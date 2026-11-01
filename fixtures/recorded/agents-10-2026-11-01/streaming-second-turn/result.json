@@ -1,0 +1,19 @@
+{
+ "claims": {
+  "deltas carry distinct timestamps": true,
+  "init reports permission mode default": true,
+  "partial text arrived as many deltas": true,
+  "same pid, same process start": true,
+  "turn 1 completed": true,
+  "turn 2 completed": true,
+  "turn 2 knows turn 1": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {
+  "delta_span_ms": 364,
+  "distinct_delta_ms": 5,
+  "init_permission_mode": "default",
+  "pid": 54686,
+  "text_deltas": 11
+ }
+}

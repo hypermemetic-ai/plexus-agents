@@ -1,0 +1,2 @@
+{"message": {"content": [{"text": "Run this exact Bash command: touch allowed-marker", "type": "text"}], "role": "user"}, "parent_tool_use_id": null, "session_id": "", "type": "user"}
+{"response": {"request_id": "9e63f218-db74-492e-8de1-e3ff6251f3a6", "response": {"behavior": "allow", "updatedInput": {"command": "touch allowed-marker", "description": "Create empty file named allowed-marker"}}, "subtype": "success"}, "type": "control_response"}

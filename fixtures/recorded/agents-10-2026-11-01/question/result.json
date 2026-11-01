@@ -1,0 +1,9 @@
+{
+ "claims": {
+  "it's a Question with options": true,
+  "the agent got the answer": true,
+  "the turn completed": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}

@@ -1,0 +1,14 @@
+{
+ "claims": {
+  "a late answer is refused": true,
+  "the approval is Cancelled, Interrupted, and a waiter was told": true,
+  "the interrupt stopped the turn": true,
+  "the same process takes another turn": true,
+  "the terminal is Interrupted": true,
+  "the tool never ran": true,
+  "the tool still never ran": true,
+  "turn 1 completed": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}

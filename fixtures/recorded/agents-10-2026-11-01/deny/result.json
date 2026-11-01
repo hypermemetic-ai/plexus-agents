@@ -1,0 +1,11 @@
+{
+ "claims": {
+  "the agent read the message": true,
+  "the answer was accepted": true,
+  "the request is in the queue, found by id from another task": true,
+  "the tool did not run": true,
+  "the turn went on and completed": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}

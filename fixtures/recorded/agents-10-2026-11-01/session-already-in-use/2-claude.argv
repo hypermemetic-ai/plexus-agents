@@ -1,0 +1,1 @@
+["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages", "--verbose", "--permission-prompt-tool", "stdio", "--permission-mode", "default", "--setting-sources", "", "--strict-mcp-config", "--model", "haiku", "--session-id", "87df5aa4-1678-4bd4-982d-bdfd28eb3b8a", "--tools", ""]

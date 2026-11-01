@@ -1,0 +1,18 @@
+{
+ "claims": {
+  "it knows the word": true,
+  "no tick after the stop": true,
+  "no tool process left running": true,
+  "the stop reports forced": true,
+  "the terminal says Interrupted by Force": true,
+  "the thread resumes after a force stop": true,
+  "the tool was ticking, with processes below claude": true,
+  "turn 1 completed": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {
+  "left_running": [],
+  "ticks_grew_after_stop": 0,
+  "tool_tree": 3
+ }
+}

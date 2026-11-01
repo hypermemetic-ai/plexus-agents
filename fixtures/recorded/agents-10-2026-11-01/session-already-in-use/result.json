@@ -1,0 +1,8 @@
+{
+ "claims": {
+  "reusing the id says SessionInUse, Broken": true,
+  "the first run completed": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}

@@ -1,0 +1,223 @@
+{
+ "cases": {
+  "approve-allow": {
+   "claims": {
+    "a second answer gets AlreadyResolved": true,
+    "input.resolved says allowed": true,
+    "it's a Bash tool approval": true,
+    "stays queryable, Answered": true,
+    "the answer was accepted": true,
+    "the request is in the queue, found by id from another task": true,
+    "the tool ran": true,
+    "the turn completed": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {}
+  },
+  "approve-edited-input": {
+   "claims": {
+    "the answer was accepted": true,
+    "the edited command ran": true,
+    "the original did not": true,
+    "the request is in the queue, found by id from another task": true,
+    "the turn completed": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {}
+  },
+  "config-dir-loses-login": {
+   "claims": {
+    "a config dir loses the login, and the terminal says so": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {
+    "status": "Failed(TurnFailure { failure: NotLoggedIn, detail: \"Not logged in · Please run /login\" })"
+   }
+  },
+  "deny": {
+   "claims": {
+    "the agent read the message": true,
+    "the answer was accepted": true,
+    "the request is in the queue, found by id from another task": true,
+    "the tool did not run": true,
+    "the turn went on and completed": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {}
+  },
+  "deny-stop-turn": {
+   "claims": {
+    "it says a denial stopped it": true,
+    "the answer was accepted": true,
+    "the next turn completes": true,
+    "the request is in the queue, found by id from another task": true,
+    "the terminal is Interrupted": true,
+    "the thread is reusable": true,
+    "the tool did not run": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {}
+  },
+  "force-stop-ticking-tool": {
+   "claims": {
+    "it knows the word": true,
+    "no tick after the stop": true,
+    "no tool process left running": true,
+    "the stop reports forced": true,
+    "the terminal says Interrupted by Force": true,
+    "the thread resumes after a force stop": true,
+    "the tool was ticking, with processes below claude": true,
+    "turn 1 completed": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {
+    "left_running": [],
+    "ticks_grew_after_stop": 0,
+    "tool_tree": 3
+   }
+  },
+  "interrupt-continue": {
+   "claims": {
+    "it knows both words": true,
+    "nothing to interrupt when idle": true,
+    "the interrupt stopped the turn": true,
+    "the same process carries on": true,
+    "the terminal is Interrupted, by the driver": true,
+    "the thread is reusable": true,
+    "turn 1 completed": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {}
+  },
+  "interrupt-pending-approval": {
+   "claims": {
+    "a late answer is refused": true,
+    "the approval is Cancelled, Interrupted, and a waiter was told": true,
+    "the interrupt stopped the turn": true,
+    "the same process takes another turn": true,
+    "the terminal is Interrupted": true,
+    "the tool never ran": true,
+    "the tool still never ran": true,
+    "turn 1 completed": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {}
+  },
+  "mcp-over-control-channel": {
+   "claims": {
+    "the server got the token through the control channel": true,
+    "the token isn't on argv": true,
+    "the turn completed": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {}
+  },
+  "minimum-env": {
+   "claims": {
+    "USER alone reaches the login": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {}
+  },
+  "question": {
+   "claims": {
+    "it's a Question with options": true,
+    "the agent got the answer": true,
+    "the turn completed": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {}
+  },
+  "queued-prompts": {
+   "claims": {
+    "both completed": true,
+    "each queued prompt gets its own terminal, in order": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {
+    "second_text": "second"
+   }
+  },
+  "resume": {
+   "claims": {
+    "a new process": true,
+    "it knows the word": true,
+    "it resumed rather than restarted": true,
+    "the resumed turn completed": true,
+    "turn 1 completed": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {}
+  },
+  "session-already-in-use": {
+   "claims": {
+    "reusing the id says SessionInUse, Broken": true,
+    "the first run completed": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {}
+  },
+  "stop-before-init": {
+   "claims": {
+    "--resume failed, so the same id restarted": true,
+    "it stopped before system/init": true,
+    "the stopped prompt is lost": true,
+    "the terminal says the driver stopped it": true,
+    "the thread reads reusable": true,
+    "the thread takes a turn: not bricked": true,
+    "under the same session id": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {
+    "init_seen": false,
+    "restarted": true,
+    "stop_exit": {
+     "code": null,
+     "signal": 9
+    }
+   }
+  },
+  "stop-before-init-graceful": {
+   "claims": {
+    "the terminal says the driver stopped it": true,
+    "the thread reads reusable": true,
+    "the thread takes a turn: not bricked": true,
+    "under the same session id": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {
+    "init_seen": true,
+    "restarted": false,
+    "stop_exit": {
+     "code": 1,
+     "signal": null
+    }
+   }
+  },
+  "streaming-second-turn": {
+   "claims": {
+    "deltas carry distinct timestamps": true,
+    "init reports permission mode default": true,
+    "partial text arrived as many deltas": true,
+    "same pid, same process start": true,
+    "turn 1 completed": true,
+    "turn 2 completed": true,
+    "turn 2 knows turn 1": true
+   },
+   "cli_version": "2.1.316 (Claude Code)",
+   "facts": {
+    "delta_span_ms": 364,
+    "distinct_delta_ms": 5,
+    "init_permission_mode": "default",
+    "pid": 54686,
+    "text_deltas": 11
+   }
+  }
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "env_given": [
+  "USER",
+  "PATH"
+ ],
+ "model": "haiku"
+}

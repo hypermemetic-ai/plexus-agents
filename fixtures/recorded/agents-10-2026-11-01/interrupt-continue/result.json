@@ -1,0 +1,13 @@
+{
+ "claims": {
+  "it knows both words": true,
+  "nothing to interrupt when idle": true,
+  "the interrupt stopped the turn": true,
+  "the same process carries on": true,
+  "the terminal is Interrupted, by the driver": true,
+  "the thread is reusable": true,
+  "turn 1 completed": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}

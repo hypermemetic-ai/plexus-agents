@@ -1,0 +1,2 @@
+{"request": {"servers": {"demo": {"args": ["-I", "<scratch>/real-cwd/mcp-over-control-channel/server.py"], "command": "/usr/bin/python3", "env": {"DEMO_TOKEN": "<demo-token>"}, "type": "stdio"}}, "subtype": "mcp_set_servers"}, "request_id": "mcp-1", "type": "control_request"}
+{"message": {"content": [{"text": "Call the tool mcp__demo__reveal, then reply done.", "type": "text"}], "role": "user"}, "parent_tool_use_id": null, "session_id": "", "type": "user"}

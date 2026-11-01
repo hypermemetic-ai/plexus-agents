@@ -1,0 +1,11 @@
+{
+ "claims": {
+  "a new process": true,
+  "it knows the word": true,
+  "it resumed rather than restarted": true,
+  "the resumed turn completed": true,
+  "turn 1 completed": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}

@@ -1,0 +1,13 @@
+{
+ "claims": {
+  "it says a denial stopped it": true,
+  "the answer was accepted": true,
+  "the next turn completes": true,
+  "the request is in the queue, found by id from another task": true,
+  "the terminal is Interrupted": true,
+  "the thread is reusable": true,
+  "the tool did not run": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}

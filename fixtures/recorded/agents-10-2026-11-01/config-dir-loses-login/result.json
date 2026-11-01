@@ -1,0 +1,9 @@
+{
+ "claims": {
+  "a config dir loses the login, and the terminal says so": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {
+  "status": "Failed(TurnFailure { failure: NotLoggedIn, detail: \"Not logged in · Please run /login\" })"
+ }
+}

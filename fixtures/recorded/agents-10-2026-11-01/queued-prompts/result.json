@@ -1,0 +1,10 @@
+{
+ "claims": {
+  "both completed": true,
+  "each queued prompt gets its own terminal, in order": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {
+  "second_text": "second"
+ }
+}

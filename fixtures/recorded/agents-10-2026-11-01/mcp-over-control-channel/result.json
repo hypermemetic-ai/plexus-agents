@@ -1,0 +1,9 @@
+{
+ "claims": {
+  "the server got the token through the control channel": true,
+  "the token isn't on argv": true,
+  "the turn completed": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}

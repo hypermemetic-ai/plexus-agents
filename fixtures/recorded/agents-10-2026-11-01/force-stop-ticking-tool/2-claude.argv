@@ -1,0 +1,1 @@
+["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages", "--verbose", "--permission-prompt-tool", "stdio", "--permission-mode", "default", "--setting-sources", "", "--strict-mcp-config", "--model", "haiku", "--resume", "470266d4-5e0c-4bad-8286-cba1d906395a", "--tools", "Bash", "--allowedTools", "Bash(sh slow-tool.sh)"]

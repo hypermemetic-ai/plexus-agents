@@ -1,0 +1,11 @@
+{
+ "claims": {
+  "the answer was accepted": true,
+  "the edited command ran": true,
+  "the original did not": true,
+  "the request is in the queue, found by id from another task": true,
+  "the turn completed": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}

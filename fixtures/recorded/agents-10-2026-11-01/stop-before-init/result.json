@@ -1,0 +1,20 @@
+{
+ "claims": {
+  "--resume failed, so the same id restarted": true,
+  "it stopped before system/init": true,
+  "the stopped prompt is lost": true,
+  "the terminal says the driver stopped it": true,
+  "the thread reads reusable": true,
+  "the thread takes a turn: not bricked": true,
+  "under the same session id": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {
+  "init_seen": false,
+  "restarted": true,
+  "stop_exit": {
+   "code": null,
+   "signal": 9
+  }
+ }
+}

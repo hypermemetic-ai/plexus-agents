@@ -1,0 +1,17 @@
+{
+ "claims": {
+  "the terminal says the driver stopped it": true,
+  "the thread reads reusable": true,
+  "the thread takes a turn: not bricked": true,
+  "under the same session id": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {
+  "init_seen": true,
+  "restarted": false,
+  "stop_exit": {
+   "code": 1,
+   "signal": null
+  }
+ }
+}

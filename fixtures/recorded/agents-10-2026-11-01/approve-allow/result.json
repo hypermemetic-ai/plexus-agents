@@ -1,0 +1,14 @@
+{
+ "claims": {
+  "a second answer gets AlreadyResolved": true,
+  "input.resolved says allowed": true,
+  "it's a Bash tool approval": true,
+  "stays queryable, Answered": true,
+  "the answer was accepted": true,
+  "the request is in the queue, found by id from another task": true,
+  "the tool ran": true,
+  "the turn completed": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}
