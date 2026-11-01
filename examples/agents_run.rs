@@ -9,7 +9,7 @@
 //! with `--env`: nothing else reaches it.
 
 use plexus_agents::runner::{launch, run_script, ApprovalPolicy};
-use plexus_agents::{LocalEnvironment, RecordingEnvironment};
+use plexus_agents::{ClaudeHarness, LocalEnvironment, RecordingEnvironment};
 use plexus_harness::conformance::wire::WireHarness;
 use plexus_harness::{Environment, Harness, ModelName, RunSpec, SessionId, SessionMode, ToolName};
 use std::sync::Arc;
@@ -76,6 +76,7 @@ async fn main() {
     };
     let harness: Arc<dyn Harness> = match a.harness.as_str() {
         "wire" => Arc::new(WireHarness::new(a.command)),
+        "claude" => Arc::new(ClaudeHarness::default()),
         other => {
             eprintln!("unknown harness {other}");
             std::process::exit(2);
