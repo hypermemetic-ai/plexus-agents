@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Fails if a fixture holds this login's identifiers, by searching for the values.
+
+    scripts/check-fixtures DIR...
+
+Reads the values from ~/.claude.json and git config, and looks for each literally,
+as it would appear inside JSON embedded in a string, and against token, JWT and
+email patterns. Prints file names and which value's key matched, never a value.
+"""
+import json, os, re, subprocess, sys
+
+HOME = os.path.expanduser("~")
+
+
+def identity():
+    vals = {}
+    try:
+        cfg = json.load(open(os.path.join(HOME, ".claude.json")))
+    except (OSError, ValueError):
+        cfg = {}
+    for k, v in (cfg.get("oauthAccount") or {}).items():
+        if isinstance(v, str) and len(v) >= 6:
+            vals[f"oauthAccount.{k}"] = v
+    if isinstance(cfg.get("userID"), str):
+        vals["userID"] = cfg["userID"]
+    for k in ("user.email", "user.name"):
+        out = subprocess.run(["git", "config", k], capture_output=True, text=True).stdout.strip()
+        if out:
+            vals[f"git.{k}"] = out
+    vals["home"] = HOME
+    vals["username"] = os.path.basename(HOME)
+    return vals
+
+
+PATTERNS = {"token": re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"),
+            "jwt": re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\."),
+            "email": re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+\.[A-Za-z]{2,}")}
+
+
+def main(dirs):
+    vals = identity()
+    print(f"checking {len(vals)} login values and {len(PATTERNS)} patterns")
+    hits, files = 0, 0
+    for root in dirs:
+        for d, _, names in os.walk(root):
+            for n in names:
+                p = os.path.join(d, n)
+                text = open(p, errors="replace").read()
+                files += 1
+                for k, v in vals.items():
+                    if v in text or v.lower() in text.lower():
+                        print(f"HIT {p}: {k}")
+                        hits += 1
+                for k, rx in PATTERNS.items():
+                    for m in rx.finditer(text):
+                        # Example addresses in the CLI's own prose aren't anyone's.
+                        if k == "email" and m.group().endswith(("@example.com", "@anthropic.com")):
+                            continue
+                        print(f"HIT {p}: pattern {k}")
+                        hits += 1
+    print(f"{files} files, {hits} hits")
+    sys.exit(1 if hits else 0)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

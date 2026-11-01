@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Copies a raw recording to a fixture directory with identifying values removed.
+
+    scripts/scrub-fixtures RAW DEST
+
+Scrubs keys, then patterns, then the login's own values literally, in every
+string, including JSON embedded in a string. scripts/check-fixtures verifies the
+result by searching for the values themselves.
+"""
+import json, os, re, shutil, sys
+
+SECRET_KEYS = re.compile(r"^(account|email|emailAddress|organization|organizationName|organizationUuid|organization_uuid|"
+                         r"orgId|org_id|accountUuid|account_uuid|userID|user_id|subscriptionType|tokenSource|apiKeySource)$", re.I)
+HOME = os.path.expanduser("~")
+USER = os.path.basename(HOME)
+PATTERNS = [
+    (re.compile(r'(\\?"(?:orgId|org_id|organizationUuid|organizationName|accountUuid|userID)\\?"\s*:\s*\\?")[^"\\]+'), r"\1<scrubbed>"),
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]+"), "<token>"),
+    (re.compile(r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]+"), "<jwt>"),
+    (re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"), "<email>"),
+    (re.compile(r"agents10-demo-token-not-a-credential"), "<demo-token>"),
+    (re.compile(r"/private/tmp/claude-\d+/[^\"'\s]*?/scratchpad"), "<scratch>"),
+    (re.compile(r"-?private-tmp-claude-\d+-[^\"'\s/]*"), "<scratch-encoded>"),
+    (re.compile(re.escape(HOME)), "<home>"),
+    (re.compile(re.escape(USER)), "<user>"),
+    (re.compile(r"hypermemet(ic)?", re.I), "<project>"),
+]
+
+
+def login_values():
+    try:
+        acct = json.load(open(os.path.join(HOME, ".claude.json"))).get("oauthAccount") or {}
+    except (OSError, ValueError):
+        return []
+    return [(re.compile(re.escape(v)), "<scrubbed>") for v in acct.values() if isinstance(v, str) and len(v) >= 6]
+
+
+PATTERNS.extend(login_values())
+
+
+def scrub_value(v):
+    if isinstance(v, dict):
+        return {k: ("<scrubbed>" if SECRET_KEYS.match(k) and isinstance(x, (dict, str)) else scrub_value(x)) for k, x in v.items()}
+    if isinstance(v, list):
+        return [scrub_value(x) for x in v]
+    if isinstance(v, str):
+        for rx, sub in PATTERNS:
+            v = rx.sub(sub, v)
+    return v
+
+
+def scrub_text(s):
+    lines = []
+    for l in s.split("\n"):
+        try:
+            lines.append(json.dumps(scrub_value(json.loads(l)), ensure_ascii=False))
+        except ValueError:
+            for rx, sub in PATTERNS:
+                l = rx.sub(sub, l)
+            lines.append(l)
+    return "\n".join(lines)
+
+
+def main(raw, dest):
+    n = 0
+    for d, _, files in os.walk(raw):
+        for name in files:
+            src = os.path.join(d, name)
+            out = os.path.join(dest, os.path.relpath(src, raw))
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            if name.endswith(".times"):
+                shutil.copy(src, out)
+                continue
+            text = open(src, errors="replace").read()
+            # A .json file is one document; everything else is lines.
+            if name.endswith(".json"):
+                doc = json.dumps(scrub_value(json.loads(text)), indent=1, ensure_ascii=False)
+            else:
+                doc = scrub_text(text)
+            open(out, "w").write(doc)
+            n += 1
+    print(f"scrubbed {n} files to {dest}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2])
