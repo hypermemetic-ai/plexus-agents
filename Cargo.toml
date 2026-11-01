@@ -1,0 +1,26 @@
+[package]
+name = "plexus-agents"
+version = "0.1.0"
+edition = "2021"
+description = "Harness implementations for Plexus: LocalEnvironment and the Claude harness"
+license = "MIT"
+
+[dependencies]
+# Unpublished, so by local path for now. Everything else is a published crate.
+plexus-harness = { path = "../plexus-harness" }
+plexus-core = "0.7.0"
+futures = "0.3"
+libc = "0.2"
+schemars = "1.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+plexus-macros = "0.7.0"
+async-stream = "0.3"
+async-trait = "0.1"
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+plexus-harness = { path = "../plexus-harness", features = ["conformance"] }
