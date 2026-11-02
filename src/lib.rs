@@ -5,6 +5,8 @@
 pub mod auth;
 pub mod claude;
 mod local;
+pub mod on;
+pub mod peer;
 pub mod record;
 pub mod runner;
 pub mod runtime;

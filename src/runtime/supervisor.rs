@@ -1763,6 +1763,13 @@ impl Supervisor {
         self.inner.placements.contains_key(name)
     }
 
+    /// The places a thread can run, in order.
+    pub fn placements(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.inner.placements.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     /// The projection of one thread.
     pub fn thread(&self, id: &ThreadId) -> Result<ThreadView, RuntimeError> {
         let row = self.inner.thread(id)?;

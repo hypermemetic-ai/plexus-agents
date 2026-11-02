@@ -3,18 +3,27 @@
 //! Every method declares its [`Caller`] through `#[from_auth]`, and the activation is
 //! `typed_params`, so a key that names no parameter is refused at dispatch: there is
 //! no way to send an actor. Thread methods declare `target = "thread"`, and `start`
-//! declares `target = "placement"`, so the gate decides each before it's routed.
+//! declares `target = "placement"`, so the gate decides each before it's routed. The
+//! exceptions are `public` on purpose: `harnesses` and `claudecode.describe` say what
+//! this service can run, take no `Caller`, and are what anon may call.
+//!
+//! `on` is [`crate::on`]: the same surface addressed by where it runs.
 //!
 //! `claudecode` is a [`HarnessActivation`], AGENTS-30's adapter over `Arc<dyn Harness>`.
 //! It describes a harness and starts nothing: runs start through `agents.start`.
 
 use crate::auth::{self, Access, AgentsRequest, Caller, Grant};
+use crate::on::OnRouter;
+use crate::peer::Peer;
 use crate::runtime::{
     GlobalSeq, InputRecord, ReadFilter, RuntimeError, StoredEvent, Supervisor, ThreadId,
     ThreadOptions, ThreadView,
 };
 use anyhow::Context;
 use futures::stream::{self, Stream, StreamExt};
+use plexus_auth_core::adapters::{Carriers, KeyProofAdapter, OidcAdapter};
+use plexus_auth_core::grants::Gate;
+use plexus_auth_core::identity::AuthenticatorChain;
 use plexus_auth_core::oidc::{Audience, OidcConfig, OidcSessionValidator, OidcValidator};
 use plexus_auth_core::IssuerUrl;
 use plexus_core::plexus::{DynamicHub, SessionValidator};
@@ -60,6 +69,14 @@ pub struct HarnessInfo {
     pub capabilities: Capabilities,
 }
 
+/// A place `on` can reach.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlacementInfo {
+    pub name: String,
+    /// Whether it's another service, not a placement of this one.
+    pub peer: bool,
+}
+
 /// Everything `agents` yields.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -73,6 +90,9 @@ pub enum AgentsEvent {
     },
     Harnesses {
         harnesses: Vec<HarnessInfo>,
+    },
+    Placements {
+        placements: Vec<PlacementInfo>,
     },
     Event {
         event: Box<StoredEvent>,
@@ -125,7 +145,6 @@ fn outcome(r: Result<AgentsEvent, RuntimeError>) -> stream::Iter<std::vec::IntoI
 pub struct HarnessActivation {
     harness: Arc<dyn Harness>,
     ns: String,
-    access: Access,
 }
 
 impl HarnessActivation {
@@ -133,7 +152,6 @@ impl HarnessActivation {
         Self {
             harness,
             ns: ns.to_string(),
-            access: Access,
         }
     }
 
@@ -148,16 +166,13 @@ impl HarnessActivation {
     namespace = "harness",
     namespace_fn = "ns",
     version = "0.1.0",
-    auth = "required",
+    auth = "mixed",
     request = AgentsRequest
 )]
 impl HarnessActivation {
     /// What this harness can do.
-    #[plexus_macros::method(streaming)]
-    pub async fn describe(
-        &self,
-        #[from_auth(self.access.verify)] _caller: Caller,
-    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+    #[plexus_macros::method(streaming, public)]
+    pub async fn describe(&self) -> impl Stream<Item = AgentsEvent> + Send + 'static {
         one(AgentsEvent::Harnesses {
             harnesses: vec![HarnessInfo {
                 name: self.harness.name().to_string(),
@@ -170,17 +185,26 @@ impl HarnessActivation {
 /// The `agents` activation. The runtime holds the state; this adds none.
 #[derive(Clone)]
 pub struct AgentsActivation {
-    runtime: Supervisor,
+    pub(crate) runtime: Supervisor,
     harnesses: Vec<Arc<dyn Harness>>,
     access: Access,
+    pub(crate) gate: Gate,
+    pub(crate) peers: Vec<Arc<Peer>>,
 }
 
 impl AgentsActivation {
-    pub fn new(runtime: Supervisor, harnesses: Vec<Arc<dyn Harness>>) -> Self {
+    pub fn new(
+        runtime: Supervisor,
+        harnesses: Vec<Arc<dyn Harness>>,
+        gate: Gate,
+        peers: Vec<Arc<Peer>>,
+    ) -> Self {
         Self {
             runtime,
             harnesses,
             access: Access,
+            gate,
+            peers,
         }
     }
 }
@@ -188,7 +212,7 @@ impl AgentsActivation {
 /// Coding agents as durable threads, addressed by thread.
 #[plexus_macros::activation(
     version = "0.1.0",
-    auth = "required",
+    auth = "mixed",
     request = AgentsRequest,
     typed_params
 )]
@@ -257,11 +281,8 @@ impl AgentsActivation {
     }
 
     /// The harnesses this service runs.
-    #[plexus_macros::method(streaming)]
-    pub async fn harnesses(
-        &self,
-        #[from_auth(self.access.verify)] _caller: Caller,
-    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+    #[plexus_macros::method(streaming, public)]
+    pub async fn harnesses(&self) -> impl Stream<Item = AgentsEvent> + Send + 'static {
         let harnesses = self.harnesses.iter().map(|h| HarnessInfo {
             name: h.name().to_string(),
             capabilities: h.capabilities(),
@@ -393,6 +414,12 @@ impl AgentsActivation {
         outcome(done.map(|()| AgentsEvent::Resumed { thread }))
     }
 
+    /// The same surface, addressed by where it runs.
+    #[plexus_macros::child]
+    fn on(&self) -> OnRouter {
+        OnRouter::new(self.clone())
+    }
+
     /// The Claude harness.
     #[plexus_macros::child]
     fn claudecode(&self) -> HarnessActivation {
@@ -407,11 +434,22 @@ pub fn hub(
     harnesses: Vec<Arc<dyn Harness>>,
     grants: Vec<Grant>,
 ) -> Arc<DynamicHub> {
-    let gate = auth::gate(&runtime, grants);
+    hub_with_peers(runtime, harnesses, grants, Vec::new())
+}
+
+/// [`hub`], with the other services `on` can reach.
+pub fn hub_with_peers(
+    runtime: Supervisor,
+    harnesses: Vec<Arc<dyn Harness>>,
+    grants: Vec<Grant>,
+    peers: Vec<Arc<Peer>>,
+) -> Arc<DynamicHub> {
+    let names = peers.iter().map(|p| p.name().to_string()).collect();
+    let gate = auth::gate(&runtime, names, grants);
     Arc::new(
         DynamicHub::new("plexus-agents")
-            .with_gate(Arc::new(gate))
-            .register(AgentsActivation::new(runtime, harnesses)),
+            .with_gate(Arc::new(gate.clone()))
+            .register(AgentsActivation::new(runtime, harnesses, gate, peers)),
     )
 }
 
@@ -437,9 +475,40 @@ impl TokenIssuer {
     }
 }
 
+/// How callers sign in: tokens from an issuer, key proof from peer services, or both.
+#[derive(Debug, Clone, Default)]
+pub struct SignIn {
+    pub tokens: Option<TokenIssuer>,
+    /// The URLs this service is dialed at, which a key proof must name.
+    pub key_audiences: Vec<String>,
+}
+
+impl SignIn {
+    /// Whichever adapter claims a credential decides it. With neither configured
+    /// there's no way in, and that's refused rather than served.
+    pub fn validator(&self) -> anyhow::Result<Arc<dyn SessionValidator>> {
+        let mut chain = AuthenticatorChain::new();
+        if let Some(t) = &self.tokens {
+            let adapter = OidcAdapter::plexus_idp(&t.issuer, &t.audience)
+                .map_err(|e| anyhow::anyhow!("--issuer, --audience: {e}"))?;
+            chain = chain.with(Arc::new(adapter));
+        }
+        if !self.key_audiences.is_empty() {
+            let adapter = KeyProofAdapter::new(&self.key_audiences)
+                .map_err(|e| anyhow::anyhow!("a key audience: {e}"))?;
+            chain = chain.with(Arc::new(adapter));
+        }
+        anyhow::ensure!(
+            !chain.names().is_empty(),
+            "no way to sign in: give --issuer and --audience, or --key-audience"
+        );
+        Ok(Arc::new(Carriers::cookie_and_bearer(chain)))
+    }
+}
+
 /// Serves `hub` on a WebSocket until it fails. A connection with no credential gets
-/// the anonymous view, where the gate refuses everything but introspection. A
-/// credential that doesn't validate is refused at the upgrade.
+/// the anonymous view, where the gate admits introspection and `public` methods and
+/// refuses the rest. A credential that doesn't validate is refused at the upgrade.
 pub async fn serve(
     hub: Arc<DynamicHub>,
     validator: Arc<dyn SessionValidator>,

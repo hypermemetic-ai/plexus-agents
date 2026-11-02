@@ -269,26 +269,97 @@ fn forbidden(reply: &Value) {
     assert_eq!(reply["error_kind"], "forbidden", "{reply}");
 }
 
+/// Anon is a minimal scope: `public` methods run, with an empty reach, and the rest
+/// refuse.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_anonymous_call_is_refused() {
     let s = service().await;
+    let ada = connect(s.port, &token(ADA, "ada")).await;
+    let thread = start(&ada).await;
     let anon = try_connect(s.port, None).await.unwrap();
     for (method, params) in [
         ("agents.threads", json!({})),
+        ("agents.threads", json!({"thread": thread})),
         ("agents.pending", json!({})),
         ("agents.watch", json!({})),
-        ("agents.harnesses", json!({})),
-        ("agents.claudecode.describe", json!({})),
+        ("agents.watch", json!({"thread": thread})),
         (
             "agents.start",
             json!({"placement": "local", "cwd": "/x", "prompt": "p"}),
         ),
         ("agents.send", json!({"thread": "t", "prompt": "p"})),
+        ("agents.on.local.harnesses", json!({})),
+        ("agents.on.placements", json!({})),
     ] {
         let r = call(&anon, method, params).await;
         assert_eq!(r["error_kind"], "unauthenticated", "{method}: {r}");
     }
-    assert!(s.runtime.threads().unwrap().is_empty());
+    assert_eq!(
+        s.runtime.threads().unwrap().len(),
+        1,
+        "anon started nothing"
+    );
+    for method in ["agents.harnesses", "agents.claudecode.describe"] {
+        let r = call(&anon, method, json!({})).await;
+        assert_eq!(r["type"], "harnesses", "{method}: {r}");
+        assert_eq!(r["harnesses"][0]["name"], "claude", "{method}: {r}");
+        let text = r.to_string();
+        assert!(!text.contains(&thread), "{method} names no thread");
+    }
+}
+
+/// Exactly these are `public`, read from the schemas a client reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn exactly_the_listed_methods_are_public() {
+    let s = service().await;
+    let root = connect(s.port, &token(ROOT, "root")).await;
+    let mut public = Vec::new();
+    for (at, ns) in [
+        ("agents.schema", "agents"),
+        ("agents.claudecode.schema", "claudecode"),
+        ("agents.on.schema", "on"),
+    ] {
+        let schema = call(&root, at, json!({})).await;
+        let methods = schema["methods"].as_array().expect(at);
+        assert!(!methods.is_empty(), "{at}");
+        for m in methods {
+            if m["public"] == true {
+                public.push(format!("{ns}.{}", m["name"].as_str().unwrap()));
+            }
+        }
+    }
+    assert_eq!(public, ["agents.harnesses", "claudecode.describe"]);
+}
+
+/// What anon's own view lists: the public methods, and no thread data anywhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_anonymous_view_lists_only_public_methods() {
+    let s = service().await;
+    let ada = connect(s.port, &token(ADA, "ada")).await;
+    let thread = start(&ada).await;
+    let anon = try_connect(s.port, None).await.unwrap();
+    let names = |schema: &Value| -> Vec<String> {
+        let methods = schema["methods"].as_array();
+        let methods = methods.map(|m| m.iter()).into_iter().flatten();
+        methods
+            .map(|m| m["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let agents = call(&anon, "agents.schema", json!({})).await;
+    assert_eq!(
+        names(&agents),
+        ["harnesses", "claudecode", "schema"],
+        "{agents}"
+    );
+    let children = agents["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1, "no `on`: {agents}");
+    assert_eq!(children[0]["namespace"], "claudecode");
+    let child = call(&anon, "agents.claudecode.schema", json!({})).await;
+    assert_eq!(names(&child), ["describe", "schema"], "{child}");
+    let hub = call(&anon, "plexus-agents.schema", json!({})).await;
+    for seen in [&agents, &child, &hub] {
+        assert!(!seen.to_string().contains(&thread));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
