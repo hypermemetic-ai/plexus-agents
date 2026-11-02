@@ -1,0 +1,70 @@
+{
+ "cli_version": "2.1.316 (Claude Code)",
+ "model": "haiku",
+ "claims": {
+  "plexus-agents came up behind a local plexus-idp": true,
+  "anonymous: threads refused": true,
+  "anonymous: start refused": true,
+  "user A started a real run": true,
+  "a request parked": true,
+  "A's watch streamed the run from synapse": true,
+  "the process is gone while it waits": true,
+  "no effect yet": true,
+  "user B: pending shows nothing": true,
+  "user B: threads shows nothing": true,
+  "user B: A's thread refused": true,
+  "user B: the refusal doesn't name A": true,
+  "user B: watching A's thread refused": true,
+  "user B: answering refused": true,
+  "user B: no grant on placement other": true,
+  "user B: an unfiltered watch shows nothing of A's": true,
+  "still parked, still unanswered, after B's tries": true,
+  "user A answered from a second connection": true,
+  "the answer holds A as verified, not as sent": true,
+  "the tool ran once": true,
+  "the turn finished": true,
+  "every resolution in the log is A's": true,
+  "the prompt in the log is A's": true,
+  "the retry took the answer, with nobody asked again": true,
+  "send starts the next turn": true,
+  "A's stream carried text deltas": true,
+  "the thread's owner is A": true,
+  "stop": true,
+  "B's watch never showed an event of A's": true,
+  "reworded: started": true,
+  "reworded: answered": true,
+  "the retry reworded its description": true,
+  "the reworded retry took the answer, with nobody asked again": true,
+  "the reworded call ran once": true,
+  "subagent: started": true,
+  "subagent: answered": true,
+  "subagent: the replacement's call took the answer": true,
+  "subagent: the tool ran once": true,
+  "no token in anything recorded": true
+ },
+ "facts": {
+  "users": 2,
+  "reworded_calls": [
+   {
+    "command": "sh third.sh",
+    "description": "Run third.sh script in working directory"
+   },
+   {
+    "command": "sh third.sh",
+    "description": "Run third.sh script in working directory retried"
+   }
+  ],
+  "subagent_calls": [
+   {
+    "command": "sh second.sh",
+    "description": "Run the second.sh script in the current working directory"
+   },
+   {
+    "command": "sh second.sh",
+    "description": "Run the second.sh script in the current working directory"
+   }
+  ],
+  "subagent_asked_again": 0,
+  "watch_events": 65
+ }
+}

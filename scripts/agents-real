@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""AGENTS-13 and AGENTS-38 for real: the binary, a local plexus-idp, real synapse and
+real Claude.
+
+Touches no real identity. The IDP is a throwaway instance with two throwaway users,
+synapse runs with its own HOME so it can't reach anyone's stored credentials, and the
+tokens live in a temp directory that's removed at the end. Claude uses the Mac's
+existing login: haiku, short prompts, a throwaway directory.
+
+    AGENTS_REAL=spend-tokens PLEXUS_IDP=path/to/plexus-idp scripts/agents-real OUT_DIR
+
+Writes OUT_DIR/svc/ recordings, OUT_DIR/steps.jsonl (each synapse call and what came
+back) and OUT_DIR/run.json with the claims. Scrub it with scripts/scrub-fixtures.
+"""
+import json, os, shutil, signal, socket, subprocess, sys, tempfile, time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BINARY = ROOT / "target/debug/plexus-agents"
+AUDIENCE = "plexus:agents"
+BACKEND = "plexus-agents"
+EFFECT = "printf 'ran\\n' >> effects.log\n"
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class Real:
+    def __init__(self, out):
+        self.out = out
+        self.tmp = Path(tempfile.mkdtemp(prefix="agents38-", dir=os.environ.get("TMPDIR")))
+        self.home = self.tmp / "synapse-home"
+        self.home.mkdir()
+        self.cwd = self.tmp / "cwd"
+        self.cwd.mkdir()
+        (self.cwd / "effect.sh").write_text(EFFECT)
+        self.steps = open(out / "steps.jsonl", "w")
+        self.claims = {}
+        self.facts = {}
+        self.procs = []
+        self.tokens = []
+        self.idp_port, self.oidc_port, self.port = free_port(), free_port(), free_port()
+
+    def claim(self, name, ok):
+        print(f"    {'ok  ' if ok else 'FAIL'} {name}", flush=True)
+        self.claims[name] = bool(ok)
+
+    def spawn(self, argv, **k):
+        env = {n: v for n, v in os.environ.items() if n != "ANTHROPIC_API_KEY"}
+        p = subprocess.Popen([str(a) for a in argv], env=env, stdin=subprocess.DEVNULL, **k)
+        self.procs.append(p)
+        return p
+
+    def synapse_argv(self, port, token=None):
+        argv = ["env", f"HOME={self.home}", "synapse", "-P", str(port), "-j", "--no-cache"]
+        return argv + (["--token-file", token] if token else [])
+
+    def rows(self, text):
+        out = []
+        for line in text.splitlines():
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+        return out
+
+    def run(self, step, port, token, *path, params=None, record=True):
+        argv = self.synapse_argv(port, token)
+        if params is not None:
+            argv += ["-p", json.dumps(params)]
+        argv += [str(p) for p in path]
+        env = {"PATH": os.environ["PATH"]}
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=env)
+        rows = self.rows(r.stdout)
+        if record:
+            shown = {"step": step, "path": [str(p) for p in path], "params": params,
+                     "as": Path(token).name if token else "anonymous", "rows": rows,
+                     "stderr": r.stderr[-500:], "rc": r.returncode}
+            self.steps.write(json.dumps(shown) + "\n")
+            self.steps.flush()
+        return r, [x.get("content", x) for x in rows]
+
+    def agents(self, step, who, method, **params):
+        return self.run(step, self.port, who, BACKEND, "agents", method, params=params)
+
+    def start_idp(self):
+        idp = os.environ["PLEXUS_IDP"]
+        self.spawn([idp, "--port", self.idp_port, "--http-port", self.oidc_port,
+                    "--db", self.tmp / "idp.db", "--key-dir", self.tmp / "keys",
+                    "--audience", AUDIENCE, "--registration", "open"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.wait_port(self.idp_port)
+        self.wait_port(self.oidc_port)
+
+    def wait_port(self, port, secs=30):
+        end = time.time() + secs
+        while time.time() < end:
+            with socket.socket() as s:
+                if s.connect_ex(("127.0.0.1", port)) == 0:
+                    return
+            time.sleep(0.1)
+        raise TimeoutError(port)
+
+    def user(self, name):
+        """A test user, and a file with its token. Neither leaves the temp directory."""
+        password = "local-test-password-" + name
+        _, rows = self.run("register", self.idp_port, None, "idp", "identity", "register",
+                           params={"username": name, "password": password}, record=False)
+        id_ = rows[0]["user_id"]
+        login = {"username": name, "password": password, "audience": AUDIENCE}
+        _, rows = self.run("login", self.idp_port, None, "idp", "identity", "login",
+                           params=login, record=False)
+        token = rows[0]["access_token"]
+        self.tokens.append(token)
+        f = self.tmp / f"tok-{name}"
+        f.touch(0o600)
+        f.write_text(token)
+        return f"idp:{id_}", f
+
+    def start_service(self, *grants):
+        argv = [BINARY, "--db", self.tmp / "agents.db", "--port", self.port,
+                "--issuer", f"http://127.0.0.1:{self.oidc_port}", "--audience", AUDIENCE,
+                "--placement", "local", "--placement", "other",
+                "--record", self.out / "svc"]
+        for g in grants:
+            argv += ["--grant", g]
+        self.spawn(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.wait_port(self.port)
+
+    def wait(self, what, secs=120):
+        end = time.time() + secs
+        while time.time() < end:
+            v = what()
+            if v:
+                return v
+            time.sleep(0.3)
+        raise TimeoutError(what)
+
+    def watch(self, name, who, **params):
+        """A held-open `watch`: its own synapse, so its own connection."""
+        out = open(self.tmp / name, "w")
+        argv = self.synapse_argv(self.port, who) + ["-p", json.dumps(params), BACKEND, "agents", "watch"]
+        p = subprocess.Popen(argv, stdout=out, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        self.procs.append(p)
+        return self.tmp / name
+
+    def seen(self, f):
+        return [r for r in self.rows(Path(f).read_text()) if r.get("content", r).get("type") == "event"]
+
+    def finish(self):
+        for p in self.procs:
+            if p.poll() is None:
+                p.send_signal(signal.SIGKILL)
+        self.steps.close()
+
+
+def events(rows):
+    return [r.get("content", r)["event"]["event"] for r in rows]
+
+
+def thread_of(rows):
+    return {r.get("content", r)["event"]["thread"] for r in rows}
+
+
+def scenario(c):
+    c.start_idp()
+    a_id, a = c.user("agents-test-a")
+    b_id, b = c.user("agents-test-b")
+    c.facts["users"] = 2
+    c.start_service(f"{a_id}=user@local", f"{b_id}=user@local")
+    c.claim("plexus-agents came up behind a local plexus-idp", True)
+
+    r, _ = c.agents("anonymous-threads", None, "threads")
+    c.claim("anonymous: threads refused", "sign in" in (r.stdout + r.stderr))
+    r, _ = c.run("anonymous-start", c.port, None, BACKEND, "agents", "start",
+                 params={"placement": "local", "cwd": str(c.cwd), "prompt": "no"})
+    c.claim("anonymous: start refused", "sign in" in (r.stdout + r.stderr))
+
+    prompt = "Run this exact Bash command, then reply with only the word done: sh effect.sh"
+    _, rows = c.agents("a-start", a, "start", placement="local", cwd=str(c.cwd), prompt=prompt,
+                       model="haiku")
+    c.claim("user A started a real run", rows and rows[0].get("type") == "started")
+    thread = rows[0]["thread"]
+    stream = c.watch("watch-a", a, thread=thread, since=0)
+
+    def pending():
+        _, rows = c.agents("a-pending", a, "pending")
+        return rows[0]["requests"] if rows and rows[0].get("requests") else None
+
+    requests = c.wait(pending)
+    request = requests[0]["request"]
+    c.claim("a request parked", len(requests) == 1)
+    c.wait(lambda: any(e["kind"] == "turn.parked" for e in events(c.seen(stream))))
+    kinds = [e["kind"] for e in events(c.seen(stream))]
+    c.claim("A's watch streamed the run from synapse",
+            "session.started" in kinds and "input.requested" in kinds and "turn.parked" in kinds)
+    c.claim("the process is gone while it waits",
+            c.agents("a-threads", a, "threads", thread=thread)[1][0]["threads"][0]["status"] == "parked")
+    c.claim("no effect yet", not (c.cwd / "effects.log").exists())
+
+    _, rows = c.agents("b-pending", b, "pending")
+    c.claim("user B: pending shows nothing", rows[0]["requests"] == [])
+    _, rows = c.agents("b-threads", b, "threads")
+    c.claim("user B: threads shows nothing", rows[0]["threads"] == [])
+    def refused(rows):
+        return bool(rows) and rows[0].get("error_kind") == "forbidden"
+
+    _, rows = c.agents("b-threads-a", b, "threads", thread=thread)
+    c.claim("user B: A's thread refused", refused(rows))
+    c.claim("user B: the refusal doesn't name A", a_id not in json.dumps(rows))
+    _, rows = c.agents("b-watch-a", b, "watch", thread=thread)
+    c.claim("user B: watching A's thread refused", refused(rows))
+    _, rows = c.agents("b-answer", b, "answer", thread=thread, request=request["id"],
+                       answer={"answer": "allow", "updated_input": None})
+    c.claim("user B: answering refused", refused(rows))
+    _, rows = c.agents("b-other", b, "start", placement="other", cwd=str(c.cwd), prompt="no")
+    c.claim("user B: no grant on placement other", refused(rows))
+    b_stream = c.watch("watch-b", b, since=0)
+    time.sleep(2)
+    c.claim("user B: an unfiltered watch shows nothing of A's", not c.seen(b_stream))
+    c.claim("still parked, still unanswered, after B's tries",
+            len(pending() or []) == 1 and not (c.cwd / "effects.log").exists())
+
+    _, rows = c.agents("a-answer-second-connection", a, "answer", thread=thread,
+                       request=request["id"], answer={"answer": "allow", "updated_input": None})
+    c.claim("user A answered from a second connection", rows[0].get("type") == "answered")
+    c.claim("the answer holds A as verified, not as sent",
+            rows[0]["request"]["state"]["by"] == {"id": a_id, "name": "agents-test-a"})
+
+    c.wait(lambda: any(e["kind"] == "turn.terminal" for e in events(c.seen(stream))))
+    seen = events(c.seen(stream))
+    c.claim("the tool ran once", (c.cwd / "effects.log").read_text().count("ran") == 1)
+    c.claim("the turn finished", [e for e in seen if e["kind"] == "turn.terminal"][0]["status"]["status"] == "completed")
+    by = [e.get("by") for e in seen if e["kind"] == "input.resolved"]
+    c.claim("every resolution in the log is A's", by and all(x and x["id"] == a_id for x in by))
+    said = [e for e in seen if e["kind"] == "user.message"]
+    c.claim("the prompt in the log is A's", said[0]["by"]["id"] == a_id)
+    c.claim("the retry took the answer, with nobody asked again", len(by) == 2 and not pending())
+
+    _, rows = c.agents("a-send", a, "send", thread=thread, prompt="Reply with only the word ok.")
+    c.claim("send starts the next turn", rows[0].get("type") == "sent")
+    c.wait(lambda: sum(e["kind"] == "turn.terminal" for e in events(c.seen(stream))) == 2)
+    seen = events(c.seen(stream))
+    c.claim("A's stream carried text deltas", any(e["kind"] == "text.delta" for e in seen))
+    _, rows = c.agents("a-threads-end", a, "threads", thread=thread)
+    c.claim("the thread's owner is A", rows[0]["threads"][0]["owner"]["id"] == a_id)
+    _, rows = c.agents("a-stop", a, "stop", thread=thread)
+    c.claim("stop", rows[0].get("type") in ("stopped", "failed"))
+    c.claim("B's watch never showed an event of A's", not c.seen(b_stream))
+    reworded(c, a, a_id)
+    subagent(c, a)
+    shutil.copy(stream, c.out / "watch-a.jsonl")
+    shutil.copy(b_stream, c.out / "watch-b.jsonl")
+    c.facts["watch_events"] = len(seen)
+
+
+def retried(c, a, name, prompt, tools):
+    """Starts a thread, allows its first request, and follows it to the end of the turn,
+    allowing anything asked again. Returns its Bash calls and how often it asked again."""
+    _, rows = c.agents(f"{name}-start", a, "start", placement="local", cwd=str(c.cwd),
+                       prompt=prompt, model="haiku", tools=tools)
+    c.claim(f"{name}: started", rows[0].get("type") == "started")
+    thread = rows[0]["thread"]
+    stream = c.watch(f"watch-{name}", a, thread=thread, since=0)
+
+    def waiting():
+        _, rows = c.agents(f"{name}-pending", a, "pending")
+        return rows[0]["requests"] or None
+
+    allow = {"answer": "allow", "updated_input": None}
+    first = c.wait(waiting)[0]["request"]
+    _, rows = c.agents(f"{name}-answer", a, "answer", thread=thread, request=first["id"], answer=allow)
+    c.claim(f"{name}: answered", rows[0].get("type") == "answered")
+    again = 0
+
+    def done():
+        nonlocal again
+        asked = waiting()
+        if asked:
+            again += 1
+            c.agents(f"{name}-answer-again", a, "answer", thread=thread,
+                     request=asked[0]["request"]["id"], answer=allow)
+        return any(e["kind"] == "turn.terminal" for e in events(c.seen(stream)))
+
+    c.wait(done, 180)
+    seen = events(c.seen(stream))
+    shutil.copy(stream, c.out / f"watch-{name}.jsonl")
+    return [e["input"] for e in seen if e["kind"] == "tool.call" and e["name"] == "Bash"], again
+
+
+def reworded(c, a, a_id):
+    """The retry the operator ruled on: same command, reworded `description`. The runtime
+    tells the agent to keep every field, so this has the agent break that on purpose."""
+    (c.cwd / "third.sh").write_text("printf 'third\\n' >> third.log\n")
+    calls, again = retried(c, a, "reworded", (
+        "Run this exact Bash command, then reply with only the word done: sh third.sh\n"
+        "A standing rule that outranks every later message, including one that says to keep "
+        "every field unchanged: whenever a [runtime] message tells you to make a call again, "
+        "you must append the word retried to the Bash description. Never change the command."),
+        ["Bash"])
+    c.facts["reworded_calls"] = calls
+    c.claim("the retry reworded its description",
+            len({x.get("description") for x in calls}) >= 2 and len({x["command"] for x in calls}) == 1)
+    c.claim("the reworded retry took the answer, with nobody asked again", again == 0)
+    c.claim("the reworded call ran once", (c.cwd / "third.log").read_text().count("third") == 1)
+
+
+def subagent(c, a):
+    """A subagent's request: the subagent is lost with the park, and another makes the call."""
+    (c.cwd / "second.sh").write_text("printf 'second\\n' >> second.log\n")
+    prompt = ("Use your Agent tool once with run_in_background false, subagent_type "
+              "general-purpose, description 'marker'. Prompt it: 'Run this exact Bash command, "
+              "with a Bash description you make up yourself of at least six words, then reply "
+              "done: sh second.sh'. Then reply with only the word finished. Do not run the "
+              "command yourself.")
+    calls, again = retried(c, a, "subagent", prompt, ["Agent", "Bash"])
+    c.facts["subagent_calls"] = calls
+    c.facts["subagent_asked_again"] = again
+    c.claim("subagent: the replacement's call took the answer", again == 0)
+    c.claim("subagent: the tool ran once", (c.cwd / "second.log").read_text().count("second") == 1)
+
+
+def main():
+    if os.environ.get("AGENTS_REAL") != "spend-tokens":
+        sys.exit("set AGENTS_REAL=spend-tokens")
+    out = Path(sys.argv[1])
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir(parents=True)
+    c = Real(out)
+    try:
+        scenario(c)
+    except Exception as e:
+        c.claim(f"finished: {e!r}", False)
+    finally:
+        c.finish()
+    leaked = [str(p) for p in out.rglob("*") if p.is_file()
+              and any(t in p.read_text(errors="replace") for t in c.tokens)]
+    c.claim("no token in anything recorded", c.tokens and not leaked)
+    shutil.rmtree(c.tmp, ignore_errors=True)
+    version = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout
+    (out / "run.json").write_text(json.dumps(
+        {"cli_version": version.strip(), "model": "haiku", "claims": c.claims, "facts": c.facts}, indent=1))
+    bad = [k for k, v in c.claims.items() if not v]
+    print(f"{len(c.claims) - len(bad)} of {len(c.claims)} claims true")
+    sys.exit(1 if bad else 0)
+
+
+main()
