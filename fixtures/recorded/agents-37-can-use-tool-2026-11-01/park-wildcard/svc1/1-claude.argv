@@ -1,0 +1,1 @@
+["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages", "--verbose", "--permission-prompt-tool", "stdio", "--permission-mode", "default", "--setting-sources", "", "--strict-mcp-config", "--model", "haiku", "--session-id", "619444ee-7153-44f0-b9a6-9e2ffc6ca11e", "--tools", "Bash", "--allowedTools", "Bash(sh:*)"]

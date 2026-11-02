@@ -5,16 +5,59 @@
   "restart-parked": {
    "claims": {
     "it parked": true,
+    "its process has gone": true,
     "nothing ran": true,
     "the request survived the restart": true,
     "a prompt is refused while it's undecided": true,
     "a new service's answer resumed it": true,
     "the tool ran once": true,
-    "the answer is applied": true,
+    "the retry took the answer": true,
+    "nobody was asked again": true,
     "the global sequence has no gaps or repeats": true,
     "the turn ended once, across both runs": true
    },
-   "facts": {}
+   "facts": {
+    "inputs": [
+     {
+      "after_unknown_outcome": false,
+      "agent": null,
+      "delivery": "superseded",
+      "id": "adea4e16-79e9-4fd6-a981-1d116b2136f7:input:1",
+      "kind": {
+       "description": "Run effect.sh script as requested",
+       "input": {
+        "command": "sh effect.sh",
+        "description": "Run effect.sh script as requested"
+       },
+       "kind": "tool_approval",
+       "needs_person": false,
+       "tool": "Bash",
+       "tool_use_id": "toolu_0122GZpQ51V7MBDsrxckaQMb"
+      },
+      "route": "parked",
+      "tool_use_id": "toolu_0122GZpQ51V7MBDsrxckaQMb"
+     },
+     {
+      "after_unknown_outcome": false,
+      "agent": null,
+      "delivery": "applied",
+      "id": "863abc60-af4a-4adc-b7cb-702201f84231:input:1",
+      "kind": {
+       "description": "Run effect.sh script as requested",
+       "input": {
+        "command": "sh effect.sh",
+        "description": "Run effect.sh script as requested"
+       },
+       "kind": "tool_approval",
+       "needs_person": false,
+       "tool": "Bash",
+       "tool_use_id": "toolu_016Z6VWGf71nsSToTPeG9xJM"
+      },
+      "route": "live",
+      "tool_use_id": "toolu_016Z6VWGf71nsSToTPeG9xJM"
+     }
+    ]
+   }
   },
   "crash-mid-tool": {
    "claims": {
@@ -32,10 +75,10 @@
     "recovery": {
      "expired": [],
      "interrupted": [
-      "87c63d8e-7ad3-461f-bf23-9b67478b26f9"
+      "f7e06e16-67f4-4224-a796-34aa9b3e8f4a"
      ],
      "outcome_unknown": [
-      "617547da-c0af-48f8-8aa4-cdd57799801c:input:1"
+      "f7e06e16-67f4-4224-a796-34aa9b3e8f4a:input:1"
      ],
      "reaped": 1,
      "rerouted": []
@@ -43,35 +86,78 @@
     "after_continue": {
      "inputs": [
       {
-       "after_unknown_outcome": false,
-       "delivery": "outcome_unknown",
-       "id": "617547da-c0af-48f8-8aa4-cdd57799801c:input:1",
+       "after_unknown_outcome": true,
+       "agent": null,
+       "delivery": "superseded",
+       "id": "3094082f-6273-4e67-9757-6b45fbe3acd6:input:1",
+       "kind": {
+        "description": "Run slow.sh script in the working directory",
+        "input": {
+         "command": "sh slow.sh",
+         "description": "Run slow.sh script in the working directory"
+        },
+        "kind": "tool_approval",
+        "needs_person": false,
+        "tool": "Bash",
+        "tool_use_id": "toolu_01R9GmvxJBG7opnWfydn3umk"
+       },
        "route": "parked",
-       "tool_use_id": "toolu_0127jGPDkAAv3PwkTngto95o"
+       "tool_use_id": "toolu_01R9GmvxJBG7opnWfydn3umk"
+      },
+      {
+       "after_unknown_outcome": false,
+       "agent": null,
+       "delivery": "outcome_unknown",
+       "id": "f7e06e16-67f4-4224-a796-34aa9b3e8f4a:input:1",
+       "kind": {
+        "description": "Run slow.sh script in the working directory",
+        "input": {
+         "command": "sh slow.sh",
+         "description": "Run slow.sh script in the working directory"
+        },
+        "kind": "tool_approval",
+        "needs_person": false,
+        "tool": "Bash",
+        "tool_use_id": "toolu_01Bqf4799jV4uNjzcdF87yMA"
+       },
+       "route": "live",
+       "tool_use_id": "toolu_01Bqf4799jV4uNjzcdF87yMA"
       },
       {
        "after_unknown_outcome": true,
+       "agent": null,
        "delivery": "pending",
-       "id": "1bcb3683-6838-45c2-9710-1210846842e8:input:1",
+       "id": "3da494e3-d443-4943-a004-df9d2c5aac38:input:1",
+       "kind": {
+        "description": "Run slow.sh script in the working directory",
+        "input": {
+         "command": "sh slow.sh",
+         "description": "Run slow.sh script in the working directory"
+        },
+        "kind": "tool_approval",
+        "needs_person": false,
+        "tool": "Bash",
+        "tool_use_id": "toolu_01TtmJ7QeiYPDE9vtotmCGEf"
+       },
        "route": "parked",
-       "tool_use_id": "toolu_0127jGPDkAAv3PwkTngto95o"
+       "tool_use_id": "toolu_01TtmJ7QeiYPDE9vtotmCGEf"
       }
      ],
      "live": false,
      "thread": {
-      "cwd": "<scratch>/real/agents9-531v2wxi/cwd",
+      "cwd": "<scratch>/agents9-bco8nx2d/cwd",
       "harness": "claude",
-      "id": "39340194-ba71-4e83-a2dc-d1dd62b24af1",
-      "last_seq": 42,
+      "id": "8a6c4f79-fb23-42c8-87f4-04a696f60615",
+      "last_seq": 70,
       "last_turn": 1,
       "outcome_unknown": [
-       "617547da-c0af-48f8-8aa4-cdd57799801c:input:1"
+       "f7e06e16-67f4-4224-a796-34aa9b3e8f4a:input:1"
       ],
       "pending": [
-       "1bcb3683-6838-45c2-9710-1210846842e8:input:1"
+       "3da494e3-d443-4943-a004-df9d2c5aac38:input:1"
       ],
       "runs": 3,
-      "session": "0df5dff5-977e-4d9b-9716-b5981110d2cc",
+      "session": "3cc9c843-f392-4da5-9366-c998488fed6e",
       "status": "parked"
      }
     },
@@ -91,28 +177,52 @@
     "recovery": {
      "expired": [],
      "interrupted": [
-      "190c4415-4f19-49cc-a292-a3e0ef9ea9dd"
+      "774b27b7-6b4b-495d-b88e-c195c93b9a0b"
      ],
      "outcome_unknown": [],
      "reaped": 1,
      "rerouted": [
-      "190c4415-4f19-49cc-a292-a3e0ef9ea9dd:input:1"
+      "774b27b7-6b4b-495d-b88e-c195c93b9a0b:input:1"
      ]
     },
     "inputs": [
      {
       "after_unknown_outcome": false,
+      "agent": null,
       "delivery": "superseded",
-      "id": "190c4415-4f19-49cc-a292-a3e0ef9ea9dd:input:1",
+      "id": "774b27b7-6b4b-495d-b88e-c195c93b9a0b:input:1",
+      "kind": {
+       "description": "Run effect.sh script with sh",
+       "input": {
+        "command": "sh effect.sh",
+        "description": "Run effect.sh script with sh"
+       },
+       "kind": "tool_approval",
+       "needs_person": false,
+       "tool": "Bash",
+       "tool_use_id": "toolu_01N4SPDtipU3XDskQXJAYpdt"
+      },
       "route": "message",
-      "tool_use_id": "toolu_01PaZ66fE3ZN2q87mV3FQsMt"
+      "tool_use_id": "toolu_01N4SPDtipU3XDskQXJAYpdt"
      },
      {
       "after_unknown_outcome": false,
+      "agent": null,
       "delivery": "applied",
-      "id": "b6f064ef-a88d-40a2-868b-a6043fd44f36:input:1",
+      "id": "9d07b2d0-38f5-4cfd-b0f0-d3991266e938:input:1",
+      "kind": {
+       "description": "Run effect.sh script with sh",
+       "input": {
+        "command": "sh effect.sh",
+        "description": "Run effect.sh script with sh"
+       },
+       "kind": "tool_approval",
+       "needs_person": false,
+       "tool": "Bash",
+       "tool_use_id": "toolu_01F8zq1UEjZYF1GHAEVtNRrT"
+      },
       "route": "live",
-      "tool_use_id": "toolu_01XKhuwXeEfrUBqAaFbtPxP1"
+      "tool_use_id": "toolu_01F8zq1UEjZYF1GHAEVtNRrT"
      }
     ]
    }
@@ -130,7 +240,7 @@
     "recovery": {
      "expired": [],
      "interrupted": [
-      "ab59a151-0cac-4a83-ae2d-3436e65a5c0a"
+      "65302293-0f45-46a6-927a-061452db80d4"
      ],
      "outcome_unknown": [],
      "reaped": 1,
@@ -141,6 +251,19 @@
      "turn.terminal",
      "run.ended"
     ]
+   }
+  },
+  "queue-across-threads": {
+   "claims": {
+    "both are queued after a restart, oldest first": true,
+    "they name their calls": true,
+    "nothing started by itself": true,
+    "answering one started its thread": true,
+    "and only that one": true,
+    "its tool ran": true
+   },
+   "facts": {
+    "waited_s": 30
    }
   }
  }

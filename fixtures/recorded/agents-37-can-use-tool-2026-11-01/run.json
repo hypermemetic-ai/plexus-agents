@@ -1,0 +1,192 @@
+{
+ "cli_version": "2.1.316 (Claude Code)",
+ "model": "haiku",
+ "cases": {
+  "park-wildcard": {
+   "claims": {
+    "the tool ran": true,
+    "it never parked": true,
+    "nothing was asked": true
+   },
+   "facts": {}
+  },
+  "park-deny-flag": {
+   "claims": {
+    "the tool didn't run": true,
+    "it never parked": true,
+    "it never reached the queue": true
+   },
+   "facts": {}
+  },
+  "park-deny-settings": {
+   "claims": {
+    "the tool didn't run": true,
+    "it never parked": true,
+    "it never reached the queue": true
+   },
+   "facts": {}
+  },
+  "park-ask": {
+   "claims": {
+    "the allow rule alone runs it": true,
+    "the ask rule parks it, over the allow rule": true,
+    "its process has gone": true,
+    "it didn't run": true,
+    "the answer ran it": true
+   },
+   "facts": {}
+  },
+  "project-rules-ignored": {
+   "claims": {
+    "it parked": true,
+    "its process has gone": true,
+    "nothing ran": true
+   },
+   "facts": {}
+  },
+  "park-allow": {
+   "claims": {
+    "it parked": true,
+    "its process has gone": true,
+    "nothing ran": true,
+    "it ran once, in the parked cwd": true,
+    "one person's answer was enough": true
+   },
+   "facts": {
+    "effects": [
+     "ran approved <scratch>/agents9-gek_lgrv/cwd"
+    ],
+    "inputs": [
+     {
+      "delivery": "superseded",
+      "route": "parked"
+     },
+     {
+      "delivery": "applied",
+      "route": "live"
+     }
+    ]
+   }
+  },
+  "park-edited": {
+   "claims": {
+    "it parked": true,
+    "its process has gone": true,
+    "nothing ran": true,
+    "the edit is what ran": true,
+    "the original never ran": true
+   },
+   "facts": {
+    "effects": [
+     "ran edited <scratch>/agents9-9ypcsr7e/cwd"
+    ]
+   }
+  },
+  "park-deny-message": {
+   "claims": {
+    "it parked": true,
+    "its process has gone": true,
+    "nothing ran": true,
+    "the tool didn't run": true,
+    "the model heard the reason": true
+   },
+   "facts": {
+    "model_said": "Denied. Reason: reason-marker-4417. I won't run `sh effect.sh refused`. I don't see any other calls from that message, so there's nothing to redo."
+   }
+  },
+  "park-deny-stop-turn": {
+   "claims": {
+    "it parked": true,
+    "its process has gone": true,
+    "nothing ran": true,
+    "the turn stopped, and says why": true,
+    "no process was started": true,
+    "the thread takes prompts": true,
+    "the next prompt carried the reason": true,
+    "the tool didn't run": true
+   },
+   "facts": {
+    "terminal": {
+     "at_ms": 1793593925462,
+     "in_turn": 1,
+     "kind": "turn.terminal",
+     "seq": 22,
+     "status": {
+      "status": "interrupted"
+     },
+     "stopped_by": "deny_and_stop",
+     "threadDisposition": "reusable",
+     "turn": 1
+    }
+   }
+  },
+  "park-question": {
+   "claims": {
+    "a question parked": true,
+    "its process has gone": true,
+    "the Bash call it led to parked too": true,
+    "the answer reached the tool": true
+   },
+   "facts": {
+    "effects": [
+     "ran gannet9745 <scratch>/agents9-k4hahxbo/cwd"
+    ]
+   }
+  },
+  "park-batch": {
+   "claims": {
+    "park 1 left no process": true,
+    "park 2 left no process": true,
+    "each call ran once": true,
+    "a person was asked once a call": true,
+    "the turn ended once": true
+   },
+   "facts": {
+    "parks": 2,
+    "answered": [
+     "sh effect.sh one",
+     "sh effect.sh two"
+    ],
+    "effects": [
+     "ran one <scratch>/agents9-vs82bero/cwd",
+     "ran two <scratch>/agents9-vs82bero/cwd"
+    ],
+    "inputs": [
+     "superseded",
+     "applied",
+     "superseded",
+     "applied"
+    ]
+   }
+  },
+  "park-subagent": {
+   "claims": {
+    "a subagent's request parks the run": true,
+    "it's the subagent's": true,
+    "nothing is left running": true,
+    "the turn finished": true,
+    "the tool ran once": true
+   },
+   "facts": {
+    "subagent_end_seen_before_resume": false,
+    "asks": 1,
+    "effects": [
+     "ran inner <scratch>/agents9-rrv_2ib3/cwd"
+    ],
+    "inputs": [
+     "superseded",
+     "applied"
+    ],
+    "subagents_started": 2
+   }
+  },
+  "live-without-park": {
+   "claims": {
+    "the process stays": true,
+    "the route is live": true,
+    "it ran in the same process": true
+   },
+   "facts": {}
+  }
+ }
+}

@@ -1,1 +1,0 @@
-["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages", "--verbose", "--permission-prompt-tool", "stdio", "--permission-mode", "default", "--setting-sources", "", "--strict-mcp-config", "--model", "haiku", "--tools", "Agent,Bash", "--settings", "<scratch>/real/cwd37/park-subagent.park/settings.json", "--include-hook-events"]

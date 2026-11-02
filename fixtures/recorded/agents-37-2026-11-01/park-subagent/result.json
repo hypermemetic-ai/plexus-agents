@@ -1,9 +1,0 @@
-{
- "claims": {
-  "a subagent's call doesn't park the run": true,
-  "it reached a live approval naming the subagent": true,
-  "the tool ran once": true
- },
- "cli_version": "2.1.316 (Claude Code)",
- "facts": {}
-}
