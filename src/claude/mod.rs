@@ -10,12 +10,15 @@
 
 mod driver;
 mod frames;
+mod park;
 
 use futures::future::BoxFuture;
 use plexus_harness::{
-    Cap, Capabilities, DriveError, Endpoint, EnvName, EnvValue, Harness, LaunchPlan, Need,
-    PlanError, Process, Resume, Run, RunSpec, SessionId, SessionMode, VersionPin, WireFormat,
+    Cap, Capabilities, DriveError, Endpoint, EnvName, EnvValue, Harness, LaunchPlan, Need, Park,
+    ParkAnswer, ParkedCall, ParkedRun, PlanError, Process, Resume, Run, RunSpec, SessionId,
+    SessionMode, Unpark, UserInput, VersionPin, WireFormat,
 };
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +39,9 @@ pub struct ClaudeOptions {
     pub interrupt_timeout: Duration,
     /// How long a graceful stop has before a force stop.
     pub stop_timeout: Duration,
+    /// A `permissions` block for a parking run's own settings file, to carry rules
+    /// that aren't flags. Nothing outside that run's file sees it.
+    pub permissions: Option<serde_json::Value>,
 }
 
 impl Default for ClaudeOptions {
@@ -45,6 +51,7 @@ impl Default for ClaudeOptions {
             config_dir: None,
             interrupt_timeout: Duration::from_secs(10),
             stop_timeout: Duration::from_secs(10),
+            permissions: None,
         }
     }
 }
@@ -86,6 +93,41 @@ impl ClaudeHarness {
             EnvName::new("ANTHROPIC_API_KEY"),
             EnvValue::secret(endpoint.key.clone()),
         );
+        Ok(())
+    }
+
+    /// Adds the per-run hook. It reaches the CLI only through `--settings`, and
+    /// nothing is written where the user's settings live.
+    fn park_plan(
+        spec: &RunSpec,
+        argv: &mut Vec<String>,
+        plan: &mut LaunchPlan,
+        state_dir: &str,
+        permissions: Option<&serde_json::Value>,
+    ) -> Result<(), PlanError> {
+        if !state_dir.starts_with('/') {
+            return Err(PlanError::Conflict {
+                what: "a park state directory must be an absolute path".into(),
+            });
+        }
+        // An answer file there would be one tool call away from the agent.
+        let inside = |cwd: &String| Path::new(state_dir).starts_with(cwd);
+        if spec.cwd.as_ref().is_some_and(inside) {
+            return Err(PlanError::Conflict {
+                what: "a park state directory must be outside the working directory".into(),
+            });
+        }
+        argv.extend([
+            "--settings".to_string(),
+            format!("{state_dir}/settings.json"),
+            "--include-hook-events".to_string(),
+        ]);
+        plan.files
+            .extend(park::files(state_dir, &spec.tools.preapproved, permissions));
+        plan.needs.push(Need::Program {
+            name: "python3".into(),
+            version: None,
+        });
         Ok(())
     }
 
@@ -151,6 +193,18 @@ impl ClaudeHarness {
         for rule in &spec.tools.preapproved {
             argv.extend(["--allowedTools".to_string(), rule.clone()]);
         }
+        for rule in &spec.tools.denied {
+            argv.extend(["--disallowedTools".to_string(), rule.clone()]);
+        }
+        if let Some(park) = &spec.park {
+            Self::park_plan(
+                spec,
+                &mut argv,
+                &mut plan,
+                &park.state_dir,
+                self.options.permissions.as_ref(),
+            )?;
+        }
 
         if let Some(dir) = &self.options.config_dir {
             plan.env.insert(
@@ -185,11 +239,65 @@ impl Harness for ClaudeHarness {
         Some(self)
     }
 
+    fn park(&self) -> Option<&dyn Park> {
+        Some(self)
+    }
+
     fn capabilities(&self) -> Capabilities {
         let mut c = Capabilities::of_harness(self);
         c.interrupt = Cap::declared(true);
         c.input_queue = Cap::declared(true);
         c
+    }
+}
+
+impl Park for ClaudeHarness {
+    fn plan_unpark(&self, parked: &ParkedRun, answers: &[ParkAnswer]) -> Result<Unpark, PlanError> {
+        let Some(park) = &parked.spec.park else {
+            return Err(PlanError::Conflict {
+                what: "this run was not started to park".into(),
+            });
+        };
+        for a in answers {
+            let known = parked
+                .calls
+                .iter()
+                .any(|c| c.tool_use_id == a.call.tool_use_id);
+            if !known {
+                return Err(PlanError::Conflict {
+                    what: format!("{} isn't pending in this run", a.call.tool_use_id),
+                });
+            }
+        }
+        // Resume ignores where it's launched from, and takes the tool with it, so
+        // this is the parked cwd and never a caller's.
+        let spec = RunSpec {
+            cwd: parked.cwd.clone(),
+            session: SessionMode::Resume {
+                id: parked.session.clone(),
+            },
+            continues: Some(parked.turn),
+            turns_before: parked.turn.0.saturating_sub(1),
+            ..parked.spec.clone()
+        };
+        let mut plan = self.build(&spec)?;
+        if let Some(cwd) = &spec.cwd {
+            plan.needs
+                .push(Need::ExistingDirectory { path: cwd.clone() });
+        }
+        for a in answers {
+            plan.files.push(park::answer_file(&park.state_dir, a)?);
+        }
+        Ok(Unpark { spec, plan })
+    }
+
+    fn message(
+        &self,
+        call: &ParkedCall,
+        answer: &plexus_harness::InputAnswer,
+        may_have_started: bool,
+    ) -> UserInput {
+        UserInput::text(park::message(call, answer, may_have_started))
     }
 }
 

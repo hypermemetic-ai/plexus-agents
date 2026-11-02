@@ -135,6 +135,16 @@ async fn meet(need: &Need, env: &BTreeMap<String, String>) -> Result<(), SpawnEr
                 detail: e.to_string(),
             })
         }
+        Need::ExistingDirectory { path } => {
+            if Path::new(path).is_dir() {
+                Ok(())
+            } else {
+                Err(SpawnError::NeedUnmet {
+                    need: need.clone(),
+                    detail: "the directory is gone".into(),
+                })
+            }
+        }
     }
 }
 
@@ -146,11 +156,18 @@ fn place(file: &PlanFile, cwd: Option<&str>) -> Result<(), SpawnError> {
         detail,
     };
     let rel = Path::new(&file.path);
-    if !rel.components().all(|c| matches!(c, Component::Normal(_))) {
-        return Err(fail("must be a plain relative path".into()));
+    let plain = rel
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::RootDir));
+    if !plain {
+        return Err(fail("must be a plain path".into()));
     }
-    let base = cwd.ok_or_else(|| fail("the plan has no cwd".into()))?;
-    let dest = Path::new(base).join(rel);
+    let dest = if rel.is_absolute() {
+        rel.to_path_buf()
+    } else {
+        let base = cwd.ok_or_else(|| fail("the plan has no cwd".into()))?;
+        Path::new(base).join(rel)
+    };
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir).map_err(|e| fail(e.to_string()))?;
     }

@@ -70,6 +70,7 @@ fn tools_and_rules_are_passed_exactly() {
         tools: ToolPolicy {
             enabled: Some(vec![ToolName::new("Bash"), ToolName::new("Read")]),
             preapproved: vec!["Bash(sh slow-tool.sh)".into()],
+            denied: vec![],
         },
         ..RunSpec::default()
     };

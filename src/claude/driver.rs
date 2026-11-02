@@ -10,16 +10,16 @@ use futures::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use futures::lock::Mutex as AsyncMutex;
 use futures::stream::{BoxStream, StreamExt};
 use plexus_harness::{
-    AgentEvent, AgentEventKind, Attribution, BoxAsyncRead, BoxAsyncWrite, CancelReason, DriveError,
-    EnvName, EnvValue, EventLog, EventSeq, ExitInfo, FailureKind, InputAnswer, InputKind,
-    InputOutcome, InputQueue, InputRequest, InputRequestId, InputResponder, Interrupt,
-    InterruptOutcome, McpTransport, MemoryInputQueue, ModelName, Process, ProcessSignal, RawFrame,
-    ResolvedSecret, Run, RunEndReason, RunError, RunId, RunInfo, RunSpec, SecretResolver,
-    SessionId, SessionMode, Signal, StopCause, StopMode, StopReport, SubagentId, TaskId,
-    ThreadDisposition, ToolName, ToolUseId, TurnFailure, TurnId, TurnOrigin, TurnStatus,
-    TurnTerminal, UserInput,
+    now_ms, AgentEvent, AgentEventKind, Attribution, BoxAsyncRead, BoxAsyncWrite, CancelReason,
+    DriveError, EnvName, EnvValue, EventLog, EventSeq, ExitInfo, FailureKind, InputAnswer,
+    InputKind, InputOutcome, InputQueue, InputRequest, InputRequestId, InputResponder, InputRoute,
+    Interrupt, InterruptOutcome, McpTransport, MemoryInputQueue, ModelName, ParkedCall, ParkedRun,
+    Process, ProcessSignal, RawFrame, ResolvedSecret, Run, RunEndReason, RunError, RunId, RunInfo,
+    RunSpec, SecretResolver, SessionId, SessionMode, Signal, StopCause, StopMode, StopReport,
+    SubagentId, TaskId, ThreadDisposition, ToolName, ToolUseId, TurnFailure, TurnId, TurnOrigin,
+    TurnStatus, TurnTerminal, UserInput,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,6 +27,8 @@ use std::time::Duration;
 use tokio::sync::{oneshot, watch};
 
 const MCP_ACK: Duration = Duration::from_secs(30);
+/// How long a parked process has to exit by itself before it's killed.
+const PARK_EXIT: Duration = Duration::from_secs(8);
 const FORCE_WAIT: Duration = Duration::from_secs(10);
 /// Most stderr kept for reading a failure out of it.
 const STDERR_TAIL: usize = 8192;
@@ -67,6 +69,10 @@ struct State {
     agent_of_tool: HashMap<String, String>,
     /// Which turn a `tool_use` was made in.
     turn_of_tool: HashMap<String, TurnId>,
+    /// The root agent's calls with no `tool_result` yet, in order. `result` names
+    /// only one deferred call, so this is where a batch's pending calls are read.
+    open_calls: Vec<(ToolUseId, ToolName, Value)>,
+    parked: Option<ParkedRun>,
     session: Option<SessionId>,
     session_reported: bool,
     /// The run itself is being stopped.
@@ -91,6 +97,7 @@ struct Shared {
     ended: watch::Sender<bool>,
     /// How many tasks are live, for an interrupt with no turn to wait on.
     live: watch::Sender<usize>,
+    spec: RunSpec,
     next_control: AtomicU64,
 }
 
@@ -301,6 +308,11 @@ impl InputResponder for Responder {
     ) -> BoxFuture<'static, Result<(), String>> {
         let shared = self.0.clone();
         async move {
+            // A parked run has nothing to write to. The answer stays on the
+            // request, for `Park::plan_unpark`.
+            if shared.state().parked.is_some() {
+                return Ok(());
+            }
             let native = shared.state().native_of.get(&request.id).cloned();
             let native = native.ok_or("the request has no native id")?;
             if matches!(
@@ -435,13 +447,20 @@ fn on_assistant(shared: &Shared, frame: Frame) {
                 text: b["text"].as_str().unwrap_or("").to_string(),
             },
             Some("tool_use") => {
-                let id = b["id"].as_str().unwrap_or("");
+                let id = ToolUseId::new(b["id"].as_str().unwrap_or(""));
+                let name = ToolName::new(b["name"].as_str().unwrap_or(""));
+                let mut g = shared.state();
                 if let Some(turn) = who.turn {
-                    shared.state().turn_of_tool.insert(id.to_string(), turn);
+                    g.turn_of_tool.insert(id.to_string(), turn);
                 }
+                if who.agent.is_none() {
+                    g.open_calls
+                        .push((id.clone(), name.clone(), b["input"].clone()));
+                }
+                drop(g);
                 AgentEventKind::ToolCall {
-                    id: ToolUseId::new(id),
-                    name: ToolName::new(b["name"].as_str().unwrap_or("")),
+                    id,
+                    name,
                     input: b["input"].clone(),
                 }
             }
@@ -471,6 +490,10 @@ fn on_user(shared: &Shared, frame: Frame) {
         return;
     }
     for (id, is_error, output) in results {
+        shared
+            .state()
+            .open_calls
+            .retain(|(c, _, _)| c.as_str() != id);
         let kind = AgentEventKind::ToolResult {
             id: ToolUseId::new(id),
             is_error,
@@ -615,7 +638,7 @@ fn on_control_request(shared: &Shared, queue: &MemoryInputQueue, frame: Frame) {
     let native = f["request_id"].as_str().unwrap_or("").to_string();
     let who = shared.who_of(f["request"]["agent_id"].as_str());
     let turn = who.turn.unwrap_or(TurnId(0));
-    let r = queue.enqueue_as(turn, who.agent.clone(), kind, f);
+    let r = queue.enqueue_as(turn, who.agent.clone(), InputRoute::Live, kind, f);
     {
         let mut g = shared.state();
         g.native_of.insert(r.id.clone(), native.clone());
@@ -661,6 +684,93 @@ fn on_control_response(shared: &Shared, frame: Frame) {
         },
         Some(raw),
     );
+}
+
+/// `stop_reason: tool_deferred`. The turn isn't over: it waits on every call that
+/// has no result, and `result` itself names only the last of a batch. A call
+/// deferred again on resume sends no `tool_use`, so `result`'s one is added.
+async fn on_deferred(shared: &Shared, queue: &MemoryInputQueue, frame: Frame) {
+    let Frame { v: f, raw } = frame;
+    let turn = shared.take_turn(!f["origin"].is_null());
+    let who = Attribution::turn(turn.id);
+    if let Some(usage) = frames::usage(&f) {
+        let kind = AgentEventKind::Tokens {
+            turn: turn.id,
+            usage,
+        };
+        shared.emit_as(who.clone(), kind, None);
+    }
+    let reported = f["deferred_tool_use"]["id"].as_str().map(ToolUseId::new);
+    let mut open = std::mem::take(&mut shared.state().open_calls);
+    if let Some(id) = &reported {
+        if !open.iter().any(|(c, _, _)| c == id) {
+            let d = &f["deferred_tool_use"];
+            let name = ToolName::new(d["name"].as_str().unwrap_or(""));
+            open.push((id.clone(), name, d["input"].clone()));
+        }
+    }
+    let mut calls = Vec::new();
+    for (id, tool, input) in open {
+        let kind = frames::input_kind(&json!({
+            "subtype": "can_use_tool",
+            "tool_name": tool.as_str(),
+            "tool_use_id": id.as_str(),
+            "input": input,
+        }));
+        let frame = json!({"tool_use_id": id.as_str(), "tool_name": tool.as_str(), "input": input});
+        let r = queue.enqueue_as(turn.id, None, InputRoute::Parked, kind.clone(), frame);
+        shared.emit_as(
+            who.clone(),
+            AgentEventKind::InputRequested { id: r.id.clone() },
+            None,
+        );
+        calls.push(ParkedCall {
+            request: r.id,
+            tool_use_id: id,
+            tool,
+            input,
+            kind,
+            agent: None,
+        });
+    }
+    let ids = calls.iter().map(|c| c.tool_use_id.clone()).collect();
+    let session = shared
+        .state()
+        .session
+        .clone()
+        .unwrap_or_else(|| SessionId::new(""));
+    let event = shared.log.append_as(
+        who,
+        AgentEventKind::TurnParked {
+            turn: turn.id,
+            calls: ids,
+        },
+        Some(raw),
+    );
+    let parked = ParkedRun {
+        harness: "claude".into(),
+        session,
+        cwd: shared.spec.cwd.clone(),
+        turn: turn.id,
+        spec: shared.spec.clone(),
+        calls,
+        reported,
+        parked_at_ms: now_ms(),
+        last_seq: event.map_or(EventSeq(0), |e| e.seq),
+    };
+    shared.state().parked = Some(parked);
+    // The CLI exits by itself, but only a process that has gone counts as parked.
+    let _ = shared.close_stdin().await;
+    let signal = shared.signal.clone();
+    let mut ended = shared.ended.subscribe();
+    tokio::spawn(async move {
+        if tokio::time::timeout(PARK_EXIT, ended.wait_for(|e| *e))
+            .await
+            .is_err()
+        {
+            let _ = signal.signal(Signal::KillTree).await;
+        }
+    });
 }
 
 fn on_result(shared: &Shared, frame: Frame) {
@@ -763,6 +873,20 @@ async fn pump(
             ("control_request", _) => on_control_request(&shared, &queue, f),
             ("control_cancel_request", _) => on_cancel(&shared, &queue, f),
             ("control_response", _) => on_control_response(&shared, f),
+            ("attachment", _) if f.v["attachment"]["type"] == "hook_stopped_continuation" => {
+                // The hook's `continue: false` doesn't stop the model on a resume
+                // (AGENTS-37 park-deny-stop-turn), so the stop is an interrupt.
+                if let Some(t) = shared.state().turns.front_mut() {
+                    t.stop.get_or_insert(StopCause::DenyAndStop);
+                }
+                let id = shared.control_id("interrupt");
+                let _ = shared.write(&frames::interrupt(&id)).await;
+                let name = "attachment".to_string();
+                shared.emit(AgentEventKind::Native { name }, Some(f.raw));
+            }
+            ("result", _) if f.v["stop_reason"] == "tool_deferred" => {
+                on_deferred(&shared, &queue, f).await
+            }
             ("result", _) => on_result(&shared, f),
             (other, subtype) => {
                 let name = match subtype {
@@ -780,7 +904,10 @@ async fn pump(
 }
 
 fn finish(shared: &Shared, queue: &MemoryInputQueue, exit: ExitInfo) {
-    shared.cancel_pending(queue, CancelReason::RunEnded);
+    let parked = shared.state().parked.is_some();
+    if !parked {
+        shared.cancel_pending(queue, CancelReason::RunEnded);
+    }
     let (open, stopping, refused, closed) = {
         let mut g = shared.state();
         g.exit = Some(exit);
@@ -841,6 +968,7 @@ fn finish(shared: &Shared, queue: &MemoryInputQueue, exit: ExitInfo) {
     let reason = match (refused, stopping, closed) {
         (true, _, _) => RunEndReason::Refused,
         (_, Some(cause), _) => RunEndReason::Stopped(cause),
+        (_, None, _) if parked => RunEndReason::Parked,
         (_, None, true) => RunEndReason::Closed,
         (_, None, false) => RunEndReason::ProcessExited,
     };
@@ -932,15 +1060,28 @@ pub async fn drive(
         SessionMode::Fresh => None,
         SessionMode::Assign { id } | SessionMode::Resume { id } => Some(id.clone()),
     };
+    let mut state = State {
+        session,
+        next_turn: spec.turns_before,
+        ..State::default()
+    };
+    // An unparked run has no prompt to open its turn, so it opens here.
+    if let Some(turn) = spec.continues {
+        state.next_turn = turn.0;
+        state.turns.push_back(OpenTurn {
+            id: turn,
+            stop: None,
+            origin: TurnOrigin::Resume,
+            began: false,
+        });
+    }
     let shared = Arc::new(Shared {
+        spec: spec.clone(),
         run: run.clone(),
         pid,
         options,
         log: EventLog::new(),
-        state: Mutex::new(State {
-            session,
-            ..State::default()
-        }),
+        state: Mutex::new(state),
         writer: AsyncMutex::new(Some(stdin)),
         signal,
         stderr: Mutex::new(String::new()),
@@ -952,6 +1093,14 @@ pub async fn drive(
         run,
         Arc::new(Responder(shared.clone())),
     ));
+    if let Some(turn) = spec.continues {
+        let origin = TurnOrigin::Resume;
+        shared.emit_as(
+            Attribution::turn(turn),
+            AgentEventKind::TurnStarted { turn, origin },
+            None,
+        );
+    }
     let errors = tokio::spawn(drain_stderr(shared.clone(), stderr));
     tokio::spawn(pump(shared.clone(), queue.clone(), stdout, errors, wait));
     attach_mcp(&shared, &spec, secrets.as_ref()).await?;
@@ -1079,6 +1228,10 @@ impl Run for ClaudeRun {
 
     fn interrupt(&self) -> Option<&dyn Interrupt> {
         Some(self)
+    }
+
+    fn parked(&self) -> Option<ParkedRun> {
+        self.shared.state().parked.clone()
     }
 
     fn inputs(&self) -> Option<Arc<dyn InputQueue>> {
