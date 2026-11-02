@@ -1,8 +1,8 @@
 //! AGENTS-30's route, compiled on published Plexus 0.7.0: an activation adapter
-//! over `Arc<dyn Harness>` streams the contract's types. The activation itself is
-//! AGENTS-13; this test keeps those types usable by it.
+//! over `Arc<dyn Harness>` streams the contract's types. `service::HarnessActivation`
+//! is the real one; this test keeps every contract type usable by it.
 //!
-//! An activation yields one event type across its methods, so AGENTS-13 needs a
+//! An activation yields one event type across its methods, so the service has a
 //! wire enum like `WireEvent` here. Every contract type fits inside one.
 
 use futures::stream::{self, Stream};

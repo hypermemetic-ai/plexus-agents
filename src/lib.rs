@@ -8,6 +8,7 @@ mod local;
 pub mod record;
 pub mod runner;
 pub mod runtime;
+pub mod service;
 
 pub use claude::{ClaudeHarness, ClaudeOptions, SUPPORTED_CLI_VERSIONS};
 pub use local::LocalEnvironment;
