@@ -1,0 +1,147 @@
+{
+ "cli_version": "2.1.316 (Claude Code)",
+ "model": "haiku",
+ "cases": {
+  "restart-parked": {
+   "claims": {
+    "it parked": true,
+    "nothing ran": true,
+    "the request survived the restart": true,
+    "a prompt is refused while it's undecided": true,
+    "a new service's answer resumed it": true,
+    "the tool ran once": true,
+    "the answer is applied": true,
+    "the global sequence has no gaps or repeats": true,
+    "the turn ended once, across both runs": true
+   },
+   "facts": {}
+  },
+  "crash-mid-tool": {
+   "claims": {
+    "the answer's outcome is unknown": true,
+    "the orphaned process was killed": true,
+    "nothing started again on restart": true,
+    "the thread shows it": true,
+    "the call came back undecided": true,
+    "marked as maybe already run": true,
+    "not re-applied": true,
+    "a person's no ended it": true,
+    "the tool started exactly once": true
+   },
+   "facts": {
+    "recovery": {
+     "expired": [],
+     "interrupted": [
+      "87c63d8e-7ad3-461f-bf23-9b67478b26f9"
+     ],
+     "outcome_unknown": [
+      "617547da-c0af-48f8-8aa4-cdd57799801c:input:1"
+     ],
+     "reaped": 1,
+     "rerouted": []
+    },
+    "after_continue": {
+     "inputs": [
+      {
+       "after_unknown_outcome": false,
+       "delivery": "outcome_unknown",
+       "id": "617547da-c0af-48f8-8aa4-cdd57799801c:input:1",
+       "route": "parked",
+       "tool_use_id": "toolu_0127jGPDkAAv3PwkTngto95o"
+      },
+      {
+       "after_unknown_outcome": true,
+       "delivery": "pending",
+       "id": "1bcb3683-6838-45c2-9710-1210846842e8:input:1",
+       "route": "parked",
+       "tool_use_id": "toolu_0127jGPDkAAv3PwkTngto95o"
+      }
+     ],
+     "live": false,
+     "thread": {
+      "cwd": "<scratch>/real/agents9-531v2wxi/cwd",
+      "harness": "claude",
+      "id": "39340194-ba71-4e83-a2dc-d1dd62b24af1",
+      "last_seq": 42,
+      "last_turn": 1,
+      "outcome_unknown": [
+       "617547da-c0af-48f8-8aa4-cdd57799801c:input:1"
+      ],
+      "pending": [
+       "1bcb3683-6838-45c2-9710-1210846842e8:input:1"
+      ],
+      "runs": 3,
+      "session": "0df5dff5-977e-4d9b-9716-b5981110d2cc",
+      "status": "parked"
+     }
+    },
+    "effects": [
+     "start"
+    ]
+   }
+  },
+  "live-pending-killed": {
+   "claims": {
+    "the live request went over to a message": true,
+    "it's still answerable": true,
+    "the tool ran once": true,
+    "nobody was asked again": true
+   },
+   "facts": {
+    "recovery": {
+     "expired": [],
+     "interrupted": [
+      "190c4415-4f19-49cc-a292-a3e0ef9ea9dd"
+     ],
+     "outcome_unknown": [],
+     "reaped": 1,
+     "rerouted": [
+      "190c4415-4f19-49cc-a292-a3e0ef9ea9dd:input:1"
+     ]
+    },
+    "inputs": [
+     {
+      "after_unknown_outcome": false,
+      "delivery": "superseded",
+      "id": "190c4415-4f19-49cc-a292-a3e0ef9ea9dd:input:1",
+      "route": "message",
+      "tool_use_id": "toolu_01PaZ66fE3ZN2q87mV3FQsMt"
+     },
+     {
+      "after_unknown_outcome": false,
+      "delivery": "applied",
+      "id": "b6f064ef-a88d-40a2-868b-a6043fd44f36:input:1",
+      "route": "live",
+      "tool_use_id": "toolu_01XKhuwXeEfrUBqAaFbtPxP1"
+     }
+    ]
+   }
+  },
+  "restart-mid-run": {
+   "claims": {
+    "the run was closed out": true,
+    "the turn is interrupted": true,
+    "the run says it was lost": true,
+    "a prompt resumes": true,
+    "it's the next turn of the same thread": true,
+    "as a second run": true
+   },
+   "facts": {
+    "recovery": {
+     "expired": [],
+     "interrupted": [
+      "ab59a151-0cac-4a83-ae2d-3436e65a5c0a"
+     ],
+     "outcome_unknown": [],
+     "reaped": 1,
+     "rerouted": []
+    },
+    "kinds_tail": [
+     "text.delta",
+     "turn.terminal",
+     "run.ended"
+    ]
+   }
+  }
+ }
+}

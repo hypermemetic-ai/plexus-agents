@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""AGENTS-9's crash checks against the real CLI, through a service that gets killed.
+
+Spends tokens on the logged-in account: haiku, short prompts, throwaway directories.
+Set AGENTS_REAL=spend-tokens. Usage: runtime-real OUT_DIR [case...]
+Writes OUT_DIR/<case>/svcN/ recordings, and OUT_DIR/run.json with each case's claims.
+"""
+import json, os, shutil, signal, subprocess, sys, tempfile, time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+SERVICE = ROOT / "target/debug/examples/agents_service"
+SLOW = "printf 'start\\n' >> effects.log; sleep 25; printf 'end\\n' >> effects.log\n"
+EFFECT = "printf 'ran\\n' >> effects.log\n"
+
+
+def prompt_for(cmd):
+    return (f"Run this exact Bash command, then reply with only the word done: {cmd}\n"
+            "If the call is refused, reply with only the word refused.")
+
+
+class Service:
+    def __init__(self, case, n):
+        self.case = case
+        out = case.out / f"svc{n}"
+        self.p = subprocess.Popen(
+            [SERVICE, "--db", case.db, "--state", case.state, "--record", out,
+             "--plans", case.out / "plans.jsonl"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, env={k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"})
+        self.ready = json.loads(self.p.stdout.readline())
+
+    def op(self, op, **k):
+        self.p.stdin.write(json.dumps({"op": op, **k}) + "\n")
+        self.p.stdin.flush()
+        return json.loads(self.p.stdout.readline())
+
+    def kill(self):
+        self.p.send_signal(signal.SIGKILL)
+        self.p.wait()
+
+    def status(self, t):
+        return self.op("status", thread=t)["ok"]
+
+    def kinds(self):
+        return [e["event"]["kind"] for e in self.op("events", since=0)["ok"]["events"]]
+
+    def wait(self, what, secs=120):
+        end = time.time() + secs
+        while time.time() < end:
+            v = what()
+            if v:
+                return v
+            time.sleep(0.2)
+        raise TimeoutError(what)
+
+    def wait_settled(self, t, secs=120):
+        def done():
+            s = self.status(t)
+            return s if s["thread"]["status"] in ("idle", "parked", "broken") else None
+        return self.wait(done, secs)
+
+    def pending(self, t):
+        return [i for i in self.status(t)["inputs"] if i["delivery"] == "pending"]
+
+
+class Case:
+    def __init__(self, name, root):
+        self.name = name
+        self.out = root / name
+        self.out.mkdir(parents=True, exist_ok=True)
+        self.tmp = Path(tempfile.mkdtemp(prefix="agents9-", dir=os.environ.get("TMPDIR")))
+        self.cwd = self.tmp / "cwd"
+        self.cwd.mkdir()
+        self.db = self.tmp / "runtime.db"
+        self.state = self.tmp / "state"
+        self.claims = {}
+        self.facts = {}
+        self.n = 0
+
+    def service(self):
+        self.n += 1
+        return Service(self, self.n)
+
+    def claim(self, name, ok):
+        print(f"    {'ok  ' if ok else 'FAIL'} {name}", flush=True)
+        self.claims[name] = bool(ok)
+
+    def write(self, name, body):
+        (self.cwd / name).write_text(body)
+
+    def effects(self):
+        f = self.cwd / "effects.log"
+        return f.read_text().split("\n")[:-1] if f.exists() else []
+
+
+def park_across_restart(c):
+    c.write("effect.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True)["ok"]["thread"]
+    a.op("prompt", thread=t, text=prompt_for("sh effect.sh"))
+    s = a.wait_settled(t)
+    c.claim("it parked", s["thread"]["status"] == "parked" and not s["live"])
+    c.claim("nothing ran", c.effects() == [])
+    a.kill()
+    b = c.service()
+    s = b.status(t)
+    c.claim("the request survived the restart", len(s["thread"]["pending"]) == 1)
+    c.claim("a prompt is refused while it's undecided",
+            "undecided" in b.op("prompt", thread=t, text="hello").get("error", ""))
+    b.op("answer", thread=t, id=s["thread"]["pending"][0], allow=True)
+    b.wait(lambda: "turn.terminal" in b.kinds())
+    s = b.status(t)
+    c.claim("a new service's answer resumed it", s["thread"]["runs"] == 2)
+    c.claim("the tool ran once", len(c.effects()) == 1)
+    c.claim("the answer is applied", s["inputs"][0]["delivery"] == "applied")
+    seqs = [e["seq"] for e in b.op("events", since=0)["ok"]["events"]]
+    c.claim("the global sequence has no gaps or repeats",
+            seqs == list(range(seqs[0], seqs[0] + len(seqs))))
+    kinds = b.kinds()
+    c.claim("the turn ended once, across both runs", kinds.count("turn.terminal") == 1)
+    b.kill()
+
+
+def crash_mid_tool(c):
+    c.write("slow.sh", SLOW)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True)["ok"]["thread"]
+    a.op("prompt", thread=t, text=prompt_for("sh slow.sh"))
+    s = a.wait_settled(t)
+    first = s["thread"]["pending"][0]
+    a.op("answer", thread=t, id=first, allow=True)
+    a.wait(lambda: "start" in c.effects(), 60)
+    a.kill()
+    b = c.service()
+    r = b.ready["recovery"]
+    c.facts["recovery"] = r
+    c.claim("the answer's outcome is unknown", r["outcome_unknown"] == [first])
+    c.claim("the orphaned process was killed", r["reaped"] == 1)
+    s = b.status(t)
+    c.claim("nothing started again on restart", s["thread"]["status"] == "parked" and not s["live"])
+    time.sleep(1)
+    c.claim("the thread shows it", s["thread"]["outcome_unknown"] == [first])
+    b.op("continue", thread=t)
+    s = b.wait_settled(t)
+    p = [i for i in s["inputs"] if i["delivery"] == "pending"]
+    c.facts["after_continue"] = s
+    c.claim("the call came back undecided", len(p) == 1)
+    c.claim("marked as maybe already run", p and p[0]["after_unknown_outcome"])
+    c.claim("not re-applied", c.effects().count("start") == 1)
+    b.op("answer", thread=t, id=p[0]["id"], allow=False, message="Do not run it again.")
+    b.wait(lambda: "turn.terminal" in b.kinds())
+    c.claim("a person's no ended it", b.kinds().count("turn.terminal") == 1)
+    c.claim("the tool started exactly once", c.effects().count("start") == 1)
+    c.facts["effects"] = c.effects()
+    b.kill()
+
+
+def pending_live_killed(c):
+    c.write("effect.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=False)["ok"]["thread"]
+    a.op("prompt", thread=t, text=prompt_for("sh effect.sh"))
+    a.wait(lambda: a.pending(t), 90)
+    a.kill()
+    b = c.service()
+    r = b.ready["recovery"]
+    c.facts["recovery"] = r
+    c.claim("the live request went over to a message", len(r["rerouted"]) == 1)
+    s = b.status(t)
+    c.claim("it's still answerable", len(s["thread"]["pending"]) == 1)
+    b.op("answer", thread=t, id=s["thread"]["pending"][0], allow=True)
+    b.wait(lambda: b.kinds().count("turn.terminal") >= 2)
+    s = b.status(t)
+    c.facts["inputs"] = s["inputs"]
+    c.claim("the tool ran once", len(c.effects()) == 1)
+    c.claim("nobody was asked again", s["thread"]["pending"] == [])
+    b.kill()
+
+
+def restart_mid_run(c):
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=False)["ok"]["thread"]
+    a.op("prompt", thread=t,
+         text="Write a three-hundred word description of the sea, with no tools.")
+    a.wait(lambda: "text.delta" in a.kinds(), 60)
+    a.kill()
+    b = c.service()
+    r = b.ready["recovery"]
+    c.facts["recovery"] = r
+    c.claim("the run was closed out", len(r["interrupted"]) == 1)
+    kinds = b.kinds()
+    c.facts["kinds_tail"] = kinds[-3:]
+    c.claim("the turn is interrupted", "turn.terminal" in kinds)
+    c.claim("the run says it was lost", kinds[-1] == "run.ended")
+    v = b.op("prompt", thread=t, text="Reply with only the word ok.")
+    c.claim("a prompt resumes", "ok" in v)
+    s = b.wait(lambda: (x := b.op("events", since=0)["ok"]["events"]) and
+               sum(e["event"]["kind"] == "turn.terminal" for e in x) == 2)
+    s = b.status(t)
+    c.claim("it's the next turn of the same thread", s["thread"]["last_turn"] == 2)
+    c.claim("as a second run", s["thread"]["runs"] == 2)
+    b.kill()
+
+
+CASES = {"restart-parked": park_across_restart, "crash-mid-tool": crash_mid_tool,
+         "live-pending-killed": pending_live_killed, "restart-mid-run": restart_mid_run}
+
+
+def main():
+    if os.environ.get("AGENTS_REAL") != "spend-tokens":
+        sys.exit("set AGENTS_REAL=spend-tokens")
+    root = Path(sys.argv[1])
+    names = sys.argv[2:] or list(CASES)
+    report = {}
+    for name in names:
+        print(name, flush=True)
+        c = Case(name, root)
+        try:
+            CASES[name](c)
+        except Exception as e:
+            c.claim(f"finished: {e!r}", False)
+        report[name] = {"claims": c.claims, "facts": c.facts}
+        shutil.rmtree(c.tmp, ignore_errors=True)
+    version = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout
+    (root / "run.json").write_text(json.dumps(
+        {"cli_version": version.strip(), "model": "haiku", "cases": report}, indent=1))
+
+
+main()
