@@ -13,15 +13,16 @@ mod supervisor;
 
 pub use store::{EventLog, ReadFilter, Store, StoreError, StoredEvent, Tx};
 pub use supervisor::{
-    Delivery, InputRecord, Recovery, RuntimeError, Supervisor, SupervisorConfig, ThreadOptions,
-    ThreadStatus, ThreadView,
+    Delivery, InputRecord, Recovery, RuntimeError, Supervisor, SupervisorConfig, ThreadHome,
+    ThreadOptions, ThreadStatus, ThreadView,
 };
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A conversation, across however many processes it takes.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
 pub struct ThreadId(pub String);
 
@@ -42,6 +43,8 @@ impl fmt::Display for ThreadId {
 
 /// A place in the whole log. This is what `since` means, across runs and threads.
 /// `GlobalSeq(0)` is the start.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(transparent)]
 pub struct GlobalSeq(pub u64);

@@ -10,6 +10,7 @@ use super::{GlobalSeq, ThreadId};
 use futures::stream::{self, BoxStream, StreamExt};
 use plexus_harness::{AgentEvent, RawFrame, RunId};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
@@ -20,7 +21,8 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS threads (
     id TEXT PRIMARY KEY, harness TEXT NOT NULL, spec TEXT NOT NULL, cwd TEXT,
     session TEXT, status TEXT NOT NULL, last_turn INTEGER NOT NULL DEFAULT 0,
-    started INTEGER NOT NULL DEFAULT 0, parked TEXT, note TEXT, created_ms INTEGER NOT NULL);
+    started INTEGER NOT NULL DEFAULT 0, parked TEXT, note TEXT, created_ms INTEGER NOT NULL,
+    owner TEXT, placement TEXT);
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY, thread TEXT NOT NULL, pid INTEGER, identity TEXT,
     live INTEGER NOT NULL, reason TEXT, started_ms INTEGER NOT NULL, ended_ms INTEGER);
@@ -59,7 +61,7 @@ impl From<serde_json::Error> for StoreError {
 }
 
 /// One event in the log: where it sits overall, and which thread and run it's from.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct StoredEvent {
     pub seq: GlobalSeq,
     pub thread: ThreadId,

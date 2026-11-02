@@ -2,14 +2,21 @@
 name = "plexus-agents"
 version = "0.1.0"
 edition = "2021"
-description = "Harness implementations for Plexus: LocalEnvironment and the Claude harness"
+description = "The agents service for Plexus: the Claude harness, the runtime and the agents activation"
 license = "MIT"
 
 [dependencies]
 # Unpublished, so by local path for now. Everything else is a published crate.
 plexus-harness = { path = "../plexus-harness" }
 plexus-core = "0.7.0"
+plexus-macros = "0.7.0"
+plexus-transport = { version = "0.6.0", default-features = false }
+plexus-auth-core = { version = "0.2.2", features = ["oidc-reqwest"] }
+anyhow = "1"
+async-stream = "0.3"
+async-trait = "0.1"
 futures = "0.3"
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 libc = "0.2"
 rusqlite = { version = "0.31", features = ["bundled"] }
 schemars = "1.1"
@@ -20,9 +27,11 @@ tokio-util = { version = "0.7", features = ["compat"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-plexus-macros = "0.7.0"
 tempfile = "3"
-async-stream = "0.3"
-async-trait = "0.1"
-jsonrpsee = { version = "0.26", features = ["server", "macros"] }
+jsonrpsee = { version = "0.26", features = ["server", "macros", "ws-client"] }
+jsonwebtoken = "9"
+rsa = "0.9"
+rand = "0.8"
+base64 = "0.22"
+url = "2"
 plexus-harness = { path = "../plexus-harness", features = ["conformance"] }

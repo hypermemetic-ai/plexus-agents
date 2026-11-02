@@ -70,6 +70,7 @@ async fn open(scripts: Vec<ReplayScript>) -> Fixture {
     let (supervisor, recovery) = Supervisor::open(SupervisorConfig {
         db: dir.path().join("runtime.db"),
         environment: Arc::new(env),
+        placements: Default::default(),
         harnesses: vec![Arc::new(ClaudeHarness::default())],
     })
     .await
@@ -97,7 +98,14 @@ fn spec() -> RunSpec {
 
 fn thread(f: &Fixture, park: bool) -> ThreadId {
     f.supervisor
-        .create_thread("claude", spec(), ThreadOptions { park })
+        .create_thread(
+            "claude",
+            spec(),
+            ThreadOptions {
+                park,
+                ..ThreadOptions::default()
+            },
+        )
         .unwrap()
 }
 
@@ -465,7 +473,7 @@ async fn a_batch_parks_for_each_call_and_says_what_already_ran() {
         .unwrap()
         .iter()
         .filter_map(|e| match &e.event.kind {
-            AgentEventKind::UserMessage { text } => Some(text.clone()),
+            AgentEventKind::UserMessage { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect();
@@ -516,6 +524,55 @@ async fn a_thread_that_doesnt_park_holds_its_process_open() {
     );
 }
 
+/// A live answer's event comes from the harness, which doesn't know who answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_answers_event_says_who_gave_it() {
+    let dir = set(SET_37).join("live-without-park/svc1");
+    let f = open(vec![phase(dir, "1-claude", false)]).await;
+    let t = thread(&f, false);
+    f.supervisor
+        .prompt(&t, UserInput::text("the recorded prompt"))
+        .await
+        .unwrap();
+    until(|| !f.supervisor.thread(&t).unwrap().pending.is_empty()).await;
+    let id = f.supervisor.thread(&t).unwrap().pending[0].clone();
+    let ada = plexus_harness::Actor {
+        id: "idp:ada".into(),
+        name: None,
+    };
+    let other = f
+        .supervisor
+        .create_thread("claude", spec(), Default::default());
+    let refused = f
+        .supervisor
+        .answer_as(&other.unwrap(), &id, allow(), ada.clone())
+        .await;
+    assert!(matches!(
+        refused,
+        Err(plexus_harness::InputError::NotFound(_))
+    ));
+    f.supervisor
+        .answer_as(&t, &id, allow(), ada.clone())
+        .await
+        .unwrap();
+    until(|| terminals(&f, &t) == 1).await;
+    let filter = ReadFilter {
+        thread: Some(t.clone()),
+        without_raw: true,
+    };
+    let log = f.supervisor.log();
+    let by: Vec<_> = log
+        .page(&filter, GlobalSeq(0), 100_000)
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.event.kind {
+            AgentEventKind::InputResolved { by, .. } => Some(by),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(by, vec![Some(ada)]);
+}
+
 /// Nothing needs a process to end a turn, and the reason waits for the next prompt.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_deny_that_stops_ends_the_turn_with_no_process_and_the_next_prompt_says_why() {
@@ -554,7 +611,7 @@ async fn a_deny_that_stops_ends_the_turn_with_no_process_and_the_next_prompt_say
             .unwrap()
             .iter()
             .filter_map(|e| match &e.event.kind {
-                AgentEventKind::UserMessage { text } => Some(text.clone()),
+                AgentEventKind::UserMessage { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect()
@@ -604,6 +661,47 @@ async fn a_rerouted_answer_covers_an_exact_retry_and_nothing_else() {
     assert!(plexus_harness::retry_answer(&prior, &bash, &reworded).is_some());
 }
 
+/// A real retry that kept the command and reworded Bash's `description`, as the
+/// operator ruled: "ignore the desc." The answer covers it and nobody is asked again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_real_retry_with_a_reworded_description_takes_the_answer() {
+    let dir = set("agents-38-2026-11-01").join("svc");
+    let f = open(vec![
+        ReplayScript::load(
+            &dir,
+            "3-claude",
+            ReplayScript::exit_from_rc(0),
+            ExitTrigger::OnSignal,
+            0,
+        )
+        .unwrap(),
+        ReplayScript::load(
+            &dir,
+            "4-claude",
+            ReplayScript::exit_from_rc(0),
+            ExitTrigger::OnInputClose,
+            0,
+        )
+        .unwrap(),
+    ])
+    .await;
+    let t = parked(&f).await;
+    let id = f.supervisor.thread(&t).unwrap().pending[0].clone();
+    f.supervisor.answer(&id, allow()).await.unwrap();
+    until(|| terminals(&f, &t) == 1).await;
+    let records = f.supervisor.records(&t).unwrap();
+    let described = |i: usize| match &records[i].request.kind {
+        plexus_harness::InputKind::ToolApproval { input, .. } => input.clone(),
+        k => panic!("{k:?}"),
+    };
+    let (first, retry) = (described(0), described(1));
+    assert_eq!(first["command"], retry["command"]);
+    assert_ne!(first["description"], retry["description"]);
+    assert_eq!(records[0].delivery, Delivery::Superseded);
+    assert_eq!(records[1].delivery, Delivery::Applied, "the retry took it");
+    assert!(f.supervisor.pending().unwrap().is_empty(), "nobody asked");
+}
+
 /// The narrowest window: `Delivered` committed, and the process's run row didn't.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_crash_before_the_run_row_still_never_reapplies() {
@@ -624,6 +722,7 @@ async fn a_crash_before_the_run_row_still_never_reapplies() {
             steps: vec![],
             next: Arc::default(),
         }),
+        placements: Default::default(),
         harnesses: vec![Arc::new(ClaudeHarness::default())],
     })
     .await

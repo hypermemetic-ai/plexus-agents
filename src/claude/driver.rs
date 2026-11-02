@@ -241,7 +241,11 @@ impl Shared {
             };
             self.emit_as(
                 who,
-                AgentEventKind::InputResolved { id: r.id, outcome },
+                AgentEventKind::InputResolved {
+                    id: r.id,
+                    outcome,
+                    by: None,
+                },
                 None,
             );
         }
@@ -339,6 +343,7 @@ impl InputResponder for Responder {
                 AgentEventKind::InputResolved {
                     id: request.id,
                     outcome,
+                    by: None,
                 },
                 None,
             );
@@ -675,7 +680,11 @@ fn on_cancel(shared: &Shared, queue: &MemoryInputQueue, frame: Frame) {
                 turn: Some(r.turn),
                 agent: r.agent,
             };
-            let kind = AgentEventKind::InputResolved { id: r.id, outcome };
+            let kind = AgentEventKind::InputResolved {
+                id: r.id,
+                outcome,
+                by: None,
+            };
             shared.emit_as(who, kind, Some(raw));
         }
         // Our interrupt usually got there first, and a late cancel moves nothing.
@@ -1120,8 +1129,8 @@ impl Run for ClaudeRun {
             let carried = shared.state().feed.take();
             if let Some(turn) = carried {
                 let who = Attribution::turn(turn);
-                let text = input.text.clone();
-                shared.emit_as(who, AgentEventKind::UserMessage { text }, None);
+                let (text, by) = (input.text.clone(), input.by.clone());
+                shared.emit_as(who, AgentEventKind::UserMessage { text, by }, None);
                 shared.write(&frames::user(&input.text)).await?;
                 return Ok(turn);
             }
@@ -1147,8 +1156,8 @@ impl Run for ClaudeRun {
                 AgentEventKind::TurnStarted { turn, origin },
                 None,
             );
-            let text = input.text.clone();
-            shared.emit_as(who, AgentEventKind::UserMessage { text }, None);
+            let (text, by) = (input.text.clone(), input.by.clone());
+            shared.emit_as(who, AgentEventKind::UserMessage { text, by }, None);
             shared.write(&frames::user(&input.text)).await?;
             Ok(turn)
         }

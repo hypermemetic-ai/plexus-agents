@@ -30,25 +30,26 @@ use super::{GlobalSeq, ReadFilter, StoredEvent, ThreadId};
 use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{BoxStream, StreamExt};
 use plexus_harness::{
-    now_ms, resume_or_restart, retry_answer, same_call, AgentEvent, AgentEventKind, Attribution,
-    CancelReason, Environment, EventSeq, Harness, InputAnswer, InputError, InputFilter, InputKind,
-    InputOutcome, InputQueue, InputRequest, InputRequestId, InputRoute, InputState,
-    InterruptOutcome, ParkAnswer, ParkedCall, ParkedRun, Run, RunEndReason, RunError, RunId,
-    RunSpec, SessionId, SessionMode, StopCause, StopMode, StopReport, ThreadDisposition, ToolUseId,
-    TurnId, TurnStatus, TurnTerminal, UserInput,
+    now_ms, resume_or_restart, retry_answer, same_call, Actor, AgentEvent, AgentEventKind,
+    Attribution, CancelReason, Environment, EventSeq, Harness, InputAnswer, InputError,
+    InputFilter, InputKind, InputOutcome, InputQueue, InputRequest, InputRequestId, InputRoute,
+    InputState, InterruptOutcome, ParkAnswer, ParkedCall, ParkedRun, Run, RunEndReason, RunError,
+    RunId, RunSpec, SessionId, SessionMode, StopCause, StopMode, StopReport, ThreadDisposition,
+    ToolUseId, TurnId, TurnStatus, TurnTerminal, UserInput,
 };
 use rusqlite::{params, OptionalExtension};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 /// Most events committed in one transaction.
 const BATCH: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ThreadStatus {
     /// No process. A prompt starts or resumes one.
@@ -82,7 +83,7 @@ impl ThreadStatus {
 }
 
 /// Where an answer is on its way to a tool (AGENTS-33).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Delivery {
     /// No answer yet.
@@ -127,7 +128,7 @@ impl Delivery {
 }
 
 /// A request, as the runtime holds it.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct InputRecord {
     pub thread: ThreadId,
     pub run: RunId,
@@ -140,10 +141,14 @@ pub struct InputRecord {
 }
 
 /// What a client needs to draw a thread without replaying it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ThreadView {
     pub id: ThreadId,
     pub harness: String,
+    /// Who started it. `None` where nobody verifies callers.
+    pub owner: Option<Actor>,
+    /// The name its environment goes by. `None` is the default environment.
+    pub placement: Option<String>,
     pub status: ThreadStatus,
     pub cwd: Option<String>,
     pub session: Option<SessionId>,
@@ -174,6 +179,7 @@ pub struct Recovery {
 pub enum RuntimeError {
     NoThread(ThreadId),
     NoHarness(String),
+    NoPlacement(String),
     /// A prompt on a thread with an undecided request. A prompt would drop the
     /// call, and a late answer with it (AGENTS-33 `h_prompt_undecided`). Answer the
     /// requests, or cancel them with `interrupt`.
@@ -194,6 +200,7 @@ impl fmt::Display for RuntimeError {
         match self {
             Self::NoThread(t) => write!(f, "no thread {t}"),
             Self::NoHarness(h) => write!(f, "no harness {h}"),
+            Self::NoPlacement(p) => write!(f, "no placement {p}"),
             Self::Undecided { thread, requests } => {
                 write!(f, "thread {thread} has undecided requests: {requests:?}")
             }
@@ -222,15 +229,29 @@ impl From<RunError> for RuntimeError {
 
 pub struct SupervisorConfig {
     pub db: PathBuf,
+    /// Where a thread with no placement runs.
     pub environment: Arc<dyn Environment>,
+    /// Named places a thread can run, each its own environment.
+    pub placements: HashMap<String, Arc<dyn Environment>>,
     pub harnesses: Vec<Arc<dyn Harness>>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ThreadOptions {
     /// Stop the process when the agent asks for a decision, where the harness can,
     /// rather than holding it open until the answer comes.
     pub park: bool,
+    pub owner: Option<Actor>,
+    /// One of [`SupervisorConfig::placements`]. `None` is the default environment.
+    pub placement: Option<String>,
+}
+
+/// Whose a thread is and where it runs. Fixed when it's created, and held in memory,
+/// because a grant gate asks on every call and doesn't do I/O.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ThreadHome {
+    pub owner: Option<Actor>,
+    pub placement: Option<String>,
 }
 
 struct ThreadRow {
@@ -248,6 +269,8 @@ struct ThreadRow {
 struct Inner {
     store: Arc<Store>,
     env: Arc<dyn Environment>,
+    placements: HashMap<String, Arc<dyn Environment>>,
+    homes: RwLock<HashMap<ThreadId, ThreadHome>>,
     harnesses: HashMap<String, Arc<dyn Harness>>,
     live: Mutex<HashMap<ThreadId, Arc<dyn Run>>>,
     /// One at a time per thread, for whatever starts or feeds a process.
@@ -348,6 +371,18 @@ impl Tx<'_> {
             .transpose()
     }
 
+    /// A harness doesn't know who answered, and the request's row does.
+    fn stamp(&self, event: &mut AgentEvent) -> Result<(), StoreError> {
+        if let AgentEventKind::InputResolved { id, by, .. } = &mut event.kind {
+            if let (None, Some((r, ..))) = (&by, self.input(id)?) {
+                if let InputState::Answered { by: who, .. } = r.state {
+                    *by = who;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn set_status(&self, thread: &ThreadId, status: ThreadStatus) -> Result<(), StoreError> {
         self.sql.execute(
             "UPDATE threads SET status = ? WHERE id = ?",
@@ -418,6 +453,7 @@ impl Tx<'_> {
             AgentEventKind::InputResolved {
                 id,
                 outcome: InputOutcome::Cancelled(reason),
+                ..
             } => {
                 if let Some((mut r, delivery, ..)) = self.input(id)? {
                     if delivery == Delivery::Pending {
@@ -509,6 +545,16 @@ impl Inner {
             .get(name)
             .cloned()
             .ok_or_else(|| RuntimeError::NoHarness(name.to_string()))
+    }
+
+    fn env_of(&self, thread: &ThreadId) -> Arc<dyn Environment> {
+        let homes = self.homes.read().expect("homes poisoned");
+        homes
+            .get(thread)
+            .and_then(|h| h.placement.as_ref())
+            .and_then(|p| self.placements.get(p))
+            .unwrap_or(&self.env)
+            .clone()
     }
 
     fn gate(&self, thread: &ThreadId) -> Arc<tokio::sync::Mutex<()>> {
@@ -626,21 +672,24 @@ impl Inner {
     }
 
     /// Answers delivered and not yet used: a retry can take one by exact match.
-    fn retry_pool(
-        &self,
-        thread: &ThreadId,
-    ) -> Result<Vec<(InputRequestId, ParkAnswer)>, StoreError> {
+    fn retry_pool(&self, thread: &ThreadId) -> Result<Vec<Spendable>, StoreError> {
         Ok(self
             .records(thread)?
             .into_iter()
             .filter(|r| r.delivery == Delivery::Delivered)
             .filter_map(|r| {
-                let InputState::Answered { answer, .. } = &r.request.state else {
+                let InputState::Answered { answer, by, .. } = &r.request.state else {
                     return None;
                 };
                 let call = ParkedCall::of(&r.request)?;
-                let answer = answer.clone();
-                Some((r.request.id.clone(), ParkAnswer { call, answer }))
+                Some(Spendable {
+                    request: r.request.id.clone(),
+                    answer: ParkAnswer {
+                        call,
+                        answer: answer.clone(),
+                    },
+                    by: by.clone(),
+                })
             })
             .collect())
     }
@@ -652,7 +701,7 @@ impl Inner {
     ) -> Result<(), RuntimeError> {
         let info = run.info();
         let identity = match info.pid {
-            Some(pid) => self.env.identity(pid).await,
+            Some(pid) => self.env_of(thread).identity(pid).await,
             None => None,
         };
         self.store.tx(|tx| {
@@ -736,6 +785,7 @@ impl Inner {
                 requests.insert(id.clone(), r);
             }
         }
+        let mut batch = batch;
         let parked_now = batch
             .iter()
             .any(|e| matches!(e.kind, AgentEventKind::TurnParked { .. }));
@@ -746,7 +796,8 @@ impl Inner {
         };
         let id = run.info().run;
         self.store.tx(|tx| {
-            for e in &batch {
+            for e in &mut batch {
+                tx.stamp(e)?;
                 tx.append(thread, &id, e)?;
                 tx.effects(thread, &id, e, &requests, parked.as_ref())?;
             }
@@ -799,7 +850,11 @@ impl Inner {
         let inner = self.clone();
         let id = r.id.clone();
         tokio::spawn(async move {
-            if let Err(e) = inner.answer(&id, taken.answer).await {
+            let by = Answering {
+                by: taken.by,
+                on: None,
+            };
+            if let Err(e) = inner.answer(&id, taken.answer, by).await {
                 eprintln!("runtime: retry of {id}: {e}");
             }
         });
@@ -817,9 +872,15 @@ impl Inner {
         &self,
         id: &InputRequestId,
         answer: InputAnswer,
+        answering: &Answering,
     ) -> Result<InputRequest, InputError> {
         let done = self.store.tx(|tx| {
-            let Some((mut r, _, thread, run)) = tx.input(id)? else {
+            let row = tx.input(id)?;
+            let on = answering.on.as_ref();
+            // Someone else's request is one this caller can't name.
+            let Some((mut r, _, thread, run)) =
+                row.filter(|(.., thread, _)| on.is_none_or(|t| t.as_str() == thread))
+            else {
                 return Ok(Err(InputError::NotFound(id.clone())));
             };
             if !r.state.is_pending() {
@@ -837,6 +898,7 @@ impl Inner {
             r.state = InputState::Answered {
                 answer: answer.clone(),
                 answered_at_ms: now_ms(),
+                by: answering.by.clone(),
             };
             let live = r.route == InputRoute::Live;
             let delivery = if live {
@@ -854,6 +916,7 @@ impl Inner {
                 let kind = AgentEventKind::InputResolved {
                     id: id.clone(),
                     outcome,
+                    by: answering.by.clone(),
                 };
                 tx.run_event(&ThreadId::new(thread), &RunId::new(run), who, kind)?;
             }
@@ -869,8 +932,9 @@ impl Inner {
         self: &Arc<Self>,
         id: &InputRequestId,
         answer: InputAnswer,
+        answering: Answering,
     ) -> Result<InputRequest, InputError> {
-        let r = self.record_answer(id, answer.clone())?;
+        let r = self.record_answer(id, answer.clone(), &answering)?;
         let thread = self.thread_of(id)?;
         let delivery = |detail: String| InputError::Delivery {
             id: id.clone(),
@@ -1050,7 +1114,8 @@ impl Inner {
             .park()
             .ok_or_else(|| RuntimeError::Start("this harness can't park".into()))?;
         let u = park.plan_unpark(parked, answers).map_err(|e| fail(&e))?;
-        let process = self.env.spawn(u.plan).await.map_err(|e| fail(&e))?;
+        let env = self.env_of(thread);
+        let process = env.spawn(u.plan).await.map_err(|e| fail(&e))?;
         let run = harness.drive(u.spec, process).await.map_err(|e| fail(&e))?;
         self.register(thread, run.clone()).await?;
         run.send(u.input).await?;
@@ -1074,7 +1139,8 @@ impl Inner {
         };
         if !row.started {
             let plan = harness.plan(&spec).map_err(|e| fail(&e))?;
-            let process = self.env.spawn(plan).await.map_err(|e| fail(&e))?;
+            let env = self.env_of(thread);
+            let process = env.spawn(plan).await.map_err(|e| fail(&e))?;
             let run = harness.drive(spec, process).await.map_err(|e| fail(&e))?;
             self.register(thread, run.clone()).await?;
             return Ok(run.send(prompt).await?);
@@ -1083,7 +1149,8 @@ impl Inner {
             .session
             .clone()
             .ok_or_else(|| RuntimeError::Start("no session to resume".into()))?;
-        let resumed = resume_or_restart(harness, self.env.as_ref(), &spec, &session, prompt)
+        let env = self.env_of(thread);
+        let resumed = resume_or_restart(harness, env.as_ref(), &spec, &session, prompt)
             .await
             .map_err(|e| fail(&e))?;
         self.register(thread, resumed.run).await?;
@@ -1111,7 +1178,7 @@ impl Inner {
             let (run, thread) = (RunId::new(run), ThreadId::new(thread));
             // First: nothing below is true while the old process can still act.
             if let (Some(pid), Some(identity)) = (pid, identity) {
-                if self.env.reap(pid, &identity).await {
+                if self.env_of(&thread).reap(pid, &identity).await {
                     report.reaped += 1;
                 }
             }
@@ -1204,6 +1271,7 @@ impl Inner {
                         let kind = AgentEventKind::InputResolved {
                             id: id.clone(),
                             outcome,
+                            by: None,
                         };
                         tx.run_event(thread, run, who, kind)?;
                         report.expired.push(id);
@@ -1280,21 +1348,40 @@ impl Inner {
     }
 }
 
-/// An answer a retry took over.
+/// An answer delivered and not yet used, and who gave it.
+struct Spendable {
+    request: InputRequestId,
+    answer: ParkAnswer,
+    by: Option<Actor>,
+}
+
+/// An answer a retry took over. It's still the answer of whoever gave it.
 struct Taken {
     prior: InputRequestId,
     answer: InputAnswer,
+    by: Option<Actor>,
+}
+
+/// Who an answer is from, and the thread it was addressed to, if one was named.
+#[derive(Default)]
+struct Answering {
+    by: Option<Actor>,
+    on: Option<ThreadId>,
 }
 
 /// The answer in `pool` that `r` retries, by exact match, taken out of the pool.
-fn take_retry(pool: &mut Vec<(InputRequestId, ParkAnswer)>, r: &InputRequest) -> Option<Taken> {
+fn take_retry(pool: &mut Vec<Spendable>, r: &InputRequest) -> Option<Taken> {
     let call = ParkedCall::of(r)?;
-    let at = pool.iter().position(|(_, a)| {
-        retry_answer(std::slice::from_ref(a), &call.tool, &call.input).is_some()
+    let at = pool.iter().position(|s| {
+        retry_answer(std::slice::from_ref(&s.answer), &call.tool, &call.input).is_some()
     })?;
-    let (prior, a) = pool.remove(at);
-    let answer = retry_answer(&[a], &call.tool, &call.input)?;
-    Some(Taken { prior, answer })
+    let s = pool.remove(at);
+    let answer = retry_answer(&[s.answer], &call.tool, &call.input)?;
+    Some(Taken {
+        prior: s.request,
+        answer,
+        by: s.by,
+    })
 }
 
 struct ThreadInputs {
@@ -1350,16 +1437,42 @@ impl InputQueue for ThreadInputs {
         answer: InputAnswer,
     ) -> BoxFuture<'static, Result<InputRequest, InputError>> {
         let (inner, id) = (self.inner.clone(), id.clone());
-        async move { inner.answer(&id, answer).await }.boxed()
+        async move { inner.answer(&id, answer, Answering::default()).await }.boxed()
     }
 }
 
 impl Supervisor {
     /// Opens the store and closes out whatever a previous service left running.
     pub async fn open(config: SupervisorConfig) -> Result<(Self, Recovery), RuntimeError> {
+        let store = Store::open(&config.db)?;
+        let homes = store.with(|c| {
+            let mut q = c.prepare("SELECT id, owner, placement FROM threads")?;
+            let rows = q
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        let homes = homes
+            .into_iter()
+            .map(|(id, owner, placement)| {
+                let owner = owner
+                    .map(|o| serde_json::from_str(&o))
+                    .transpose()
+                    .map_err(store_err)?;
+                Ok((ThreadId::new(id), ThreadHome { owner, placement }))
+            })
+            .collect::<Result<HashMap<_, _>, StoreError>>()?;
         let inner = Arc::new(Inner {
-            store: Store::open(&config.db)?,
+            store,
             env: config.environment,
+            placements: config.placements,
+            homes: RwLock::new(homes),
             harnesses: config
                 .harnesses
                 .into_iter()
@@ -1389,6 +1502,11 @@ impl Supervisor {
         options: ThreadOptions,
     ) -> Result<ThreadId, RuntimeError> {
         let h = self.inner.harness(harness)?;
+        if let Some(p) = options.placement.as_ref() {
+            if !self.inner.placements.contains_key(p) {
+                return Err(RuntimeError::NoPlacement(p.clone()));
+            }
+        }
         let id = ThreadId::new(uuid::Uuid::new_v4().to_string());
         let mut spec = spec;
         // Known before any frame, so a stop before init can still be resumed.
@@ -1406,10 +1524,16 @@ impl Supervisor {
             SessionMode::Fresh => None,
         };
         let text = serde_json::to_string(&spec).map_err(store_err)?;
+        let owner = options.owner.as_ref();
+        let owner = owner
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(store_err)?;
         self.inner.store.tx(|tx| {
             tx.sql.execute(
-                "INSERT INTO threads (id, harness, spec, cwd, session, status, created_ms)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO threads
+                 (id, harness, spec, cwd, session, status, created_ms, owner, placement)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     id.as_str(),
                     harness,
@@ -1417,11 +1541,20 @@ impl Supervisor {
                     spec.cwd,
                     session,
                     ThreadStatus::Idle.as_str(),
-                    now_ms() as i64
+                    now_ms() as i64,
+                    owner,
+                    options.placement
                 ],
             )?;
             Ok(())
         })?;
+        self.inner.homes.write().expect("homes poisoned").insert(
+            id.clone(),
+            ThreadHome {
+                owner: options.owner,
+                placement: options.placement,
+            },
+        );
         Ok(id)
     }
 
@@ -1451,7 +1584,10 @@ impl Supervisor {
         // A prompt supersedes a parked call whose outcome is unknown: the agent
         // drops it (AGENTS-33 `h_prompt_undecided`).
         let input = match &row.note {
-            Some(note) => UserInput::text(format!("{note}\n\n{}", input.text)),
+            Some(note) => UserInput {
+                text: format!("{note}\n\n{}", input.text),
+                by: input.by,
+            },
             None => input,
         };
         self.inner.store.tx(|tx| tx.set_parked(thread, None))?;
@@ -1513,7 +1649,11 @@ impl Supervisor {
                 let id = q.id.clone();
                 tx.set_input(&id, Some(&q), Delivery::Cancelled)?;
                 let outcome = InputOutcome::Cancelled(CancelReason::Interrupted);
-                let kind = AgentEventKind::InputResolved { id, outcome };
+                let kind = AgentEventKind::InputResolved {
+                    id,
+                    outcome,
+                    by: None,
+                };
                 tx.run_event(thread, &run, Attribution::turn(q.turn), kind)?;
             }
             if let Some(parked) = &row.parked {
@@ -1593,7 +1733,34 @@ impl Supervisor {
         id: &InputRequestId,
         answer: InputAnswer,
     ) -> Result<InputRequest, InputError> {
-        self.inner.answer(id, answer).await
+        self.inner.answer(id, answer, Answering::default()).await
+    }
+
+    /// Answers a request on `thread`, as `actor`. A request on any other thread is
+    /// [`InputError::NotFound`], so being allowed one thread reaches no other.
+    pub async fn answer_as(
+        &self,
+        thread: &ThreadId,
+        id: &InputRequestId,
+        answer: InputAnswer,
+        actor: Actor,
+    ) -> Result<InputRequest, InputError> {
+        let answering = Answering {
+            by: Some(actor),
+            on: Some(thread.clone()),
+        };
+        self.inner.answer(id, answer, answering).await
+    }
+
+    /// Whose `id` is and where it runs. `None` for a thread that doesn't exist.
+    pub fn home(&self, id: &ThreadId) -> Option<ThreadHome> {
+        let homes = self.inner.homes.read().expect("homes poisoned");
+        homes.get(id).cloned()
+    }
+
+    /// Whether `name` is a place a thread can run.
+    pub fn has_placement(&self, name: &str) -> bool {
+        self.inner.placements.contains_key(name)
     }
 
     /// The projection of one thread.
@@ -1620,9 +1787,12 @@ impl Supervisor {
             )?;
             Ok((runs as u64, GlobalSeq(seq as u64)))
         })?;
+        let home = self.home(id).unwrap_or_default();
         Ok(ThreadView {
             id: id.clone(),
             harness: row.harness,
+            owner: home.owner,
+            placement: home.placement,
             status: row.status,
             cwd: row.spec.cwd,
             session: row.session,

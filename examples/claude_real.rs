@@ -366,7 +366,7 @@ async fn approve_allow(c: &mut Ctx) {
         v
     };
     c.claim("input.resolved says allowed", all.iter().any(|e| matches!(
-        &e.kind, AgentEventKind::InputResolved { id: i, outcome: InputOutcome::Allowed } if *i == id)));
+        &e.kind, AgentEventKind::InputResolved { id: i, outcome: InputOutcome::Allowed, .. } if *i == id)));
     l.close().await;
 }
 

@@ -12,7 +12,7 @@
 //! the call with no result, `--resume` with no prompt doesn't ask again, and that
 //! call can't be answered any more. So an answer goes in as a message, and the agent
 //! makes the call again under a new id. That retry reaches `can_use_tool` too, and
-//! the runtime answers it only by [`plexus_harness::retry_answer`]'s exact match.
+//! the runtime answers it only by [`plexus_harness::retry_answer`]'s match.
 //!
 //! A batch needs telling what happened. The CLI asks about a message's calls one at a
 //! time and writes their results together, so a kill loses the result of a call
@@ -22,9 +22,10 @@
 //! record of them goes in: [`completed`].
 //!
 //! The message carries the input as JSON. Told only the command, the model rewrote
-//! Bash's `description` on the retry, and the match failed. Given the JSON, it kept
-//! every field. Nothing depends on that but a person's time: a retry that differs
-//! parks again and asks again. Approval text grants nothing.
+//! Bash's `description` on the retry. Given the JSON, it kept every field. Nothing
+//! depends on that but a person's time: a retry that differs in anything that affects
+//! execution parks again and asks again, and `description` isn't such a thing. Approval
+//! text grants nothing.
 
 use plexus_harness::{CompletedCall, InputAnswer, ParkedCall};
 

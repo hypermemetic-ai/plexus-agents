@@ -1,6 +1,8 @@
-//! Harness implementations: [`LocalEnvironment`], [`ClaudeHarness`], and an example
-//! runner's body in [`runner`]. Contracts live in `plexus-harness`.
+//! The agents service: [`LocalEnvironment`], [`ClaudeHarness`], the [`runtime`], and
+//! the `agents` activation in [`service`] with who may call it in [`auth`]. Contracts
+//! live in `plexus-harness`.
 
+pub mod auth;
 pub mod claude;
 mod local;
 pub mod record;

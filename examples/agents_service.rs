@@ -134,6 +134,7 @@ async fn handle(s: &Supervisor, op: &Value) -> Result<Value, String> {
         "create" => {
             let options = ThreadOptions {
                 park: op["park"].as_bool().unwrap_or(false),
+                ..ThreadOptions::default()
             };
             let id = s.create_thread("claude", spec(op), options).map_err(err)?;
             Ok(json!({"thread": id}))
@@ -251,6 +252,7 @@ async fn main() -> Result<(), String> {
     let (supervisor, recovery) = Supervisor::open(SupervisorConfig {
         db: db.ok_or("--db")?.into(),
         environment: Arc::new(Noted { inner, file: plans }),
+        placements: Default::default(),
         harnesses: vec![Arc::new(ClaudeHarness::new(ClaudeOptions {
             permissions,
             ..ClaudeOptions::default()
