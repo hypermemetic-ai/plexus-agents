@@ -1,0 +1,13 @@
+{
+ "claims": {
+  "the deny rule held": true,
+  "the parked process has gone": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {
+  "forbidden_ran": false,
+  "hook_saw_the_call": true,
+  "reply": "The Bash call was refused with this reason: \"Permission to use Bash with command sh forbidden.sh has been denied.\"\n\nI haven't retried, since the denial means the command isn't allowed as written. `effect.sh` was not run.",
+  "terminal": "Completed"
+ }
+}

@@ -1,0 +1,11 @@
+{
+ "claims": {
+  "a question parked": true,
+  "the agent acted on the answer": true,
+  "the parked process has gone": true,
+  "the picked word ran once": true,
+  "the turn completed": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}

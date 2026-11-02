@@ -1,0 +1,8 @@
+{
+ "claims": {
+  "a preapproved call doesn't park": true,
+  "it ran once": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}

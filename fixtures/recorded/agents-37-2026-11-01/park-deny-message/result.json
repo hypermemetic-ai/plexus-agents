@@ -1,0 +1,12 @@
+{
+ "claims": {
+  "the agent read the reason": true,
+  "the parked process has gone": true,
+  "the tool stayed unrun": true,
+  "the turn completed": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {
+  "reply": "PreToolUse:Bash hook error: declined, reference juniper5465"
+ }
+}

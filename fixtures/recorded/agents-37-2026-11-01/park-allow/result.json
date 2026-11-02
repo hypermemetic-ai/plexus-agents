@@ -1,0 +1,16 @@
+{
+ "claims": {
+  "in the original cwd": true,
+  "it ran exactly once": true,
+  "nothing ran before the answer": true,
+  "one call is pending": true,
+  "the parked process has gone": true,
+  "the resumed turn says so": true,
+  "the turn carried on and completed": true,
+  "the user's settings file is unchanged": true,
+  "the working directory holds no hook": true,
+  "under the same turn": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {}
+}
