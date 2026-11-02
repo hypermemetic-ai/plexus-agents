@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""AGENTS-18 for real: `agents.on.hal` between two services, as separate processes.
+
+Each service has its own SQLite database, key and port, on real WebSockets, driven by
+real synapse. `hal` runs real Claude: haiku, the Mac's login, a throwaway directory, no
+bypassed permissions. The root reaches it with key proof, and no bearer token crosses.
+
+Touches no real identity. The caller signs in to a throwaway local plexus-idp, synapse
+runs with its own HOME, and keys and tokens live in a temp directory that's removed at
+the end. Nothing here needs a second machine, and none was used.
+
+    ON_DEMO=spend-tokens PLEXUS_IDP=path/to/plexus-idp scripts/on-demo OUT_DIR
+
+Writes OUT_DIR/steps.jsonl (each synapse call and what came back), OUT_DIR/hal/
+recordings, OUT_DIR/watch.jsonl (the stream, with when each line arrived) and
+OUT_DIR/run.json with the claims. Scrub it with scripts/scrub-fixtures.
+"""
+import base64, json, os, shutil, signal, socket, sqlite3, subprocess, sys, tempfile, threading, time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+BINARY = ROOT / "target/debug/plexus-agents"
+AUDIENCE = "plexus:agents"
+BACKEND = "plexus-agents"
+EFFECT = "printf 'ran\\n' >> effects.log\n"
+PROMPT = "Run this exact Bash command, then reply with only the word done: sh effect.sh"
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class Demo:
+    def __init__(self, out):
+        self.out = out
+        self.tmp = Path(tempfile.mkdtemp(prefix="on-demo-", dir=os.environ.get("TMPDIR")))
+        self.home = self.tmp / "synapse-home"
+        self.home.mkdir()
+        self.cwd = self.tmp / "hal-cwd"
+        self.cwd.mkdir()
+        (self.cwd / "effect.sh").write_text(EFFECT)
+        self.steps = open(out / "steps.jsonl", "w")
+        self.claims, self.facts, self.procs, self.tokens, self.streams = {}, {}, {}, [], {}
+        names = ("idp", "oidc", "root", "hal", "rogue")
+        self.port = {n: free_port() for n in names}
+
+    def claim(self, name, ok):
+        print(f"    {'ok  ' if ok else 'FAIL'} {name}", flush=True)
+        self.claims[name] = bool(ok)
+
+    def spawn(self, name, argv, log=None):
+        env = {n: v for n, v in os.environ.items() if n != "ANTHROPIC_API_KEY"}
+        out = open(log, "a") if log else subprocess.DEVNULL
+        self.procs[name] = subprocess.Popen([str(a) for a in argv], env=env, stdin=subprocess.DEVNULL,
+                                            stdout=out, stderr=out)
+
+    def wait_port(self, port, secs=30):
+        end = time.time() + secs
+        while time.time() < end:
+            with socket.socket() as s:
+                if s.connect_ex(("127.0.0.1", port)) == 0:
+                    return
+            time.sleep(0.1)
+        raise TimeoutError(port)
+
+    def wait(self, what, secs=150):
+        end = time.time() + secs
+        while time.time() < end:
+            v = what()
+            if v:
+                return v
+            time.sleep(0.5)
+        raise TimeoutError(getattr(what, "__name__", "wait"))
+
+    def key(self, name):
+        path = self.tmp / f"{name}.key"
+        path.touch(0o600)
+        path.write_text(base64.b64encode(os.urandom(32)).decode())
+        out = subprocess.run([BINARY, "--print-key", path], capture_output=True, text=True, check=True)
+        return path, out.stdout.strip()
+
+    def synapse(self, port, token, extra):
+        argv = ["env", f"HOME={self.home}", "synapse", "-P", str(port), "-j", "--no-cache",
+                "--no-hold", "--reconnect-for", "0"]
+        return argv + (["--token-file", str(token)] if token else []) + extra
+
+    def rows(self, text):
+        out = []
+        for line in text.splitlines():
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                pass
+        return out
+
+    def call(self, step, port, token, extra, record=True):
+        r = subprocess.run(self.synapse(port, token, extra), capture_output=True, text=True,
+                           timeout=60, env={"PATH": os.environ["PATH"]})
+        rows = self.rows(r.stdout)
+        if record:
+            shown = {"step": step, "argv": extra, "as": Path(token).name if token else "anonymous",
+                     "rows": rows, "stderr": r.stderr[-500:], "stdout_tail": r.stdout[-300:] if not rows else "",
+                     "rc": r.returncode}
+            self.steps.write(json.dumps(shown) + "\n")
+            self.steps.flush()
+        return r, [x.get("content", x) if x.get("type") != "error" else x for x in rows]
+
+    def nav(self, step, token, *path, port=None, **params):
+        extra = ["-p", json.dumps(params), BACKEND, *path]
+        return self.call(step, port or self.port["root"], token, extra)
+
+    def rpc(self, step, token, method, port=None, **params):
+        extra = ["-r", json.dumps({"method": method, "params": params}), BACKEND]
+        return self.call(step, port or self.port["root"], token, extra)
+
+    def start_idp(self):
+        self.spawn("idp", [os.environ["PLEXUS_IDP"], "--port", self.port["idp"], "--http-port", self.port["oidc"],
+                           "--db", self.tmp / "idp.db", "--key-dir", self.tmp / "idp-keys",
+                           "--audience", AUDIENCE, "--registration", "open"])
+        self.wait_port(self.port["idp"])
+        self.wait_port(self.port["oidc"])
+
+    def user(self, name):
+        password = "local-test-password-" + name
+        _, rows = self.call("register", self.port["idp"], None,
+                            ["-p", json.dumps({"username": name, "password": password}), "idp", "identity", "register"],
+                            record=False)
+        id_ = rows[0]["user_id"]
+        login = {"username": name, "password": password, "audience": AUDIENCE}
+        _, rows = self.call("login", self.port["idp"], None,
+                            ["-p", json.dumps(login), "idp", "identity", "login"], record=False)
+        self.tokens.append(rows[0]["access_token"])
+        f = self.tmp / f"tok-{name}"
+        f.touch(0o600)
+        f.write_text(rows[0]["access_token"])
+        return f"idp:{id_}", f
+
+    def url(self, name):
+        return f"ws://127.0.0.1:{self.port[name]}"
+
+    def start_hal(self):
+        self.spawn("hal", [BINARY, "--db", self.tmp / "hal.db", "--port", self.port["hal"],
+                           "--key-audience", self.url("hal"), "--grant", f"{self.root_id}=admin@*",
+                           "--service-key", self.hal_key, "--peer", f"root={self.url('root')}",
+                           "--record", self.out / "hal"], self.tmp / "hal.log")
+        self.wait_port(self.port["hal"])
+
+    def start_root(self, admin):
+        self.spawn("root", [BINARY, "--db", self.tmp / "root.db", "--port", self.port["root"],
+                            "--issuer", f"http://127.0.0.1:{self.port['oidc']}", "--audience", AUDIENCE,
+                            "--key-audience", self.url("root"), "--service-key", self.root_key,
+                            "--peer", f"hal={self.url('hal')}",
+                            "--grant", f"{admin}=admin@*", "--grant", f"{self.hal_id}=admin@*"],
+                   self.tmp / "root.log")
+        self.wait_port(self.port["root"])
+
+    def start_rogue(self, admin):
+        key, _ = self.key("rogue")
+        self.spawn("rogue", [BINARY, "--db", self.tmp / "rogue.db", "--port", self.port["rogue"],
+                             "--issuer", f"http://127.0.0.1:{self.port['oidc']}", "--audience", AUDIENCE,
+                             "--service-key", key, "--peer", f"hal={self.url('hal')}",
+                             "--grant", f"{admin}=admin@*"], self.tmp / "rogue.log")
+        self.wait_port(self.port["rogue"])
+
+    def watch(self, name, token, **params):
+        """A held-open `watch` through the root: each line kept with when it came."""
+        extra = ["-p", json.dumps(params), BACKEND, "agents", "on", "hal", "watch"]
+        p = subprocess.Popen(self.synapse(self.port["root"], token, extra), stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True)
+        self.procs[name] = p
+        lines = self.streams.setdefault(name, [])
+
+        def read():
+            for line in p.stdout:
+                lines.append((time.time(), line))
+
+        threading.Thread(target=read, daemon=True).start()
+        return lines
+
+    def finish(self):
+        for p in self.procs.values():
+            if p.poll() is None:
+                p.send_signal(signal.SIGKILL)
+        self.steps.close()
+
+
+def events(lines):
+    out = []
+    for at, line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        event = row.get("content", {}).get("event") if isinstance(row.get("content"), dict) else None
+        if event:
+            out.append((at, event["event"]))
+    return out
+
+
+def kinds(lines):
+    return [e["kind"] for _, e in events(lines)]
+
+
+def says(rows, text):
+    """synapse keeps a stream error's message and drops any `error_kind` but auth's, so
+    these read the message. `tests/on_wire.rs` asserts the kinds on the wire."""
+    return any(text in str(r.get("message")) for r in rows if isinstance(r, dict))
+
+
+def error_of(rows):
+    return next((r for r in rows if isinstance(r, dict) and r.get("type") == "error"), {})
+
+
+def scenario(d):
+    d.start_idp()
+    admin, tok = d.user("on-demo-admin")
+    d.root_key, d.root_id = d.key("root")
+    d.hal_key, d.hal_id = d.key("hal")
+    d.start_hal()
+    d.start_root(admin)
+    d.claim("two services up, each with its own process, database, key and port",
+            d.procs["hal"].poll() is None and d.procs["root"].poll() is None and d.root_id != d.hal_id)
+
+    print("  anon", flush=True)
+    _, rows = d.nav("anon-harnesses", None, "agents", "harnesses")
+    d.claim("anon: agents.harnesses runs", rows and rows[0].get("type") == "harnesses")
+    _, rows = d.nav("anon-describe", None, "agents", "claudecode", "describe")
+    d.claim("anon: claudecode.describe runs", rows and rows[0].get("type") == "harnesses")
+    r, _ = d.nav("anon-threads", None, "agents", "threads")
+    d.claim("anon: threads refused", "sign in" in r.stdout + r.stderr)
+    r, _ = d.nav("anon-start", None, "agents", "start", placement="local", cwd=str(d.cwd), prompt="no")
+    d.claim("anon: start refused", "sign in" in r.stdout + r.stderr)
+    r, rows = d.rpc("anon-peer-schema", None, "agents.on.hal.schema")
+    d.claim("anon: agents.on.hal.schema refused", "sign in" in r.stdout + r.stderr)
+    r, rows = d.rpc("anon-peer-harnesses", None, "agents.on.hal.harnesses")
+    d.claim("anon: a peer's public method isn't reachable through the tunnel", "sign in" in r.stdout + r.stderr)
+    r, _ = d.call("anon-view", d.port["root"], None, [BACKEND, "agents"])
+    shown = r.stdout + r.stderr
+    d.claim("anon: the view lists harnesses and claudecode, no on and no thread methods",
+            "claudecode" in shown and "harnesses" in shown and "watch" not in shown and "pending" not in shown)
+
+    print("  through the root", flush=True)
+    r, rows = d.call("schema", d.port["root"], tok, ["-s", BACKEND, "agents", "on", "hal"])
+    d.claim("synapse navigates agents.on.hal and fetches hal's schema",
+            any(m.get("name") == "watch" for row in rows for m in row.get("methods", [])))
+    _, rows = d.nav("placements", tok, "agents", "on", "placements")
+    d.claim("placements lists local and hal", [p["name"] for p in rows[0]["placements"]] == ["local", "hal"])
+    _, rows = d.nav("start", tok, "agents", "on", "hal", "start",
+                    placement="local", cwd=str(d.cwd), prompt=PROMPT, model="haiku")
+    d.claim("a real run started on hal through the root", rows and rows[0].get("type") == "started")
+    thread = rows[0]["thread"]
+    _, rows = d.nav("root-threads", tok, "agents", "threads")
+    d.claim("the root holds no thread", rows[0]["threads"] == [])
+    stream = d.watch("watch", tok, thread=thread, since=0)
+
+    def pending():
+        _, rows = d.nav("pending", tok, "agents", "on", "hal", "pending")
+        return rows and rows[0].get("requests")
+
+    requests = d.wait(pending)
+    request = requests[0]["request"]
+    d.claim("a tool approval parked at hal, and pending through the root shows it", len(requests) == 1)
+    _, rows = d.nav("root-pending", tok, "agents", "pending")
+    d.claim("the root's own pending is empty", rows[0]["requests"] == [])
+    d.wait(lambda: "turn.parked" in kinds(stream))
+    parked_at = next(at for at, e in events(stream) if e["kind"] == "turn.parked")
+    d.claim("the watch streamed the run live, before anyone answered",
+            {"session.started", "input.requested", "turn.parked"} <= set(kinds(stream)))
+    d.claim("the tool hasn't run", not (d.cwd / "effects.log").exists())
+    answer = {"answer": "allow", "updated_input": None}
+    answered_at = time.time()
+    _, rows = d.nav("answer", tok, "agents", "on", "hal", "answer",
+                    thread=thread, request=request["id"], answer=answer)
+    d.claim("the answer went through the root", rows and rows[0].get("type") == "answered")
+    d.wait(lambda: "turn.completed" in kinds(stream) or "turn.ended" in kinds(stream)
+           or (d.cwd / "effects.log").exists() and "input.resolved" in kinds(stream))
+    d.wait(lambda: (d.cwd / "effects.log").exists())
+    time.sleep(3)
+    d.claim("the tool ran once at hal", (d.cwd / "effects.log").read_text().count("ran") == 1)
+    after = [e for at, e in events(stream) if at >= answered_at]
+    d.claim("events after the answer arrived on the same live watch", len(after) > 0 and parked_at < answered_at)
+
+    db = sqlite3.connect(f"file:{d.tmp / 'hal.db'}?mode=ro", uri=True)
+    text = "\n".join(str(row) for row in db.execute("select * from events"))
+    d.claim("hal's log holds the record", thread in text and "input.resolved" in text)
+    d.claim("hal's log names no one but the service: the expected limit",
+            d.root_id in text and admin not in text)
+    db.close()
+    root_db = sqlite3.connect(f"file:{d.tmp / 'root.db'}?mode=ro", uri=True)
+    d.claim("the root's log holds nothing", root_db.execute("select count(*) from events").fetchone()[0] == 0)
+    root_db.close()
+    resolved = next(e for _, e in events(stream) if e["kind"] == "input.resolved")
+    d.facts["actor_at_hal"] = resolved.get("by")
+    d.claim("hal recorded the service as the actor", (resolved.get("by") or {}).get("id") == d.root_id)
+
+    print("  hal stops mid-stream", flush=True)
+    held = d.watch("watch-held", tok, thread=thread)
+    d.wait(lambda: len(events(held)) > 0, 30)
+    d.procs["hal"].send_signal(signal.SIGKILL)
+    d.procs["hal"].wait()
+    d.wait(lambda: any("child hal is unavailable" in line for _, line in held), 30)
+    d.claim("hal stopping mid-stream: child_unavailable on the held watch", True)
+    r, rows = d.rpc("offline-threads", tok, "agents.on.hal.threads")
+    d.claim("a call while hal is down: child_unavailable", says(rows, "child hal is unavailable"))
+    r, rows = d.nav("offline-placements", tok, "agents", "on", "placements")
+    d.claim("hal is out of placements while down", [p["name"] for p in rows[0]["placements"]] == ["local"])
+    r, _ = d.nav("offline-nav", tok, "agents", "on", "hal", "threads")
+    d.facts["synapse_navigating_to_an_offline_peer"] = (r.stdout + r.stderr)[:120]
+    d.start_hal()
+
+    def back():
+        _, rows = d.rpc("recover", tok, "agents.on.hal.threads")
+        return rows and rows[0].get("type") == "threads" and rows[0]
+
+    view = d.wait(back, 90)
+    d.claim("calls recover on restart, the thread intact", any(t["id"] == thread for t in view["threads"]))
+
+    print("  refused", flush=True)
+    d.start_rogue(admin)
+    _, rows = d.rpc("rogue-threads", tok, "agents.on.hal.threads", port=d.port["rogue"])
+    d.claim("a key hal didn't grant: threads forbidden", error_of(rows).get("error_kind") == "forbidden")
+    _, rows = d.rpc("rogue-start", tok, "agents.on.hal.start", port=d.port["rogue"],
+                    placement="local", cwd=str(d.cwd), prompt="no")
+    d.claim("a key hal didn't grant: start forbidden", error_of(rows).get("error_kind") == "forbidden")
+    _, rows = d.rpc("loop", tok, "agents.on.hal.on.root.threads")
+    d.claim("a two-peer loop is refused", says(rows, "max_depth is 0"))
+
+
+def main(out):
+    if os.environ.get("ON_DEMO") != "spend-tokens":
+        sys.exit("set ON_DEMO=spend-tokens: this runs real Claude")
+    out = Path(out)
+    (out / "hal").mkdir(parents=True, exist_ok=True)
+    d = Demo(out)
+    failed = None
+    try:
+        scenario(d)
+    except Exception as e:  # The claims so far still get written.
+        failed = repr(e)
+        print("FAILED:", failed)
+    d.finish()
+    for name in ("watch", "watch-held"):
+        p = d.procs.get(name)
+        d.facts[f"{name}_rc"] = p.returncode if p else None
+    for name, lines in d.streams.items():
+        first = lines[0][0] if lines else 0
+        rows = [json.dumps({"after_s": round(at - first, 3), "line": line.rstrip("\n")}) for at, line in lines]
+        (out / f"{name}.jsonl").write_text("\n".join(rows) + "\n")
+    (out / "logs").mkdir(exist_ok=True)
+    for name in ("hal.log", "root.log", "rogue.log"):
+        if (d.tmp / name).exists():
+            shutil.copy(d.tmp / name, out / "logs" / name)
+    for f in out.rglob("*"):
+        if f.is_file():
+            text = f.read_text(errors="replace")
+            for t in d.tokens:
+                assert t not in text, f"a token in {f}"
+    (out / "run.json").write_text(json.dumps({"claims": d.claims, "facts": d.facts, "failed": failed}, indent=1))
+    good = sum(d.claims.values())
+    print(f"{good} of {len(d.claims)} claims")
+    shutil.rmtree(d.tmp, ignore_errors=True)
+    sys.exit(0 if good == len(d.claims) and not failed else 1)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])

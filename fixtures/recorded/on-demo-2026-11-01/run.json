@@ -1,0 +1,43 @@
+{
+ "claims": {
+  "two services up, each with its own process, database, key and port": true,
+  "anon: agents.harnesses runs": true,
+  "anon: claudecode.describe runs": true,
+  "anon: threads refused": true,
+  "anon: start refused": true,
+  "anon: agents.on.hal.schema refused": true,
+  "anon: a peer's public method isn't reachable through the tunnel": true,
+  "anon: the view lists harnesses and claudecode, no on and no thread methods": true,
+  "synapse navigates agents.on.hal and fetches hal's schema": true,
+  "placements lists local and hal": true,
+  "a real run started on hal through the root": true,
+  "the root holds no thread": true,
+  "a tool approval parked at hal, and pending through the root shows it": true,
+  "the root's own pending is empty": true,
+  "the watch streamed the run live, before anyone answered": true,
+  "the tool hasn't run": true,
+  "the answer went through the root": true,
+  "the tool ran once at hal": true,
+  "events after the answer arrived on the same live watch": true,
+  "hal's log holds the record": true,
+  "hal's log names no one but the service: the expected limit": true,
+  "the root's log holds nothing": true,
+  "hal recorded the service as the actor": true,
+  "hal stopping mid-stream: child_unavailable on the held watch": true,
+  "a call while hal is down: child_unavailable": true,
+  "hal is out of placements while down": true,
+  "calls recover on restart, the thread intact": true,
+  "a key hal didn't grant: threads forbidden": true,
+  "a key hal didn't grant: start forbidden": true,
+  "a two-peer loop is refused": true
+ },
+ "facts": {
+  "actor_at_hal": {
+   "id": "key:9a5f41d6c54a06f9743498963f0e8a9e8c34a18dba27b10d434ba8f89903c829"
+  },
+  "synapse_navigating_to_an_offline_peer": "Command not found: 'hal' at agents.on\n\nAvailable commands:\n\n  Methods:\n    placements          The placements here, and ",
+  "watch_rc": 0,
+  "watch-held_rc": 0
+ },
+ "failed": null
+}
