@@ -598,6 +598,10 @@ async fn a_rerouted_answer_covers_an_exact_retry_and_nothing_else() {
     let mut changed = input.clone();
     changed["command"] = "sh something-else.sh".into();
     assert!(plexus_harness::retry_answer(&prior, &bash, &changed).is_none());
+    // A subagent's retry reworded this. It's a label, so it's still the same call.
+    let mut reworded = input.clone();
+    reworded["description"] = "Said differently".into();
+    assert!(plexus_harness::retry_answer(&prior, &bash, &reworded).is_some());
 }
 
 /// The narrowest window: `Delivered` committed, and the process's run row didn't.

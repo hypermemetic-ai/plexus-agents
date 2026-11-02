@@ -30,12 +30,12 @@ use super::{GlobalSeq, ReadFilter, StoredEvent, ThreadId};
 use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{BoxStream, StreamExt};
 use plexus_harness::{
-    now_ms, resume_or_restart, retry_answer, AgentEvent, AgentEventKind, Attribution, CancelReason,
-    Environment, EventSeq, Harness, InputAnswer, InputError, InputFilter, InputKind, InputOutcome,
-    InputQueue, InputRequest, InputRequestId, InputRoute, InputState, InterruptOutcome, ParkAnswer,
-    ParkedCall, ParkedRun, Run, RunEndReason, RunError, RunId, RunSpec, SessionId, SessionMode,
-    StopCause, StopMode, StopReport, ThreadDisposition, ToolUseId, TurnId, TurnStatus,
-    TurnTerminal, UserInput,
+    now_ms, resume_or_restart, retry_answer, same_call, AgentEvent, AgentEventKind, Attribution,
+    CancelReason, Environment, EventSeq, Harness, InputAnswer, InputError, InputFilter, InputKind,
+    InputOutcome, InputQueue, InputRequest, InputRequestId, InputRoute, InputState,
+    InterruptOutcome, ParkAnswer, ParkedCall, ParkedRun, Run, RunEndReason, RunError, RunId,
+    RunSpec, SessionId, SessionMode, StopCause, StopMode, StopReport, ThreadDisposition, ToolUseId,
+    TurnId, TurnStatus, TurnTerminal, UserInput,
 };
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -590,7 +590,7 @@ impl Inner {
                 Ok((run, request, Delivery::parse(&delivery), tool))
             })
             .collect::<Result<Vec<_>, StoreError>>()?;
-        // A retry has a new id, so it's the same call if it's the same input.
+        // A retry has a new id, so it's the same call if the input does the same.
         let unknown: Vec<ParkedCall> = parsed
             .iter()
             .filter(|r| r.2 == Delivery::OutcomeUnknown)
@@ -600,7 +600,7 @@ impl Inner {
             ParkedCall::of(request).is_some_and(|c| {
                 unknown
                     .iter()
-                    .any(|u| u.tool == c.tool && u.input == c.input)
+                    .any(|u| u.tool == c.tool && same_call(&c.tool, &u.input, &c.input))
             })
         };
         Ok(parsed
