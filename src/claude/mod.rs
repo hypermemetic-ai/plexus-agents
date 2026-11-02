@@ -6,7 +6,8 @@
 //! Approvals use `--permission-prompt-tool stdio`, so they arrive as
 //! `control_request/can_use_tool` on stdout and no MCP server is involved. This is
 //! the route AGENTS-3 case 5 tested. `--setting-sources ""` keeps the operator's
-//! settings, and so their permission mode, out of a run.
+//! settings, and so their permission mode and rules, out of a run: the rules a run
+//! has are the spec's, as flags, and [`ClaudeOptions::permissions`].
 
 mod driver;
 mod frames;
@@ -18,7 +19,6 @@ use plexus_harness::{
     ParkAnswer, ParkedCall, ParkedRun, PlanError, Process, Resume, Run, RunSpec, SessionId,
     SessionMode, Unpark, UserInput, VersionPin, WireFormat,
 };
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,8 +39,8 @@ pub struct ClaudeOptions {
     pub interrupt_timeout: Duration,
     /// How long a graceful stop has before a force stop.
     pub stop_timeout: Duration,
-    /// A `permissions` block for a parking run's own settings file, to carry rules
-    /// that aren't flags. Nothing outside that run's file sees it.
+    /// A `permissions` block for this harness's runs, to carry rules that aren't
+    /// flags, such as `ask`. Goes inline to `--settings`, so it's no file anywhere.
     pub permissions: Option<serde_json::Value>,
 }
 
@@ -93,41 +93,6 @@ impl ClaudeHarness {
             EnvName::new("ANTHROPIC_API_KEY"),
             EnvValue::secret(endpoint.key.clone()),
         );
-        Ok(())
-    }
-
-    /// Adds the per-run hook. It reaches the CLI only through `--settings`, and
-    /// nothing is written where the user's settings live.
-    fn park_plan(
-        spec: &RunSpec,
-        argv: &mut Vec<String>,
-        plan: &mut LaunchPlan,
-        state_dir: &str,
-        permissions: Option<&serde_json::Value>,
-    ) -> Result<(), PlanError> {
-        if !state_dir.starts_with('/') {
-            return Err(PlanError::Conflict {
-                what: "a park state directory must be an absolute path".into(),
-            });
-        }
-        // An answer file there would be one tool call away from the agent.
-        let inside = |cwd: &String| Path::new(state_dir).starts_with(cwd);
-        if spec.cwd.as_ref().is_some_and(inside) {
-            return Err(PlanError::Conflict {
-                what: "a park state directory must be outside the working directory".into(),
-            });
-        }
-        argv.extend([
-            "--settings".to_string(),
-            format!("{state_dir}/settings.json"),
-            "--include-hook-events".to_string(),
-        ]);
-        plan.files
-            .extend(park::files(state_dir, &spec.tools.preapproved, permissions));
-        plan.needs.push(Need::Program {
-            name: "python3".into(),
-            version: None,
-        });
         Ok(())
     }
 
@@ -196,14 +161,9 @@ impl ClaudeHarness {
         for rule in &spec.tools.denied {
             argv.extend(["--disallowedTools".to_string(), rule.clone()]);
         }
-        if let Some(park) = &spec.park {
-            Self::park_plan(
-                spec,
-                &mut argv,
-                &mut plan,
-                &park.state_dir,
-                self.options.permissions.as_ref(),
-            )?;
+        if let Some(permissions) = &self.options.permissions {
+            let settings = serde_json::json!({ "permissions": permissions });
+            argv.extend(["--settings".to_string(), settings.to_string()]);
         }
 
         if let Some(dir) = &self.options.config_dir {
@@ -253,11 +213,11 @@ impl Harness for ClaudeHarness {
 
 impl Park for ClaudeHarness {
     fn plan_unpark(&self, parked: &ParkedRun, answers: &[ParkAnswer]) -> Result<Unpark, PlanError> {
-        let Some(park) = &parked.spec.park else {
+        if !parked.spec.park {
             return Err(PlanError::Conflict {
                 what: "this run was not started to park".into(),
             });
-        };
+        }
         for a in answers {
             let known = parked
                 .calls
@@ -266,6 +226,11 @@ impl Park for ClaudeHarness {
             if !known {
                 return Err(PlanError::Conflict {
                     what: format!("{} isn't pending in this run", a.call.tool_use_id),
+                });
+            }
+            if !a.answer.fits(&a.call.kind) {
+                return Err(PlanError::Conflict {
+                    what: format!("{:?} doesn't fit {:?}", a.answer.outcome(), a.call.kind),
                 });
             }
         }
@@ -285,10 +250,20 @@ impl Park for ClaudeHarness {
             plan.needs
                 .push(Need::ExistingDirectory { path: cwd.clone() });
         }
-        for a in answers {
-            plan.files.push(park::answer_file(&park.state_dir, a)?);
-        }
-        Ok(Unpark { spec, plan })
+        let mut said: Vec<String> = if answers.is_empty() {
+            parked.calls.iter().map(park::again).collect()
+        } else {
+            answers
+                .iter()
+                .map(|a| park::message(&a.call, &a.answer, false))
+                .collect()
+        };
+        said.extend(park::completed(&parked.completed));
+        Ok(Unpark {
+            spec,
+            plan,
+            input: UserInput::text(said.join("\n")),
+        })
     }
 
     fn message(

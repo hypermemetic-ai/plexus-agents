@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const SET_9: &str = "agents-9-2026-11-01";
-const SET_37: &str = "agents-37-2026-11-01";
+const SET_37: &str = "agents-37-can-use-tool-2026-11-01";
 
 fn set(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -29,11 +29,15 @@ fn set(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn phase(dir: PathBuf, name: &str, unprompted: bool) -> ReplayScript {
+/// A process that's killed where its recording ends, or runs to the end of it.
+fn phase(dir: PathBuf, name: &str, killed: bool) -> ReplayScript {
     let exit = ReplayScript::exit_from_rc(0);
-    let mut s = ReplayScript::load(&dir, name, exit, ExitTrigger::OnInputClose, 0).unwrap();
-    s.unprompted = unprompted;
-    s
+    let trigger = if killed {
+        ExitTrigger::OnSignal
+    } else {
+        ExitTrigger::OnInputClose
+    };
+    ReplayScript::load(&dir, name, exit, trigger, 0).unwrap()
 }
 
 struct Sequence {
@@ -65,7 +69,6 @@ async fn open(scripts: Vec<ReplayScript>) -> Fixture {
     };
     let (supervisor, recovery) = Supervisor::open(SupervisorConfig {
         db: dir.path().join("runtime.db"),
-        state_root: dir.path().join("state").to_string_lossy().to_string(),
         environment: Arc::new(env),
         harnesses: vec![Arc::new(ClaudeHarness::default())],
     })
@@ -117,8 +120,8 @@ fn allow() -> InputAnswer {
 fn parked_replays() -> Vec<ReplayScript> {
     let dir = set(SET_9).join("restart-parked");
     vec![
-        phase(dir.join("svc1"), "1-claude", false),
-        phase(dir.join("svc2"), "1-claude", true),
+        phase(dir.join("svc1"), "1-claude", true),
+        phase(dir.join("svc2"), "1-claude", false),
     ]
 }
 
@@ -149,7 +152,7 @@ fn every_real_runtime_run_held_its_claims() {
     let path = set(SET_9).join("run.json");
     let v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let cases = v["cases"].as_object().unwrap();
-    assert_eq!(cases.len(), 4);
+    assert_eq!(cases.len(), 5);
     for (name, case) in cases {
         let claims = case["claims"].as_object().unwrap();
         assert!(claims.len() >= 4, "{name}");
@@ -367,28 +370,202 @@ async fn real_frames_come_back_byte_identical_through_a_run() {
     }
 }
 
-/// Answers to a batch are all applied together, and only once all are in.
+/// One agent asks about one call at a time, so the real `park-batch` parks twice.
+/// More than one can be pending when requests race the kill, so this one is injected.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_batch_waits_for_every_answer() {
-    let dir = set(SET_37).join("park-batch");
+async fn a_thread_waits_for_every_answer_and_applies_them_once() {
+    let f = open(parked_replays()).await;
+    let t = parked(&f).await;
+    let log = f.supervisor.log();
+    log.tx(|tx| {
+        let (request, id): (String, String) = tx.sql.query_row(
+            "SELECT request, id FROM inputs WHERE thread = ?",
+            [t.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let other = format!("{id}-2");
+        let mut v: Value = serde_json::from_str(&request).unwrap();
+        v["id"] = other.clone().into();
+        v["kind"]["tool_use_id"] = "toolu_second".into();
+        v["kind"]["input"]["command"] = "sh second.sh".into();
+        tx.sql.execute(
+            "INSERT INTO inputs (id, thread, run, turn, tool_use_id, request, delivery)
+             SELECT ?, thread, run, turn, 'toolu_second', ?, delivery FROM inputs WHERE id = ?",
+            rusqlite::params![other, v.to_string(), id],
+        )?;
+        let mut p: Value = serde_json::from_str(&tx.sql.query_row(
+            "SELECT parked FROM threads WHERE id = ?",
+            [t.as_str()],
+            |r| r.get::<_, String>(0),
+        )?)
+        .unwrap();
+        let mut second = p["calls"][0].clone();
+        second["request"] = other.into();
+        second["tool_use_id"] = "toolu_second".into();
+        second["input"]["command"] = "sh second.sh".into();
+        p["calls"].as_array_mut().unwrap().push(second);
+        tx.sql.execute(
+            "UPDATE threads SET parked = ? WHERE id = ?",
+            rusqlite::params![p.to_string(), t.as_str()],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let pending = f.supervisor.thread(&t).unwrap().pending;
+    assert_eq!(pending.len(), 2);
+    f.supervisor.answer(&pending[0], allow()).await.unwrap();
+    assert_eq!(
+        f.spawned.load(Ordering::SeqCst),
+        1,
+        "one is still undecided"
+    );
+    let again = f.supervisor.answer(&pending[0], allow()).await;
+    assert!(again.is_err(), "the first answer stands");
+    f.supervisor.answer(&pending[1], allow()).await.unwrap();
+    assert_eq!(f.spawned.load(Ordering::SeqCst), 2);
+    let q = f.supervisor.inputs(&t);
+    let listed = q.list(InputFilter::default()).await;
+    assert!(listed[..2].iter().all(|r| r.route == InputRoute::Parked));
+}
+
+/// `park-batch`, each process in turn. The second parks with one call finished, and
+/// that result lives nowhere but here: the transcript says it was interrupted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_parks_for_each_call_and_says_what_already_ran() {
+    let dir = set(SET_37).join("park-batch/svc1");
     let f = open(vec![
-        phase(dir.clone(), "1-claude", false),
-        phase(dir, "2-claude", true),
+        phase(dir.clone(), "1-claude", true),
+        phase(dir.clone(), "2-claude", true),
+        phase(dir, "3-claude", false),
     ])
     .await;
     let t = parked(&f).await;
-    let pending = f.supervisor.thread(&t).unwrap().pending;
-    assert!(pending.len() >= 2, "{pending:?}");
     let q = f.supervisor.inputs(&t);
-    for (n, id) in pending.iter().enumerate() {
-        assert_eq!(f.spawned.load(Ordering::SeqCst), 1, "still waiting at {n}");
-        q.answer(id, allow()).await.unwrap();
+    let first = f.supervisor.thread(&t).unwrap().pending;
+    assert_eq!(first.len(), 1, "one at a time, though two calls are open");
+    f.supervisor.answer(&first[0], allow()).await.unwrap();
+    until(|| {
+        let v = f.supervisor.thread(&t).unwrap();
+        v.status == ThreadStatus::Parked && !v.pending.is_empty()
+    })
+    .await;
+    let records = f.supervisor.records(&t).unwrap();
+    assert_eq!(records[0].delivery, Delivery::Superseded);
+    assert_eq!(records[1].delivery, Delivery::Applied, "the retry took it");
+    let second = f.supervisor.thread(&t).unwrap().pending;
+    q.answer(&second[0], allow()).await.unwrap();
+    until(|| terminals(&f, &t) == 1).await;
+    let log = f.supervisor.log();
+    let filter = ReadFilter {
+        thread: Some(t.clone()),
+        without_raw: true,
+    };
+    let fed: Vec<String> = log
+        .page(&filter, GlobalSeq(0), 100_000)
+        .unwrap()
+        .iter()
+        .filter_map(|e| match &e.event.kind {
+            AgentEventKind::UserMessage { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fed.len(), 3, "the prompt, and an answer a park");
+    assert!(!fed[1].contains("Do not make them again"), "{}", fed[1]);
+    assert!(fed[2].contains("Do not make them again"), "{}", fed[2]);
+    assert!(fed[2].contains("sh effect.sh one"), "{}", fed[2]);
+    assert_eq!(f.supervisor.thread(&t).unwrap().last_turn.0, 1);
+}
+
+/// Rules are the CLI's, so calls they settled are nothing to do with parking.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parking_thread_stays_up_when_the_rules_settle_the_call() {
+    for case in ["park-wildcard", "park-deny-flag", "park-deny-settings"] {
+        let dir = set(SET_37).join(case).join("svc1");
+        let f = open(vec![phase(dir, "1-claude", false)]).await;
+        let t = thread(&f, true);
+        f.supervisor
+            .prompt(&t, UserInput::text("the recorded prompt"))
+            .await
+            .unwrap();
+        until(|| terminals(&f, &t) == 1).await;
+        assert!(f.supervisor.records(&t).unwrap().is_empty(), "{case}");
+        assert!(f.supervisor.pending().unwrap().is_empty(), "{case}");
+        assert!(f.supervisor.is_live(&t), "{case}: nothing killed it");
     }
-    assert_eq!(f.spawned.load(Ordering::SeqCst), 2);
-    let again = q.answer(&pending[0], allow()).await;
-    assert!(again.is_err(), "the first answer stands");
-    let listed = q.list(InputFilter::default()).await;
-    assert!(listed.iter().all(|r| r.route == InputRoute::Parked));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_that_doesnt_park_holds_its_process_open() {
+    let dir = set(SET_37).join("live-without-park/svc1");
+    let f = open(vec![phase(dir, "1-claude", false)]).await;
+    let t = thread(&f, false);
+    f.supervisor
+        .prompt(&t, UserInput::text("the recorded prompt"))
+        .await
+        .unwrap();
+    until(|| !f.supervisor.thread(&t).unwrap().pending.is_empty()).await;
+    assert!(f.supervisor.is_live(&t));
+    let r = &f.supervisor.pending().unwrap()[0];
+    assert_eq!(r.request.route, InputRoute::Live);
+    f.supervisor.answer(&r.request.id, allow()).await.unwrap();
+    until(|| terminals(&f, &t) == 1).await;
+    assert_eq!(f.spawned.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        f.supervisor.records(&t).unwrap()[0].delivery,
+        Delivery::Applied
+    );
+}
+
+/// Nothing needs a process to end a turn, and the reason waits for the next prompt.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deny_that_stops_ends_the_turn_with_no_process_and_the_next_prompt_says_why() {
+    let dir = set(SET_37).join("park-deny-stop-turn/svc1");
+    let f = open(vec![
+        phase(dir.clone(), "1-claude", true),
+        phase(dir, "2-claude", false),
+    ])
+    .await;
+    let t = parked(&f).await;
+    let id = f.supervisor.thread(&t).unwrap().pending[0].clone();
+    let deny = InputAnswer::Deny {
+        message: "reason-marker".into(),
+        stop_turn: true,
+    };
+    f.supervisor.answer(&id, deny).await.unwrap();
+    assert_eq!(f.spawned.load(Ordering::SeqCst), 1);
+    assert_eq!(terminals(&f, &t), 1);
+    let view = f.supervisor.thread(&t).unwrap();
+    assert_eq!(view.status, ThreadStatus::Idle);
+    assert_eq!(
+        f.supervisor.records(&t).unwrap()[0].delivery,
+        Delivery::Superseded
+    );
+    f.supervisor
+        .prompt(&t, UserInput::text("next"))
+        .await
+        .unwrap();
+    let filter = ReadFilter {
+        thread: Some(t.clone()),
+        without_raw: true,
+    };
+    let said = || -> Vec<String> {
+        let log = f.supervisor.log();
+        log.page(&filter, GlobalSeq(0), 100_000)
+            .unwrap()
+            .iter()
+            .filter_map(|e| match &e.event.kind {
+                AgentEventKind::UserMessage { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    until(|| said().len() == 2).await;
+    let all = said();
+    assert!(
+        all[1].contains("reason-marker") && all[1].ends_with("next"),
+        "{}",
+        all[1]
+    );
 }
 
 /// The real retry: the live request became a message, the agent called the tool
@@ -439,7 +616,6 @@ async fn a_crash_before_the_run_row_still_never_reapplies() {
     let db = f._dir.path().join("runtime.db");
     let (again, recovery) = Supervisor::open(SupervisorConfig {
         db,
-        state_root: "/unused".into(),
         environment: Arc::new(Sequence {
             steps: vec![],
             next: Arc::default(),

@@ -1,47 +1,60 @@
-//! AGENTS-37: replays of the driver's own real park runs, and the park's plan.
-//! The recordings came from `examples/claude_real.rs` on real CLI 2.1.316.
+//! AGENTS-37: parking through the driver, replayed from real runs of
+//! `scripts/runtime-real` on CLI 2.1.316, and the park's plan.
 
 use futures::StreamExt;
-use plexus_agents::runner::launch;
-use plexus_agents::ClaudeHarness;
+use plexus_agents::runner::{launch, pending};
+use plexus_agents::{ClaudeHarness, ClaudeOptions};
 use plexus_harness::conformance::replay::{ExitTrigger, ReplayEnvironment, ReplayScript};
 use plexus_harness::{
-    AgentEventKind, Environment, EventSeq, Harness, InputAnswer, InputKind, InputRoute, ModelName,
-    Need, Park, ParkAnswer, ParkSpec, ParkedRun, PlanError, Run, RunEndReason, RunSpec, Signal,
-    ToolName, TurnOrigin, UserInput,
+    AgentEventKind, Environment, EventSeq, Harness, InputAnswer, InputKind, ModelName, Need, Park,
+    ParkAnswer, ParkedRun, PlanError, Run, RunEndReason, RunSpec, Signal, ToolName, TurnOrigin,
+    UserInput,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-fn set() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/recorded/agents-37-2026-11-01")
+const SET: &str = "agents-37-can-use-tool-2026-11-01";
+
+fn set(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/recorded")
+        .join(name)
 }
 
 fn spec() -> RunSpec {
     RunSpec {
         cwd: Some("/parked/here".into()),
         model: Some(ModelName::new("haiku")),
-        park: Some(ParkSpec {
-            state_dir: "/state/one".into(),
-        }),
+        park: true,
         ..RunSpec::default()
     }
 }
 
 fn script(case: &str, phase: &str, trigger: ExitTrigger) -> ReplayScript {
     let exit = ReplayScript::exit_from_rc(0);
-    ReplayScript::load(&set().join(case), phase, exit, trigger, 0).unwrap()
+    ReplayScript::load(&set(SET).join(case).join("svc1"), phase, exit, trigger, 0).unwrap()
 }
 
+/// Runs a recorded first process up to its request, then parks it as the runtime
+/// would. The recording ends in the kill, so only a signal ends the process.
 async fn parked_in(case: &str) -> (Arc<dyn Run>, ReplayEnvironment, ParkedRun) {
-    let env = ReplayEnvironment::new(script(case, "1-claude", ExitTrigger::OnInputClose));
+    let env = ReplayEnvironment::new(script(case, "1-claude", ExitTrigger::OnSignal));
     let run = launch(&ClaudeHarness::default(), &env, spec())
         .await
         .unwrap();
     run.send(UserInput::text("the recorded prompt"))
         .await
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while pending(run.as_ref()).await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the recording asks");
+    run.park().await.unwrap();
     let all: Vec<_> = run.events(EventSeq(0)).collect().await;
     let last = all.last().unwrap();
     assert!(
@@ -55,22 +68,38 @@ async fn parked_in(case: &str) -> (Arc<dyn Run>, ReplayEnvironment, ParkedRun) {
         "{:?}",
         last.kind
     );
+    assert!(
+        !all.iter()
+            .any(|e| matches!(e.kind, AgentEventKind::TurnTerminal(_))),
+        "a park isn't the end of a turn"
+    );
     let parked = run.parked().expect("parked");
     (run, env, parked)
 }
 
-#[test]
-fn every_real_park_run_held_its_claims() {
-    let path = set().join("run.json");
+fn claims_hold(path: PathBuf, cases: usize) {
     let v: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let cases = v["cases"].as_object().unwrap();
-    assert_eq!(cases.len(), 13);
-    for (name, case) in cases {
-        for (claim, ok) in case["claims"].as_object().unwrap() {
+    let got = v["cases"].as_object().unwrap();
+    assert_eq!(got.len(), cases);
+    for (name, case) in got {
+        let claims = case["claims"].as_object().unwrap();
+        assert!(!claims.is_empty(), "{name}");
+        for (claim, ok) in claims {
             assert_eq!(ok, true, "{name}: {claim}");
         }
     }
     assert!(v["cli_version"].as_str().unwrap().starts_with("2.1.316"));
+}
+
+#[test]
+fn every_real_park_run_held_its_claims() {
+    claims_hold(set(SET).join("run.json"), 13);
+}
+
+/// What was learned about hooks against rules, kept though the hook has gone.
+#[test]
+fn the_hook_recordings_still_hold_their_claims() {
+    claims_hold(set("agents-37-2026-11-01").join("run.json"), 5);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -78,29 +107,36 @@ async fn a_parked_run_keeps_its_requests_and_needs_no_process() {
     let (run, env, parked) = parked_in("park-allow").await;
     assert_eq!(parked.calls.len(), 1);
     assert_eq!(parked.cwd.as_deref(), Some("/parked/here"));
-    assert_eq!(parked.reported.as_ref(), Some(&parked.calls[0].tool_use_id));
     let q = run.inputs().unwrap();
     let r = q.get(&parked.calls[0].request).await.unwrap();
     assert!(
         r.state.is_pending(),
         "a park doesn't cancel what it waits on"
     );
-    assert_eq!(r.route, InputRoute::Parked);
-    // The process went by itself, so nothing was signalled.
-    assert!(!env.signals.lock().unwrap().contains(&Signal::KillTree));
+    // Killed: closing stdin makes the CLI fail the request, and the model carries on.
+    assert!(env.signals.lock().unwrap().contains(&Signal::KillTree));
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_batch_parks_with_every_call_though_result_names_one() {
-    let (_, _, parked) = parked_in("park-batch").await;
-    assert_eq!(parked.calls.len(), 2);
-    assert!(parked.reported.is_some());
+async fn parking_twice_is_parking_once() {
+    let (run, env, parked) = parked_in("park-allow").await;
+    run.park().await.unwrap();
+    assert_eq!(run.parked().unwrap().parked_at_ms, parked.parked_at_ms);
+    assert_eq!(env.signals.lock().unwrap().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_question_parks_as_a_question() {
     let (_, _, parked) = parked_in("park-question").await;
     assert!(matches!(parked.calls[0].kind, InputKind::Question { .. }));
+    assert_eq!(parked.calls[0].tool, ToolName::new("AskUserQuestion"));
+    assert!(parked.calls[0].input["questions"].is_array());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subagents_request_parks_with_the_subagent_named() {
+    let (_, _, parked) = parked_in("park-subagent").await;
+    assert!(parked.calls[0].agent.is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -118,29 +154,21 @@ async fn an_unpark_uses_the_parked_cwd_whatever_the_spec_says() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_answer_becomes_one_file_outside_the_cwd_and_nothing_else_changes() {
+async fn an_answer_goes_in_as_text_and_leaves_nothing_on_disk() {
     let (_, _, parked) = parked_in("park-allow").await;
-    let h = ClaudeHarness::default();
-    let bare = h.plan_unpark(&parked, &[]).unwrap();
     let a = ParkAnswer {
         call: parked.calls[0].clone(),
         answer: InputAnswer::Allow {
             updated_input: None,
         },
     };
-    let u = h.plan_unpark(&parked, &[a]).unwrap();
-    assert_eq!(u.plan.files.len(), bare.plan.files.len() + 1);
-    let file = u.plan.files.last().unwrap();
+    let u = ClaudeHarness::default().plan_unpark(&parked, &[a]).unwrap();
+    assert!(u.plan.files.is_empty());
     assert!(
-        file.path.starts_with("/state/one/answers/"),
-        "{}",
-        file.path
+        u.input.text.contains(&parked.calls[0].input.to_string()),
+        "the retry can't match unless it's given the input: {}",
+        u.input.text
     );
-    assert!(!u
-        .plan
-        .files
-        .iter()
-        .any(|f| f.path.contains(".claude") || f.path.starts_with("/parked/here")));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -160,78 +188,110 @@ async fn an_answer_for_a_call_that_isnt_pending_is_refused() {
     ));
 }
 
-#[test]
-fn a_state_dir_inside_the_cwd_is_refused() {
-    // Answers there would be one tool call away from the agent.
-    let spec = RunSpec {
-        park: Some(ParkSpec {
-            state_dir: "/parked/here/.state".into(),
-        }),
-        ..spec()
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_of_the_wrong_kind_is_refused() {
+    let (_, _, parked) = parked_in("park-allow").await;
+    let a = ParkAnswer {
+        call: parked.calls[0].clone(),
+        answer: InputAnswer::Answers {
+            answers: Default::default(),
+        },
     };
     assert!(matches!(
-        ClaudeHarness::default().plan(&spec),
+        ClaudeHarness::default().plan_unpark(&parked, &[a]),
         Err(PlanError::Conflict { .. })
     ));
 }
 
+/// The bug this replaced: a hook sees a call before the rules do.
 #[test]
-fn the_hook_reaches_the_cli_through_this_runs_settings_file_alone() {
-    let p = ClaudeHarness::default().plan(&spec()).unwrap();
-    let at = p.argv.iter().position(|a| a == "--settings").unwrap();
-    assert_eq!(p.argv[at + 1], "/state/one/settings.json");
-    let sources = p
+fn parking_adds_nothing_to_the_cli_so_its_rules_stay_in_charge() {
+    let parks = ClaudeHarness::default().plan(&spec()).unwrap();
+    let plain = RunSpec {
+        park: false,
+        ..spec()
+    };
+    let not = ClaudeHarness::default().plan(&plain).unwrap();
+    assert_eq!(parks.argv, not.argv);
+    assert_eq!(parks.needs, not.needs);
+    assert!(parks.files.is_empty());
+    let sources = parks
         .argv
         .iter()
         .position(|a| a == "--setting-sources")
         .unwrap();
-    assert_eq!(p.argv[sources + 1], "", "the user's settings stay out");
-    assert!(p
+    assert_eq!(parks.argv[sources + 1], "", "the user's settings stay out");
+    assert!(parks
         .argv
         .windows(2)
         .any(|w| w == ["--permission-mode", "default"]));
-    assert!(p.files.iter().all(|f| f.path.starts_with("/state/one/")));
-}
-
-#[test]
-fn a_run_that_doesnt_ask_to_park_gets_no_hook() {
-    let spec = RunSpec {
-        park: None,
-        ..spec()
-    };
-    let p = ClaudeHarness::default().plan(&spec).unwrap();
-    assert!(!p.argv.iter().any(|a| a == "--settings"));
-    assert!(p.files.is_empty());
 }
 
 #[test]
 fn rules_reach_the_cli_as_flags() {
     let mut s = spec();
     s.tools.denied = vec!["Bash(rm *)".into()];
+    s.tools.preapproved = vec!["Bash(git:*)".into()];
     s.tools.enabled = Some(vec![ToolName::new("Bash")]);
     let p = ClaudeHarness::default().plan(&s).unwrap();
     assert!(p
         .argv
         .windows(2)
         .any(|w| w == ["--disallowedTools", "Bash(rm *)"]));
+    assert!(p
+        .argv
+        .windows(2)
+        .any(|w| w == ["--allowedTools", "Bash(git:*)"]));
+}
+
+#[test]
+fn a_permissions_block_goes_inline_and_is_no_file() {
+    let h = ClaudeHarness::new(ClaudeOptions {
+        permissions: Some(json!({"ask": ["Bash(sh ask.sh)"]})),
+        ..ClaudeOptions::default()
+    });
+    let p = h.plan(&spec()).unwrap();
+    let at = p.argv.iter().position(|a| a == "--settings").unwrap();
+    let v: Value = serde_json::from_str(&p.argv[at + 1]).unwrap();
+    assert_eq!(v["permissions"]["ask"][0], "Bash(sh ask.sh)");
+    assert!(p.files.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_resumed_run_opens_its_turn_with_no_prompt() {
+async fn a_resumed_run_carries_on_its_turn_with_what_its_fed() {
     let (_, _, parked) = parked_in("park-allow").await;
     let h = ClaudeHarness::default();
-    let u = h.plan_unpark(&parked, &[]).unwrap();
-    let mut s = script("park-allow", "2-claude", ExitTrigger::OnInputClose);
-    s.unprompted = true;
-    let env = ReplayEnvironment::new(s);
+    let a = ParkAnswer {
+        call: parked.calls[0].clone(),
+        answer: InputAnswer::Allow {
+            updated_input: None,
+        },
+    };
+    let u = h.plan_unpark(&parked, &[a]).unwrap();
+    let text = u.input.text.clone();
+    let env = ReplayEnvironment::new(script("park-allow", "2-claude", ExitTrigger::OnInputClose));
     let process = env.spawn(u.plan).await.unwrap();
     let run = h.drive(u.spec, process).await.unwrap();
+    let turn = run.send(u.input).await.unwrap();
+    assert_eq!(turn, parked.turn, "the same turn, and no new one");
+    // A second send is an ordinary prompt: only the first carries the turn on.
     let mut events = run.events(EventSeq(0));
     let mut origin = None;
     let mut terminal = None;
+    let mut starts = 0;
     while let Some(e) = events.next().await {
         match e.kind {
-            AgentEventKind::TurnStarted { turn, origin: o } => origin = Some((turn, o)),
+            AgentEventKind::TurnStarted { turn, origin: o } => {
+                starts += 1;
+                origin = Some((turn, o));
+            }
+            AgentEventKind::InputRequested { id } => {
+                let q = run.inputs().unwrap();
+                let allow = InputAnswer::Allow {
+                    updated_input: None,
+                };
+                q.answer(&id, allow).await.unwrap();
+            }
             AgentEventKind::TurnTerminal(t) => {
                 terminal = Some(t);
                 run.close_input().await.unwrap();
@@ -239,10 +299,29 @@ async fn a_resumed_run_opens_its_turn_with_no_prompt() {
             _ => {}
         }
     }
+    assert_eq!(starts, 1);
     assert_eq!(origin, Some((parked.turn, TurnOrigin::Resume)));
     assert_eq!(terminal.unwrap().turn, parked.turn);
     let stdin = env.stdin.lock().unwrap();
-    assert!(stdin.is_empty(), "a resume sends no prompt: {stdin:?}");
+    assert_eq!(stdin[0]["message"]["content"][0]["text"], text.as_str());
+}
+
+#[test]
+fn a_run_not_started_to_park_cant_be_unparked() {
+    let parked = ParkedRun {
+        harness: "claude".into(),
+        session: plexus_harness::SessionId::new("s"),
+        cwd: None,
+        turn: plexus_harness::TurnId(1),
+        spec: RunSpec::default(),
+        calls: vec![],
+        completed: vec![],
+        parked_at_ms: 0,
+    };
+    assert!(matches!(
+        ClaudeHarness::default().plan_unpark(&parked, &[]),
+        Err(PlanError::Conflict { .. })
+    ));
 }
 
 #[test]

@@ -1,150 +1,92 @@
-//! Parking a Claude run (AGENTS-33): a `PreToolUse` hook returns `defer`, the CLI
-//! ends the turn with `stop_reason: tool_deferred` and exits, and `--resume` with no
-//! prompt fires the hook again for the same call.
+//! What a parked Claude run is told when it comes back.
 //!
-//! The hook is one file written for one run, under the run's state directory, and
-//! reaches the CLI through `--settings`. It goes nowhere near the user's settings:
-//! `--setting-sources ""` stays on, and the state directory must be outside `cwd`.
+//! The CLI's permission rules decide whether a call needs a person: `allow` and
+//! `deny` rules are applied inside the CLI, and only a call it would ask about
+//! reaches us, as `can_use_tool`. So a run parks on that request and on nothing
+//! else, and no rule is matched here. An earlier version parked from a `PreToolUse`
+//! hook, which fires before the rules are read, so it parked on calls the rules
+//! would have allowed and on calls they refuse (AGENTS-37's correction).
 //!
-//! An answer is a file in `answers/` that the hook takes by `rename`, which is
-//! atomic. That rename is what consumes it: a crash mid-tool leaves nothing for a
-//! later resume to apply, the hook defers again, and a person decides (AGENTS-33
-//! `h_crash_kept` ran a tool twice, `h_crash_oneshot` didn't).
+//! The process is killed, not closed: a request pending when stdin closes fails, and
+//! the model carries on and answers as though it were refused. The transcript keeps
+//! the call with no result, `--resume` with no prompt doesn't ask again, and that
+//! call can't be answered any more. So an answer goes in as a message, and the agent
+//! makes the call again under a new id. That retry reaches `can_use_tool` too, and
+//! the runtime answers it only by [`plexus_harness::retry_answer`]'s exact match.
 //!
-//! A hook's `allow` applies `updatedInput`, so what runs is what was approved, not
-//! what the model asked for on the retry.
+//! A batch needs telling what happened. The CLI asks about a message's calls one at a
+//! time and writes their results together, so a kill loses the result of a call
+//! that ran, and on resume the transcript says every call in that message was
+//! interrupted. Left at that, the model did the finished calls again, forever: the
+//! real `park-batch` asked a person five times over two calls. So the runtime's own
+//! record of them goes in: [`completed`].
+//!
+//! The message carries the input as JSON. Told only the command, the model rewrote
+//! Bash's `description` on the retry, and the match failed. Given the JSON, it kept
+//! every field. Nothing depends on that but a person's time: a retry that differs
+//! parks again and asks again. Approval text grants nothing.
 
-use plexus_harness::{InputAnswer, InputKind, ParkAnswer, ParkedCall, PlanError, PlanFile};
-use serde_json::{json, Value};
+use plexus_harness::{CompletedCall, InputAnswer, ParkedCall};
 
-/// The tools the hook parks. Any other tool isn't deferred: if it needs approval
-/// the CLI asks over stdio, which is the live route and just as safe.
-pub const PARKED_TOOLS: &str = "Bash|Edit|Write|NotebookEdit|AskUserQuestion";
+/// Most of a finished call's output to repeat.
+const OUTPUT_LIMIT: usize = 4000;
 
-/// Runs under `python3 -I`, which reads no site packages or current directory.
-///
-/// A subagent's call passes through to the permission check: `defer` from inside a
-/// subagent isn't how a run parks (AGENTS-37 `park-subagent`). So does a call a
-/// preapproved rule names exactly: that rule is the CLI's to apply, and a hook that
-/// stays silent changes nothing. Any failure here prints nothing, and that too
-/// falls through to the CLI's own permission check.
-const GATE: &str = r#"import json, os, re, sys
-here = os.path.dirname(os.path.abspath(__file__))
-e = json.load(sys.stdin)
-tool = e.get("tool_name", "")
-tid = e.get("tool_use_id", "")
-if e.get("agent_id") or not re.fullmatch(r"[A-Za-z0-9_-]+", tid):
-    sys.exit(0)
-rules = json.load(open(f"{here}/pass.json"))
-command = (e.get("tool_input") or {}).get("command")
-if tool in rules or (command is not None and f"{tool}({command})" in rules):
-    sys.exit(0)
-path = f"{here}/answers/{tid}.json"
-try:
-    os.rename(path, path + ".used")
-except FileNotFoundError:
-    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "defer"}}))
-    sys.exit(0)
-print(open(path + ".used").read())
-"#;
+const OTHERS: &str = "Any other call from that same message did not run: make it again too.";
 
-fn file(state_dir: &str, name: &str, contents: String) -> PlanFile {
-    PlanFile {
-        path: format!("{state_dir}/{name}"),
-        contents,
+/// What finished alongside the parked calls. Says so whatever the transcript says.
+pub fn completed(calls: &[CompletedCall]) -> Option<String> {
+    if calls.is_empty() {
+        return None;
     }
-}
-
-/// What a parking run adds to its plan.
-pub fn files(
-    state_dir: &str,
-    preapproved: &[String],
-    permissions: Option<&Value>,
-) -> Vec<PlanFile> {
-    let command = format!("python3 -I {state_dir}/gate.py");
-    let mut settings = json!({"hooks": {"PreToolUse": [{
-        "matcher": PARKED_TOOLS,
-        "hooks": [{"type": "command", "command": command}],
-    }]}});
-    if let Some(p) = permissions {
-        settings["permissions"] = p.clone();
-    }
-    vec![
-        file(state_dir, "gate.py", GATE.to_string()),
-        file(state_dir, "settings.json", settings.to_string()),
-        file(state_dir, "pass.json", json!(preapproved).to_string()),
-    ]
-}
-
-/// What the hook prints for `answer`.
-fn hook_output(a: &ParkAnswer) -> Result<Value, PlanError> {
-    let call = &a.call;
-    let allow = |input: &Value| {
-        json!({"hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-            "updatedInput": input,
-        }})
-    };
-    let deny = |reason: &str| {
-        json!({"hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": reason,
-        }})
-    };
-    match (&a.answer, &call.kind) {
-        (InputAnswer::Allow { .. }, InputKind::ToolApproval { .. }) => {
-            Ok(allow(a.approved_input()))
-        }
-        (InputAnswer::Answers { answers }, InputKind::Question { .. }) => {
-            let mut input = call.input.clone();
-            input["answers"] = json!(answers);
-            Ok(allow(&input))
-        }
-        (InputAnswer::Deny { message, stop_turn }, _) => {
-            let mut out = deny(message);
-            if *stop_turn {
-                out["continue"] = json!(false);
-                out["stopReason"] = json!(message);
-            }
-            Ok(out)
-        }
-        (InputAnswer::Refuse { reason }, _) => Ok(deny(reason)),
-        (answer, kind) => Err(PlanError::Conflict {
-            what: format!("{:?} doesn't fit {kind:?}", answer.outcome()),
-        }),
-    }
-}
-
-/// One answer file, for the hook to take when its call comes round again.
-pub fn answer_file(state_dir: &str, a: &ParkAnswer) -> Result<PlanFile, PlanError> {
-    Ok(file(
-        state_dir,
-        &format!("answers/{}.json", a.call.tool_use_id),
-        hook_output(a)?.to_string(),
+    let said: Vec<String> = calls
+        .iter()
+        .map(|c| {
+            let cut = (0..=OUTPUT_LIMIT.min(c.output.len()))
+                .rfind(|i| c.output.is_char_boundary(*i))
+                .unwrap_or(0);
+            let failed = if c.is_error { " and failed" } else { "" };
+            format!(
+                "{} with input {} ran{failed}, and returned: {}",
+                c.tool,
+                c.input,
+                &c.output[..cut]
+            )
+        })
+        .collect();
+    Some(format!(
+        "[runtime] These calls from that message did finish, whatever the record above says. \
+         Do not make them again.\n{}",
+        said.join("\n")
     ))
 }
 
-/// The AGENTS-33 fallback text, verbatim where it can be.
+fn subagent(call: &ParkedCall) -> &'static str {
+    if call.agent.is_some() {
+        " It was made by a subagent you started, which was stopped with it: start the subagent \
+         again, and have it make the call with exactly that input."
+    } else {
+        ""
+    }
+}
+
+/// The text that carries `answer` to the model.
 pub fn message(call: &ParkedCall, answer: &InputAnswer, may_have_started: bool) -> String {
-    let command = call.input["command"]
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| call.input.to_string());
+    let again = |input: &serde_json::Value| {
+        format!(
+            "Make the call again now, with exactly this input, every field unchanged: {input}.{}",
+            subagent(call)
+        )
+    };
     let said = match answer {
         InputAnswer::Allow {
             updated_input: None,
-        } => format!("allow. Run the exact same command again now: {command}"),
+        } => format!("allow. {}", again(&call.input)),
         InputAnswer::Allow {
             updated_input: Some(edited),
-        } => {
-            let edited = edited["command"]
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| edited.to_string());
-            format!("allow, with the command edited. Do not run the original. Run exactly this instead: {edited}")
-        }
+        } => format!(
+            "allow, with the input edited. Do not make the original call. {}",
+            again(edited)
+        ),
         InputAnswer::Deny { message, .. } => {
             format!("deny. Reason: {message}. Do not run it. Reply quoting the reason.")
         }
@@ -168,15 +110,30 @@ pub fn message(call: &ParkedCall, answer: &InputAnswer, may_have_started: bool) 
         ", and it did not run"
     };
     format!(
-        "[runtime] Your {} call {} was interrupted by a restart while waiting for a decision{ran}. The decision has now arrived: {said}",
+        "[runtime] Your {} call {} was stopped while waiting for a decision{ran}. \
+         The decision has now arrived: {said} {OTHERS}",
         call.tool, call.tool_use_id
+    )
+}
+
+/// The text for a call with no answer to give: it comes back to a person.
+pub fn again(call: &ParkedCall) -> String {
+    format!(
+        "[runtime] Your {} call {} was stopped, and it isn't known whether it ran. \
+         Make the call again now, with exactly this input, every field unchanged, \
+         and a person will decide: {}.{} {OTHERS}",
+        call.tool,
+        call.tool_use_id,
+        call.input,
+        subagent(call)
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use plexus_harness::{InputRequestId, ToolName, ToolUseId};
+    use plexus_harness::{InputKind, InputRequestId, SubagentId, ToolName, ToolUseId};
+    use serde_json::{json, Value};
 
     fn call(input: Value) -> ParkedCall {
         ParkedCall {
@@ -196,36 +153,63 @@ mod tests {
     }
 
     #[test]
-    fn an_allow_prints_the_input_that_was_approved() {
-        let a = ParkAnswer {
-            call: call(json!({"command": "a"})),
-            answer: InputAnswer::Allow {
-                updated_input: Some(json!({"command": "b"})),
+    fn an_allow_carries_the_whole_input_as_json() {
+        let c = call(json!({"command": "a", "description": "reworded unless it's here"}));
+        let text = message(
+            &c,
+            &InputAnswer::Allow {
+                updated_input: None,
             },
-        };
-        let out = hook_output(&a).unwrap();
-        assert_eq!(out["hookSpecificOutput"]["updatedInput"]["command"], "b");
-        assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "allow");
+            false,
+        );
+        assert!(text.contains(&c.input.to_string()), "{text}");
     }
 
     #[test]
-    fn an_answer_of_the_wrong_kind_is_refused() {
-        let a = ParkAnswer {
-            call: call(json!({})),
-            answer: InputAnswer::Answers {
-                answers: Default::default(),
+    fn an_edit_carries_the_edit_and_not_the_original() {
+        let c = call(json!({"command": "a"}));
+        let edited = json!({"command": "b"});
+        let text = message(
+            &c,
+            &InputAnswer::Allow {
+                updated_input: Some(edited.clone()),
             },
-        };
-        assert!(matches!(hook_output(&a), Err(PlanError::Conflict { .. })));
+            false,
+        );
+        assert!(text.contains(&edited.to_string()), "{text}");
+        assert!(!text.contains(&c.input.to_string()), "{text}");
     }
 
     #[test]
-    fn the_fallback_says_the_tool_may_have_run_when_it_may_have() {
+    fn the_message_says_the_tool_may_have_run_when_it_may_have() {
         let c = call(json!({"command": "x"}));
         let allow = InputAnswer::Allow {
             updated_input: None,
         };
         assert!(message(&c, &allow, false).contains("and it did not run"));
-        assert!(!message(&c, &allow, true).contains("did not run"));
+        assert!(!message(&c, &allow, true).contains("did not run,"));
+    }
+
+    #[test]
+    fn finished_calls_are_named_with_what_they_returned() {
+        assert_eq!(completed(&[]), None);
+        let done = CompletedCall {
+            tool: ToolName::new("Bash"),
+            input: json!({"command": "sh one"}),
+            is_error: false,
+            output: "é".repeat(OUTPUT_LIMIT),
+        };
+        let text = completed(std::slice::from_ref(&done)).unwrap();
+        assert!(text.contains("Do not make them again"), "{text}");
+        assert!(text.contains(&done.input.to_string()), "{text}");
+        assert!(text.len() < OUTPUT_LIMIT + 300, "the output is cut");
+    }
+
+    #[test]
+    fn a_subagents_call_says_the_subagent_went_with_it() {
+        let mut c = call(json!({"command": "x"}));
+        assert!(!again(&c).contains("subagent"));
+        c.agent = Some(SubagentId::new("a"));
+        assert!(again(&c).contains("subagent"));
     }
 }

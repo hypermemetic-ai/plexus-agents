@@ -35,8 +35,6 @@ impl Service {
         command
             .arg("--db")
             .arg(dir.join("runtime.db"))
-            .arg("--state")
-            .arg(dir.join("state"))
             .arg("--plans")
             .arg(dir.join("plans.jsonl"));
         for r in replay {
@@ -113,15 +111,10 @@ fn plans(dir: &Path) -> Vec<Value> {
         .collect()
 }
 
-fn answer_files(plan: &Value) -> Vec<String> {
-    plan["files"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(Value::as_str)
-        .filter(|p| p.contains("/answers/") || p.contains("answer"))
-        .map(str::to_string)
-        .collect()
+/// An answer goes in by stdin and never as a file, so nothing is left for a later
+/// process to apply.
+fn no_answer_files(plan: &Value) -> bool {
+    plan["files"].as_array().unwrap().is_empty()
 }
 
 #[test]
@@ -130,8 +123,8 @@ fn a_crash_mid_tool_never_hands_the_answer_to_another_process() {
     let mut a = Service::start(
         dir.path(),
         &[
-            phase("crash-mid-tool", "svc1/1-claude", ""),
-            phase("crash-mid-tool", "svc1/2-claude", ":signal:unprompted"),
+            phase("crash-mid-tool", "svc1/1-claude", ":signal"),
+            phase("crash-mid-tool", "svc1/2-claude", ":signal"),
         ],
     );
     let t = create(&mut a, true);
@@ -143,24 +136,20 @@ fn a_crash_mid_tool_never_hands_the_answer_to_another_process() {
         .to_string();
     let v = a.op(json!({"op": "answer", "thread": t, "id": first, "allow": true}));
     assert!(v.get("ok").is_some(), "{v}");
-    a.wait(|s| s.status(&t)["inputs"][0]["delivery"] == "delivered");
-    // The tool is running in the replayed process. Now the service dies.
-    a.wait(|s| s.kinds().contains(&"tool.started".to_string()) || s.status(&t)["live"] == true);
+    // The retry took the answer, and the tool is running. Now the service dies.
+    a.wait(|s| s.status(&t)["inputs"][1]["delivery"] == "delivered");
     a.kill();
-    assert_eq!(
-        answer_files(&plans(dir.path())[1]).len(),
-        1,
-        "the first resume had it"
-    );
+    assert!(plans(dir.path()).iter().all(no_answer_files));
 
     let mut b = Service::start(
         dir.path(),
         &[
-            phase("crash-mid-tool", "svc2/1-claude", ":unprompted"),
-            phase("crash-mid-tool", "svc2/2-claude", ":unprompted"),
+            phase("crash-mid-tool", "svc2/1-claude", ":signal"),
+            phase("crash-mid-tool", "svc2/2-claude", ""),
         ],
     );
-    assert_eq!(b.ready["recovery"]["outcome_unknown"], json!([first]));
+    let unknown = b.ready["recovery"]["outcome_unknown"].clone();
+    assert_eq!(unknown.as_array().unwrap().len(), 1, "{unknown}");
     assert_eq!(
         plans(dir.path()).len(),
         2,
@@ -168,10 +157,9 @@ fn a_crash_mid_tool_never_hands_the_answer_to_another_process() {
     );
     let s = b.status(&t);
     assert_eq!(s["thread"]["status"], "parked");
-    assert_eq!(s["thread"]["outcome_unknown"], json!([first]));
-    assert_eq!(s["inputs"][0]["delivery"], "outcome_unknown");
+    assert_eq!(s["thread"]["outcome_unknown"], unknown);
     // An answer can't be given twice, and that row is no longer answerable.
-    let v = b.op(json!({"op": "answer", "thread": t, "id": first, "allow": true}));
+    let v = b.op(json!({"op": "answer", "thread": t, "id": unknown[0], "allow": true}));
     assert!(v.get("error").is_some(), "{v}");
     assert_eq!(plans(dir.path()).len(), 2);
 
@@ -180,7 +168,7 @@ fn a_crash_mid_tool_never_hands_the_answer_to_another_process() {
     assert!(v.get("ok").is_some(), "{v}");
     let all = plans(dir.path());
     assert_eq!(all.len(), 3);
-    assert_eq!(answer_files(&all[2]), Vec::<String>::new());
+    assert!(no_answer_files(&all[2]), "nothing stale is left to apply");
     b.wait(|s| s.status(&t)["thread"]["status"] == "parked" && s.status(&t)["live"] == false);
     b.wait(|s| s.status(&t)["thread"]["pending"].as_array().unwrap().len() == 1);
     let s = b.status(&t);
@@ -191,7 +179,6 @@ fn a_crash_mid_tool_never_hands_the_answer_to_another_process() {
         .filter(|i| i["delivery"] == "pending")
         .collect();
     assert_eq!(pending[0]["after_unknown_outcome"], true);
-    assert_eq!(pending[0]["tool_use_id"], s["inputs"][0]["tool_use_id"]);
     b.kill();
 }
 
@@ -234,21 +221,60 @@ fn a_restart_mid_run_closes_it_out_as_interrupted() {
 fn a_parked_thread_survives_the_service_and_a_new_one_answers_it() {
     let dir = tempfile::tempdir().unwrap();
     let case = "restart-parked";
-    let mut a = Service::start(dir.path(), &[phase(case, "svc1/1-claude", "")]);
+    let mut a = Service::start(dir.path(), &[phase(case, "svc1/1-claude", ":signal")]);
     let t = create(&mut a, true);
     a.op(json!({"op": "prompt", "thread": t, "text": "recorded"}));
     a.wait(|s| s.status(&t)["thread"]["status"] == "parked");
     a.kill();
 
-    let mut b = Service::start(dir.path(), &[phase(case, "svc2/1-claude", ":unprompted")]);
+    let mut b = Service::start(dir.path(), &[phase(case, "svc2/1-claude", "")]);
     let s = b.status(&t);
     let id = s["thread"]["pending"][0].as_str().unwrap().to_string();
     let v = b.op(json!({"op": "prompt", "thread": t, "text": "no"}));
     assert!(v["error"].as_str().unwrap().contains("undecided"), "{v}");
     b.op(json!({"op": "answer", "thread": t, "id": id, "allow": true}));
-    b.wait(|s| s.status(&t)["inputs"][0]["delivery"] == "applied");
-    assert_eq!(answer_files(&plans(dir.path())[1]).len(), 1);
+    b.wait(|s| s.status(&t)["inputs"][1]["delivery"] == "applied");
+    assert_eq!(b.status(&t)["inputs"][0]["delivery"], "superseded");
     b.wait(|s| s.kinds().contains(&"turn.terminal".to_string()));
+    b.kill();
+}
+
+#[test]
+fn the_queue_spans_threads_oldest_first_and_outlives_the_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let case = "queue-across-threads";
+    let mut a = Service::start(
+        dir.path(),
+        &[
+            phase(case, "svc1/1-claude", ":signal"),
+            phase(case, "svc1/2-claude", ":signal"),
+        ],
+    );
+    let (one, two) = (create(&mut a, true), create(&mut a, true));
+    for t in [&one, &two] {
+        a.op(json!({"op": "prompt", "thread": t, "text": "recorded"}));
+        a.wait(|s| s.status(t)["thread"]["status"] == "parked");
+    }
+    a.kill();
+
+    let mut b = Service::start(dir.path(), &[phase(case, "svc2/1-claude", "")]);
+    let q = b.op(json!({"op": "pending"}))["ok"]["pending"].take();
+    let threads: Vec<&str> = q
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["thread"].as_str().unwrap())
+        .collect();
+    assert_eq!(threads, [one.as_str(), two.as_str()]);
+    assert_eq!(plans(dir.path()).len(), 2, "nothing started by itself");
+
+    // No thread named: the id alone finds it, and starts that thread alone.
+    b.op(json!({"op": "answer", "id": q[0]["id"], "allow": true}));
+    b.wait(|s| s.status(&one)["thread"]["runs"] == 2);
+    assert_eq!(b.status(&two)["thread"]["runs"], 1);
+    let left = b.op(json!({"op": "pending"}))["ok"]["pending"].take();
+    assert_eq!(left.as_array().unwrap().len(), 1);
+    assert_eq!(left[0]["thread"], two.as_str());
     b.kill();
 }
 

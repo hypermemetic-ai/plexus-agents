@@ -2,12 +2,14 @@
 //! is a test driver and not the service: the activation is AGENTS-13.
 //!
 //! ```text
-//! agents_service --db FILE --state DIR [--record DIR | --replay PHASE[:signal][:unprompted]...]
-//!                [--plans FILE]
+//! agents_service --db FILE [--record DIR | --replay PHASE[:signal][:unprompted]...]
+//!                [--plans FILE] [--permissions JSON]
 //! ```
 //! Reads one JSON op a line, writes one JSON reply a line:
-//! `create {cwd, model, park}`, `prompt {thread, text}`, `answer {id, allow}`,
+//! `create {cwd, model, park, tools, preapproved, denied}`, `prompt {thread, text}`,
+//! `answer {id, allow | edited | answers | message, stop_turn}`, `pending {}`,
 //! `continue {thread}`, `interrupt {thread}`, `status {thread}`, `events {since}`.
+//! `--permissions` is a `permissions` block for every run.
 //!
 //! `--replay` plays `<dir>/<phase>` recordings in place of `claude`, for a check
 //! that spends nothing. `:signal` holds a phase open until its process is killed,
@@ -19,7 +21,7 @@ use futures::future::BoxFuture;
 use plexus_agents::runtime::{
     EventLog, GlobalSeq, ReadFilter, Supervisor, SupervisorConfig, ThreadId, ThreadOptions,
 };
-use plexus_agents::{ClaudeHarness, LocalEnvironment, RecordingEnvironment};
+use plexus_agents::{ClaudeHarness, ClaudeOptions, LocalEnvironment, RecordingEnvironment};
 use plexus_harness::conformance::replay::{ExitTrigger, ReplayEnvironment, ReplayScript};
 use plexus_harness::{
     Environment, InputAnswer, InputRequestId, LaunchPlan, ModelName, Process, RunSpec, SpawnError,
@@ -97,14 +99,27 @@ fn replayed(phases: &[String]) -> Result<Sequence, String> {
 }
 
 fn spec(op: &Value) -> RunSpec {
-    let tool = ToolName::new("Bash");
+    let names = |k: &str| -> Vec<String> {
+        op[k]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let tools = match names("tools") {
+        t if t.is_empty() => vec!["Bash".to_string()],
+        t => t,
+    };
     RunSpec {
         cwd: op["cwd"].as_str().map(str::to_string),
         model: Some(ModelName::new(op["model"].as_str().unwrap_or("haiku"))),
         tools: ToolPolicy {
-            enabled: Some(vec![tool]),
-            preapproved: vec![],
-            denied: vec![],
+            enabled: Some(tools.iter().map(ToolName::new).collect()),
+            preapproved: names("preapproved"),
+            denied: names("denied"),
         },
         ..RunSpec::default()
     }
@@ -132,22 +147,38 @@ async fn handle(s: &Supervisor, op: &Value) -> Result<Value, String> {
         }
         "answer" => {
             let id = InputRequestId::new(text("id"));
-            let answer = if op["allow"].as_bool().unwrap_or(false) {
+            let answer = if let Some(answers) = op["answers"].as_object() {
+                let said = |v: &Value| v.as_str().unwrap_or_default().to_string();
+                InputAnswer::Answers {
+                    answers: answers.iter().map(|(q, a)| (q.clone(), said(a))).collect(),
+                }
+            } else if op["allow"].as_bool().unwrap_or(false) {
                 InputAnswer::Allow {
-                    updated_input: None,
+                    updated_input: (!op["edited"].is_null()).then(|| op["edited"].clone()),
                 }
             } else {
                 InputAnswer::Deny {
                     message: text("message"),
-                    stop_turn: false,
+                    stop_turn: op["stop_turn"].as_bool().unwrap_or(false),
                 }
             };
-            let r = s
-                .inputs(&thread)
-                .answer(&id, answer)
-                .await
-                .map_err(|e| e.to_string())?;
+            let r = s.answer(&id, answer).await.map_err(|e| e.to_string())?;
             Ok(json!({"state": r.state}))
+        }
+        "pending" => {
+            let rows: Vec<Value> = s
+                .pending()
+                .map_err(err)?
+                .iter()
+                .map(|r| {
+                    json!({
+                        "thread": r.thread, "id": r.request.id, "route": r.request.route,
+                        "after_unknown_outcome": r.after_unknown_outcome,
+                        "kind": r.request.kind, "agent": r.request.agent,
+                    })
+                })
+                .collect();
+            Ok(json!({"pending": rows}))
         }
         "continue" => s
             .continue_thread(&thread)
@@ -168,7 +199,8 @@ async fn handle(s: &Supervisor, op: &Value) -> Result<Value, String> {
                 .map(|r| {
                     json!({
                         "id": r.request.id, "delivery": r.delivery, "route": r.request.route,
-                        "tool_use_id": r.tool_use_id,
+                        "tool_use_id": r.tool_use_id, "kind": r.request.kind,
+                        "agent": r.request.agent,
                         "after_unknown_outcome": r.after_unknown_outcome,
                     })
                 })
@@ -193,14 +225,16 @@ async fn handle(s: &Supervisor, op: &Value) -> Result<Value, String> {
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
-    let (mut db, mut state, mut record, mut plans, mut replay) =
-        (None, None, None, None, Vec::new());
+    let (mut db, mut record, mut plans, mut replay, mut permissions) =
+        (None, None, None, Vec::new(), None);
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
         match flag.as_str() {
             "--db" => db = Some(value()?),
-            "--state" => state = Some(value()?),
+            "--permissions" => {
+                permissions = Some(serde_json::from_str(&value()?).map_err(|e| e.to_string())?)
+            }
             "--record" => record = Some(value()?),
             "--plans" => plans = Some(PathBuf::from(value()?)),
             "--replay" => replay.push(value()?),
@@ -216,9 +250,11 @@ async fn main() -> Result<(), String> {
     };
     let (supervisor, recovery) = Supervisor::open(SupervisorConfig {
         db: db.ok_or("--db")?.into(),
-        state_root: state.ok_or("--state")?,
         environment: Arc::new(Noted { inner, file: plans }),
-        harnesses: vec![Arc::new(ClaudeHarness::default())],
+        harnesses: vec![Arc::new(ClaudeHarness::new(ClaudeOptions {
+            permissions,
+            ..ClaudeOptions::default()
+        }))],
     })
     .await
     .map_err(|e| e.to_string())?;

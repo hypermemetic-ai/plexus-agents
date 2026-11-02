@@ -9,8 +9,21 @@
 //! answer still stored, and a resume applied it again. So an answer moves through
 //! [`Delivery`], and `Delivered` commits before anything can act on it. After a
 //! crash a `Delivered` row with no tool result becomes `OutcomeUnknown`, which is
-//! shown to a person and never re-applied. The hook side takes its answer file by
-//! `rename`, so it can't be applied twice from there either.
+//! shown to a person and never re-applied. An answer reaches a tool through a call
+//! the agent makes again, and each answer covers one such call, by exact match.
+//!
+//! ## Parking
+//!
+//! A thread that parks has its process killed when the CLI asks for a decision, and
+//! only then: the request is the CLI's own `can_use_tool`, so its rules have already
+//! said yes or no to anything they cover. The request is durable before the kill,
+//! and it waits for as long as it takes: nothing here expires. [`Supervisor::pending`]
+//! lists every thread's, oldest first, and answering the last one a thread is waiting
+//! on starts it again.
+//!
+//! Killing the process kills whatever else it was doing. Tools it had allowed run
+//! one at a time around a request, so none is in flight then, but a subagent or a
+//! background task is lost with it, and the agent has to start that again.
 
 use super::store::{EventLog, Store, StoreError, Tx};
 use super::{GlobalSeq, ReadFilter, StoredEvent, ThreadId};
@@ -20,13 +33,13 @@ use plexus_harness::{
     now_ms, resume_or_restart, retry_answer, AgentEvent, AgentEventKind, Attribution, CancelReason,
     Environment, EventSeq, Harness, InputAnswer, InputError, InputFilter, InputKind, InputOutcome,
     InputQueue, InputRequest, InputRequestId, InputRoute, InputState, InterruptOutcome, ParkAnswer,
-    ParkSpec, ParkedCall, ParkedRun, Run, RunEndReason, RunError, RunId, RunSpec, SessionId,
-    SessionMode, StopCause, StopMode, StopReport, ThreadDisposition, ToolName, ToolUseId, TurnId,
-    TurnStatus, TurnTerminal, UserInput,
+    ParkedCall, ParkedRun, Run, RunEndReason, RunError, RunId, RunSpec, SessionId, SessionMode,
+    StopCause, StopMode, StopReport, ThreadDisposition, ToolUseId, TurnId, TurnStatus,
+    TurnTerminal, UserInput,
 };
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -209,16 +222,14 @@ impl From<RunError> for RuntimeError {
 
 pub struct SupervisorConfig {
     pub db: PathBuf,
-    /// Where parking runs keep their files, one directory a thread. In the
-    /// environment's filesystem, and outside any `cwd`.
-    pub state_root: String,
     pub environment: Arc<dyn Environment>,
     pub harnesses: Vec<Arc<dyn Harness>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ThreadOptions {
-    /// Shut the process down on a pending request, where the harness can.
+    /// Stop the process when the agent asks for a decision, where the harness can,
+    /// rather than holding it open until the answer comes.
     pub park: bool,
 }
 
@@ -230,13 +241,14 @@ struct ThreadRow {
     last_turn: u64,
     started: bool,
     parked: Option<ParkedRun>,
+    /// What the next prompt has to carry: a stopped turn's answers.
+    note: Option<String>,
 }
 
 struct Inner {
     store: Arc<Store>,
     env: Arc<dyn Environment>,
     harnesses: HashMap<String, Arc<dyn Harness>>,
-    state_root: String,
     live: Mutex<HashMap<ThreadId, Arc<dyn Run>>>,
     /// One at a time per thread, for whatever starts or feeds a process.
     gates: Mutex<HashMap<ThreadId, Arc<tokio::sync::Mutex<()>>>>,
@@ -257,31 +269,6 @@ fn cancelled(reason: CancelReason) -> InputState {
         reason,
         cancelled_at_ms: now_ms(),
     }
-}
-
-/// The tool and input a request asks about, from whichever frame it came in.
-fn call_of(request: &InputRequest, tool_use_id: Option<&ToolUseId>) -> Option<ParkedCall> {
-    let (tool, input) = match &request.kind {
-        InputKind::ToolApproval { tool, input, .. } => (tool.clone(), input.clone()),
-        InputKind::Question { .. } => {
-            let raw = &request.raw;
-            let input = if raw["input"].is_null() {
-                raw["request"]["input"].clone()
-            } else {
-                raw["input"].clone()
-            };
-            (ToolName::new("AskUserQuestion"), input)
-        }
-        InputKind::Other { .. } => return None,
-    };
-    Some(ParkedCall {
-        request: request.id.clone(),
-        tool_use_id: tool_use_id?.clone(),
-        tool,
-        input,
-        kind: request.kind.clone(),
-        agent: request.agent.clone(),
-    })
 }
 
 fn tool_use_of(kind: &InputKind) -> Option<ToolUseId> {
@@ -369,6 +356,14 @@ impl Tx<'_> {
         Ok(())
     }
 
+    fn set_note(&self, thread: &ThreadId, note: Option<&str>) -> Result<(), StoreError> {
+        self.sql.execute(
+            "UPDATE threads SET note = ? WHERE id = ?",
+            params![note, thread.as_str()],
+        )?;
+        Ok(())
+    }
+
     fn set_parked(&self, thread: &ThreadId, parked: Option<&ParkedRun>) -> Result<(), StoreError> {
         let text = parked.map(serde_json::to_string).transpose()?;
         self.sql.execute(
@@ -415,6 +410,9 @@ impl Tx<'_> {
                             Delivery::Pending.as_str(),
                         ],
                     )?;
+                }
+                if parked.is_some() {
+                    self.set_parked(thread, parked)?;
                 }
             }
             AgentEventKind::InputResolved {
@@ -533,7 +531,7 @@ impl Inner {
     fn thread(&self, id: &ThreadId) -> Result<ThreadRow, RuntimeError> {
         let row = self.store.with(|c| {
             Ok(c.query_row(
-                "SELECT harness, spec, session, status, last_turn, started, parked
+                "SELECT harness, spec, session, status, last_turn, started, parked, note
                  FROM threads WHERE id = ?",
                 [id.as_str()],
                 |r| {
@@ -545,12 +543,13 @@ impl Inner {
                         r.get::<_, i64>(4)?,
                         r.get::<_, i64>(5)?,
                         r.get::<_, Option<String>>(6)?,
+                        r.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
             .optional()?)
         })?;
-        let (harness, spec, session, status, last_turn, started, parked) =
+        let (harness, spec, session, status, last_turn, started, parked, note) =
             row.ok_or_else(|| RuntimeError::NoThread(id.clone()))?;
         Ok(ThreadRow {
             harness,
@@ -563,6 +562,7 @@ impl Inner {
                 .map(|p| serde_json::from_str(&p))
                 .transpose()
                 .map_err(store_err)?,
+            note,
         })
     }
 
@@ -583,25 +583,37 @@ impl Inner {
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })?;
-        let unknown: BTreeSet<&str> = rows
-            .iter()
-            .filter(|r| Delivery::parse(&r.2) == Delivery::OutcomeUnknown)
-            .filter_map(|r| r.3.as_deref())
-            .collect();
-        rows.iter()
+        let parsed = rows
+            .into_iter()
             .map(|(run, request, delivery, tool)| {
-                let delivery = Delivery::parse(delivery);
-                Ok(InputRecord {
-                    thread: thread.clone(),
-                    run: RunId::new(run),
-                    request: serde_json::from_str(request)?,
-                    delivery,
-                    tool_use_id: tool.as_deref().map(ToolUseId::new),
-                    after_unknown_outcome: delivery != Delivery::OutcomeUnknown
-                        && tool.as_deref().is_some_and(|t| unknown.contains(t)),
-                })
+                let request: InputRequest = serde_json::from_str(&request)?;
+                Ok((run, request, Delivery::parse(&delivery), tool))
             })
-            .collect()
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        // A retry has a new id, so it's the same call if it's the same input.
+        let unknown: Vec<ParkedCall> = parsed
+            .iter()
+            .filter(|r| r.2 == Delivery::OutcomeUnknown)
+            .filter_map(|r| ParkedCall::of(&r.1))
+            .collect();
+        let same = |request: &InputRequest| {
+            ParkedCall::of(request).is_some_and(|c| {
+                unknown
+                    .iter()
+                    .any(|u| u.tool == c.tool && u.input == c.input)
+            })
+        };
+        Ok(parsed
+            .iter()
+            .map(|(run, request, delivery, tool)| InputRecord {
+                thread: thread.clone(),
+                run: RunId::new(run),
+                request: request.clone(),
+                delivery: *delivery,
+                tool_use_id: tool.as_deref().map(ToolUseId::new),
+                after_unknown_outcome: *delivery != Delivery::OutcomeUnknown && same(request),
+            })
+            .collect())
     }
 
     fn undecided(&self, thread: &ThreadId) -> Result<Vec<InputRequestId>, StoreError> {
@@ -626,7 +638,7 @@ impl Inner {
                 let InputState::Answered { answer, .. } = &r.request.state else {
                     return None;
                 };
-                let call = call_of(&r.request, r.tool_use_id.as_ref())?;
+                let call = ParkedCall::of(&r.request)?;
                 let answer = answer.clone();
                 Some((r.request.id.clone(), ParkAnswer { call, answer }))
             })
@@ -697,20 +709,41 @@ impl Inner {
         run: &Arc<dyn Run>,
         batch: Vec<AgentEvent>,
     ) -> Result<(), RuntimeError> {
+        let asked = batch
+            .iter()
+            .any(|e| matches!(e.kind, AgentEventKind::InputRequested { .. }));
         let mut requests = HashMap::new();
-        if let Some(q) = run.inputs() {
+        let mut retries = Vec::new();
+        let mut park_now = false;
+        if let (true, Some(q)) = (asked, run.inputs()) {
+            let parks = self.thread(thread)?.spec.park;
+            let mut pool = self.retry_pool(thread)?;
             for e in &batch {
-                if let AgentEventKind::InputRequested { id } = &e.kind {
-                    if let Ok(r) = q.get(id).await {
-                        requests.insert(id.clone(), r);
-                    }
+                let AgentEventKind::InputRequested { id } = &e.kind else {
+                    continue;
+                };
+                let Ok(mut r) = q.get(id).await else {
+                    continue;
+                };
+                if let Some(taken) = take_retry(&mut pool, &r) {
+                    retries.push((r.clone(), taken));
+                } else if parks && ParkedCall::of(&r).is_some() {
+                    // In the row before anyone can see it, so an answer that beats
+                    // the kill waits for the resume.
+                    r.route = InputRoute::Parked;
+                    park_now = true;
                 }
+                requests.insert(id.clone(), r);
             }
         }
         let parked_now = batch
             .iter()
             .any(|e| matches!(e.kind, AgentEventKind::TurnParked { .. }));
-        let parked = if parked_now { run.parked() } else { None };
+        let parked = if parked_now || asked {
+            run.parked()
+        } else {
+            None
+        };
         let id = run.info().run;
         self.store.tx(|tx| {
             for e in &batch {
@@ -719,11 +752,11 @@ impl Inner {
             }
             Ok(())
         })?;
-        // Retries: a live re-request may already have its answer.
-        for r in requests.values() {
-            if r.route == InputRoute::Live {
-                self.take_retry_live(thread, r).await?;
-            }
+        for (r, taken) in retries {
+            self.answer_retry(thread, &r, taken)?;
+        }
+        if park_now {
+            run.park().await?;
         }
         let ended = batch.iter().find_map(|e| match &e.kind {
             AgentEventKind::RunEnded { reason, .. } => Some(*reason),
@@ -744,64 +777,37 @@ impl Inner {
         Ok(())
     }
 
-    async fn take_retry_live(
+    /// Answers a retry from the answer it matched. That answer is spent first, so it
+    /// covers one call. If `r` is a parked call's retry, it takes that call's place.
+    fn answer_retry(
         self: &Arc<Self>,
         thread: &ThreadId,
         r: &InputRequest,
+        taken: Taken,
     ) -> Result<(), RuntimeError> {
-        let tool_use = tool_use_of(&r.kind);
-        let Some(call) = call_of(r, tool_use.as_ref()) else {
-            return Ok(());
-        };
-        let pool = self.retry_pool(thread)?;
-        let prior: Vec<ParkAnswer> = pool.iter().map(|(_, a)| a.clone()).collect();
-        let Some(answer) = retry_answer(&prior, &call.tool, &call.input) else {
-            return Ok(());
-        };
-        self.use_up(&pool, &call)?;
+        let row = self.thread(thread)?;
+        self.store.tx(|tx| {
+            tx.set_input(&taken.prior, None, Delivery::Superseded)?;
+            if let (Some(mut p), Some(call)) = (row.parked, ParkedCall::of(r)) {
+                for c in p.calls.iter_mut().filter(|c| c.request == taken.prior) {
+                    *c = call.clone();
+                }
+                tx.set_parked(thread, Some(&p))?;
+            }
+            Ok(())
+        })?;
         let inner = self.clone();
         let id = r.id.clone();
         tokio::spawn(async move {
-            if let Err(e) = inner.answer(&id, answer).await {
+            if let Err(e) = inner.answer(&id, taken.answer).await {
                 eprintln!("runtime: retry of {id}: {e}");
             }
         });
         Ok(())
     }
 
-    /// Spends the pool entry that matched `call`, so an answer applies once.
-    fn use_up(
-        &self,
-        pool: &[(InputRequestId, ParkAnswer)],
-        call: &ParkedCall,
-    ) -> Result<(), StoreError> {
-        let used = pool
-            .iter()
-            .find(|(_, a)| a.call.tool == call.tool && *a.approved_input() == call.input);
-        if let Some((id, _)) = used {
-            self.store
-                .tx(|tx| tx.set_input(id, None, Delivery::Superseded))?;
-        }
-        Ok(())
-    }
-
-    /// After a park: a call the agent re-issued may match an answer it already has.
+    /// After a park: an answer may have come while the process was going.
     async fn after_park(self: &Arc<Self>, thread: &ThreadId) -> Result<(), RuntimeError> {
-        let pool = self.retry_pool(thread)?;
-        let prior: Vec<ParkAnswer> = pool.iter().map(|(_, a)| a.clone()).collect();
-        for r in self.records(thread)? {
-            if r.delivery != Delivery::Pending || r.after_unknown_outcome {
-                continue;
-            }
-            let Some(call) = call_of(&r.request, r.tool_use_id.as_ref()) else {
-                continue;
-            };
-            if let Some(answer) = retry_answer(&prior, &call.tool, &call.input) {
-                self.use_up(&pool, &call)?;
-                self.record_answer(&r.request.id, answer)
-                    .map_err(|e| RuntimeError::Start(format!("retry of {}: {e}", r.request.id)))?;
-            }
-        }
         self.try_apply(thread).await
     }
 
@@ -947,11 +953,28 @@ impl Inner {
             InputState::Answered { answer, .. } => Some(answer.clone()),
             _ => None,
         };
+        let park = harness
+            .park()
+            .ok_or_else(|| RuntimeError::Start("this harness can't park".into()))?;
+        let text = |r: &InputRecord| {
+            let call = ParkedCall::of(&r.request)?;
+            Some(park.message(&call, &answer_of(r)?, false).text)
+        };
+        let stops = |r: &InputRecord| {
+            matches!(
+                answer_of(r),
+                Some(InputAnswer::Deny {
+                    stop_turn: true,
+                    ..
+                })
+            )
+        };
+        if ready.iter().any(stops) {
+            let said: Vec<String> = ready.iter().filter_map(text).collect();
+            return self.stop_turn(thread, &row, &ready, &said.join("\n"));
+        }
         mark(Delivery::Delivered)?;
         let started = async {
-            let park = harness
-                .park()
-                .ok_or_else(|| RuntimeError::Start("this harness can't park".into()))?;
             if let Some(parked) = row
                 .parked
                 .as_ref()
@@ -960,26 +983,16 @@ impl Inner {
                 let answers: Vec<ParkAnswer> = ready
                     .iter()
                     .filter_map(|r| {
-                        let call = parked
-                            .calls
-                            .iter()
-                            .find(|c| Some(&c.tool_use_id) == r.tool_use_id.as_ref())?;
                         Some(ParkAnswer {
-                            call: call.clone(),
+                            call: ParkedCall::of(&r.request)?,
                             answer: answer_of(r)?,
                         })
                     })
                     .collect();
                 return self.unpark(&harness, thread, parked, &answers).await;
             }
-            let text: Vec<String> = ready
-                .iter()
-                .filter_map(|r| {
-                    let call = call_of(&r.request, r.tool_use_id.as_ref())?;
-                    Some(park.message(&call, &answer_of(r)?, false).text)
-                })
-                .collect();
-            self.launch(thread, &row, UserInput::text(text.join("\n")))
+            let said: Vec<String> = ready.iter().filter_map(text).collect();
+            self.launch(thread, &row, UserInput::text(said.join("\n")))
                 .await
                 .map(|_| ())
         }
@@ -988,6 +1001,41 @@ impl Inner {
             mark(Delivery::Answered)?;
         }
         started
+    }
+
+    /// A deny that also stops the turn, on a thread with no process: nothing needs
+    /// starting to end it. The agent hears why with the next prompt.
+    fn stop_turn(
+        &self,
+        thread: &ThreadId,
+        row: &ThreadRow,
+        ready: &[InputRecord],
+        note: &str,
+    ) -> Result<(), RuntimeError> {
+        let run = self.store.latest_run(thread)?;
+        let run = run.ok_or_else(|| RuntimeError::NotRunning(thread.clone()))?;
+        self.store.tx(|tx| {
+            for r in ready {
+                tx.set_input(&r.request.id, None, Delivery::Superseded)?;
+            }
+            tx.set_note(thread, Some(note))?;
+            if let Some(parked) = &row.parked {
+                let terminal = TurnTerminal {
+                    turn: parked.turn,
+                    status: TurnStatus::Interrupted,
+                    thread_disposition: ThreadDisposition::Reusable,
+                    stopped_by: Some(StopCause::DenyAndStop),
+                };
+                tx.run_event(
+                    thread,
+                    &run,
+                    Attribution::turn(parked.turn),
+                    AgentEventKind::TurnTerminal(terminal),
+                )?;
+            }
+            tx.set_status(thread, ThreadStatus::Idle)
+        })?;
+        Ok(())
     }
 
     async fn unpark(
@@ -1004,7 +1052,9 @@ impl Inner {
         let u = park.plan_unpark(parked, answers).map_err(|e| fail(&e))?;
         let process = self.env.spawn(u.plan).await.map_err(|e| fail(&e))?;
         let run = harness.drive(u.spec, process).await.map_err(|e| fail(&e))?;
-        self.register(thread, run).await
+        self.register(thread, run.clone()).await?;
+        run.send(u.input).await?;
+        Ok(())
     }
 
     /// Starts a process for `prompt`: the thread's first, or a resume from what was
@@ -1230,6 +1280,23 @@ impl Inner {
     }
 }
 
+/// An answer a retry took over.
+struct Taken {
+    prior: InputRequestId,
+    answer: InputAnswer,
+}
+
+/// The answer in `pool` that `r` retries, by exact match, taken out of the pool.
+fn take_retry(pool: &mut Vec<(InputRequestId, ParkAnswer)>, r: &InputRequest) -> Option<Taken> {
+    let call = ParkedCall::of(r)?;
+    let at = pool.iter().position(|(_, a)| {
+        retry_answer(std::slice::from_ref(a), &call.tool, &call.input).is_some()
+    })?;
+    let (prior, a) = pool.remove(at);
+    let answer = retry_answer(&[a], &call.tool, &call.input)?;
+    Some(Taken { prior, answer })
+}
+
 struct ThreadInputs {
     inner: Arc<Inner>,
     thread: ThreadId,
@@ -1298,7 +1365,6 @@ impl Supervisor {
                 .into_iter()
                 .map(|h| (h.name().to_string(), h))
                 .collect(),
-            state_root: config.state_root,
             live: Mutex::default(),
             gates: Mutex::default(),
         });
@@ -1331,14 +1397,10 @@ impl Supervisor {
                 id: SessionId::new(uuid::Uuid::new_v4().to_string()),
             };
         }
-        if options.park {
-            if h.park().is_none() {
-                return Err(RuntimeError::Start(format!("{harness} can't park")));
-            }
-            spec.park = Some(ParkSpec {
-                state_dir: format!("{}/{id}", self.inner.state_root),
-            });
+        if options.park && h.park().is_none() {
+            return Err(RuntimeError::Start(format!("{harness} can't park")));
         }
+        spec.park = options.park;
         let session = match &spec.session {
             SessionMode::Assign { id } | SessionMode::Resume { id } => Some(id.to_string()),
             SessionMode::Fresh => None,
@@ -1388,13 +1450,20 @@ impl Supervisor {
         }
         // A prompt supersedes a parked call whose outcome is unknown: the agent
         // drops it (AGENTS-33 `h_prompt_undecided`).
+        let input = match &row.note {
+            Some(note) => UserInput::text(format!("{note}\n\n{}", input.text)),
+            None => input,
+        };
         self.inner.store.tx(|tx| tx.set_parked(thread, None))?;
-        self.inner.launch(thread, &row, input).await
+        let turn = self.inner.launch(thread, &row, input).await?;
+        self.inner.store.tx(|tx| tx.set_note(thread, None))?;
+        Ok(turn)
     }
 
-    /// Resumes a parked thread with no answer, after an unknown outcome. The same
-    /// call comes back as a new pending request with `after_unknown_outcome` set, so
-    /// a person decides with that in view. Nothing is re-applied.
+    /// Resumes a parked thread with no answer, after an unknown outcome. The agent is
+    /// asked to make the call again, and it comes back as a new pending request with
+    /// `after_unknown_outcome` set, so a person decides with that in view. Nothing is
+    /// re-applied.
     pub async fn continue_thread(&self, thread: &ThreadId) -> Result<(), RuntimeError> {
         let gate = self.inner.gate(thread);
         let _held = gate.lock().await;
@@ -1488,6 +1557,43 @@ impl Supervisor {
 
     pub fn records(&self, thread: &ThreadId) -> Result<Vec<InputRecord>, RuntimeError> {
         Ok(self.inner.records(thread)?)
+    }
+
+    /// Every undecided request on every thread, oldest first. Durable, so a restart
+    /// changes nothing, and nothing here expires. Each comes from the request's row,
+    /// so what's listed is what can be answered.
+    pub fn pending(&self) -> Result<Vec<InputRecord>, RuntimeError> {
+        let rows = self.inner.store.with(|c| {
+            let mut q =
+                c.prepare("SELECT id, thread FROM inputs WHERE delivery = ? ORDER BY rowid")?;
+            let rows = q
+                .query_map([Delivery::Pending.as_str()], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        let mut held: HashMap<String, Vec<InputRecord>> = HashMap::new();
+        let mut out = Vec::with_capacity(rows.len());
+        for (id, thread) in rows {
+            if !held.contains_key(&thread) {
+                let records = self.inner.records(&ThreadId::new(&thread))?;
+                held.insert(thread.clone(), records);
+            }
+            let found = held[&thread].iter().find(|r| r.request.id.as_str() == id);
+            out.extend(found.cloned());
+        }
+        Ok(out)
+    }
+
+    /// Answers a request, whichever thread it's on. Once a parked thread has every
+    /// answer it's waiting on, this starts it.
+    pub async fn answer(
+        &self,
+        id: &InputRequestId,
+        answer: InputAnswer,
+    ) -> Result<InputRequest, InputError> {
+        self.inner.answer(id, answer).await
     }
 
     /// The projection of one thread.

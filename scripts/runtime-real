@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""AGENTS-9's crash checks against the real CLI, through a service that gets killed.
+"""AGENTS-9's crash checks and AGENTS-37's parks against the real CLI, through a
+service that gets killed.
 
 Spends tokens on the logged-in account: haiku, short prompts, throwaway directories.
 Set AGENTS_REAL=spend-tokens. Usage: runtime-real OUT_DIR [case...]
@@ -11,7 +12,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SERVICE = ROOT / "target/debug/examples/agents_service"
 SLOW = "printf 'start\\n' >> effects.log; sleep 25; printf 'end\\n' >> effects.log\n"
-EFFECT = "printf 'ran\\n' >> effects.log\n"
+EFFECT = "printf 'ran %s %s\\n' \"$1\" \"$(pwd)\" >> effects.log\n"
 
 
 def prompt_for(cmd):
@@ -23,9 +24,11 @@ class Service:
     def __init__(self, case, n):
         self.case = case
         out = case.out / f"svc{n}"
+        argv = [SERVICE, "--db", case.db, "--record", out, "--plans", case.out / "plans.jsonl"]
+        if case.permissions:
+            argv += ["--permissions", json.dumps(case.permissions)]
         self.p = subprocess.Popen(
-            [SERVICE, "--db", case.db, "--state", case.state, "--record", out,
-             "--plans", case.out / "plans.jsonl"],
+            argv,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, env={k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"})
         self.ready = json.loads(self.p.stdout.readline())
@@ -54,6 +57,11 @@ class Service:
             time.sleep(0.2)
         raise TimeoutError(what)
 
+    def gone(self, t):
+        """Nothing left of this thread's session in the process table."""
+        session = self.status(t)["thread"]["session"]
+        return subprocess.run(["pgrep", "-f", session], capture_output=True).returncode != 0
+
     def wait_settled(self, t, secs=120):
         def done():
             s = self.status(t)
@@ -73,7 +81,7 @@ class Case:
         self.cwd = self.tmp / "cwd"
         self.cwd.mkdir()
         self.db = self.tmp / "runtime.db"
-        self.state = self.tmp / "state"
+        self.permissions = None
         self.claims = {}
         self.facts = {}
         self.n = 0
@@ -94,31 +102,321 @@ class Case:
         return f.read_text().split("\n")[:-1] if f.exists() else []
 
 
+def parked(c, a, t, cmd):
+    a.op("prompt", thread=t, text=prompt_for(cmd))
+    s = a.wait_settled(t)
+    c.claim("it parked", s["thread"]["status"] == "parked" and not s["live"])
+    c.claim("its process has gone", a.gone(t))
+    c.claim("nothing ran", c.effects() == [])
+    return s
+
+
+
+
 def park_across_restart(c):
     c.write("effect.sh", EFFECT)
     a = c.service()
     t = a.op("create", cwd=str(c.cwd), park=True)["ok"]["thread"]
-    a.op("prompt", thread=t, text=prompt_for("sh effect.sh"))
-    s = a.wait_settled(t)
-    c.claim("it parked", s["thread"]["status"] == "parked" and not s["live"])
-    c.claim("nothing ran", c.effects() == [])
+    parked(c, a, t, "sh effect.sh")
     a.kill()
     b = c.service()
     s = b.status(t)
     c.claim("the request survived the restart", len(s["thread"]["pending"]) == 1)
     c.claim("a prompt is refused while it's undecided",
             "undecided" in b.op("prompt", thread=t, text="hello").get("error", ""))
-    b.op("answer", thread=t, id=s["thread"]["pending"][0], allow=True)
+    b.op("answer", id=s["thread"]["pending"][0], allow=True)
     b.wait(lambda: "turn.terminal" in b.kinds())
     s = b.status(t)
+    c.facts["inputs"] = s["inputs"]
     c.claim("a new service's answer resumed it", s["thread"]["runs"] == 2)
     c.claim("the tool ran once", len(c.effects()) == 1)
-    c.claim("the answer is applied", s["inputs"][0]["delivery"] == "applied")
+    c.claim("the retry took the answer", s["inputs"][-1]["delivery"] == "applied")
+    c.claim("nobody was asked again", len(s["inputs"]) == 2)
     seqs = [e["seq"] for e in b.op("events", since=0)["ok"]["events"]]
     c.claim("the global sequence has no gaps or repeats",
             seqs == list(range(seqs[0], seqs[0] + len(seqs))))
     kinds = b.kinds()
     c.claim("the turn ended once, across both runs", kinds.count("turn.terminal") == 1)
+    b.kill()
+
+
+def park_wildcard(c):
+    """The bug: this call has a wildcard rule, and it parked."""
+    c.write("effect.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True, preapproved=["Bash(sh:*)"])["ok"]["thread"]
+    a.op("prompt", thread=t, text=prompt_for("sh effect.sh wild"))
+    a.wait(lambda: "turn.terminal" in a.kinds())
+    s = a.status(t)
+    c.claim("the tool ran", len(c.effects()) == 1)
+    c.claim("it never parked", "turn.parked" not in a.kinds() and s["thread"]["runs"] == 1)
+    c.claim("nothing was asked", s["inputs"] == [])
+    a.kill()
+
+
+def refused_by_rule(c):
+    c.write("forbidden.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True,
+             denied=[] if c.permissions else ["Bash(sh forbidden.sh)"])["ok"]["thread"]
+    a.op("prompt", thread=t, text=prompt_for("sh forbidden.sh"))
+    a.wait(lambda: "turn.terminal" in a.kinds())
+    s = a.status(t)
+    c.claim("the tool didn't run", c.effects() == [])
+    c.claim("it never parked", "turn.parked" not in a.kinds() and s["thread"]["runs"] == 1)
+    c.claim("it never reached the queue",
+            s["inputs"] == [] and a.op("pending")["ok"]["pending"] == [])
+    a.kill()
+
+
+def park_deny_flag(c):
+    refused_by_rule(c)
+
+
+def park_deny_settings(c):
+    c.permissions = {"deny": ["Bash(sh forbidden.sh)"]}
+    refused_by_rule(c)
+
+
+def park_ask(c):
+    c.permissions = {"allow": ["Bash(sh:*)"], "ask": ["Bash(sh ask.sh)"]}
+    c.write("ask.sh", EFFECT)
+    c.write("free.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True)["ok"]["thread"]
+    a.op("prompt", thread=t, text=prompt_for("sh free.sh"))
+    a.wait(lambda: "turn.terminal" in a.kinds())
+    s = a.status(t)
+    c.claim("the allow rule alone runs it", len(c.effects()) == 1 and s["inputs"] == [])
+    a.op("prompt", thread=t, text=prompt_for("sh ask.sh"))
+    s = a.wait(lambda: (x := a.status(t))["thread"]["status"] == "parked" and x)
+    c.claim("the ask rule parks it, over the allow rule", len(s["thread"]["pending"]) == 1)
+    c.claim("its process has gone", a.gone(t) and not s["live"])
+    c.claim("it didn't run", len(c.effects()) == 1)
+    a.op("answer", id=s["thread"]["pending"][0], allow=True)
+    a.wait(lambda: a.kinds().count("turn.terminal") >= 2)
+    c.claim("the answer ran it", len(c.effects()) == 2)
+    a.kill()
+
+
+def project_rules(c):
+    """`--setting-sources ""`: a rule in the project's own settings doesn't apply."""
+    c.write("effect.sh", EFFECT)
+    (c.cwd / ".claude").mkdir()
+    (c.cwd / ".claude/settings.json").write_text(
+        json.dumps({"permissions": {"allow": ["Bash(sh:*)"]}}))
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True)["ok"]["thread"]
+    parked(c, a, t, "sh effect.sh")
+    a.kill()
+
+
+def park_allow(c):
+    c.write("effect.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True)["ok"]["thread"]
+    s = parked(c, a, t, "sh effect.sh approved")
+    a.op("answer", id=s["thread"]["pending"][0], allow=True)
+    a.wait(lambda: "turn.terminal" in a.kinds())
+    c.facts["effects"] = c.effects()
+    c.claim("it ran once, in the parked cwd",
+            c.effects() == [f"ran approved {os.path.realpath(c.cwd)}"]
+            or (len(c.effects()) == 1 and c.effects()[0].endswith("/cwd")))
+    s = a.status(t)
+    c.facts["inputs"] = [{k: i[k] for k in ("delivery", "route")} for i in s["inputs"]]
+    c.claim("one person's answer was enough", len(s["inputs"]) == 2)
+    a.kill()
+
+
+def park_edited(c):
+    c.write("effect.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True)["ok"]["thread"]
+    s = parked(c, a, t, "sh effect.sh original")
+    i = s["inputs"][0]["kind"]["input"]
+    a.op("answer", id=s["thread"]["pending"][0], allow=True,
+         edited={**i, "command": "sh effect.sh edited"})
+    a.wait(lambda: "turn.terminal" in a.kinds() or a.pending(t))
+    s = a.status(t)
+    c.facts["effects"] = c.effects()
+    c.claim("the edit is what ran", len(c.effects()) == 1 and " edited " in c.effects()[0])
+    c.claim("the original never ran", not any("original" in e for e in c.effects()))
+    a.kill()
+
+
+def park_deny_message(c):
+    c.write("effect.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True)["ok"]["thread"]
+    s = parked(c, a, t, "sh effect.sh refused")
+    a.op("answer", id=s["thread"]["pending"][0], allow=False, message="reason-marker-4417")
+    a.wait(lambda: "turn.terminal" in a.kinds())
+    c.claim("the tool didn't run", c.effects() == [])
+    text = " ".join(e["event"].get("text", "") for e in a.op("events", since=0)["ok"]["events"]
+                    if e["event"]["kind"] == "message")
+    c.facts["model_said"] = text
+    c.claim("the model heard the reason", "reason-marker-4417" in text or "refused" in text)
+    a.kill()
+
+
+def park_deny_stop(c):
+    c.write("effect.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True)["ok"]["thread"]
+    s = parked(c, a, t, "sh effect.sh refused")
+    a.op("answer", id=s["thread"]["pending"][0], allow=False, message="reason-marker-8821",
+         stop_turn=True)
+    a.wait(lambda: "turn.terminal" in a.kinds())
+    s = a.status(t)
+    events = a.op("events", since=0)["ok"]["events"]
+    last = [e["event"] for e in events if e["event"]["kind"] == "turn.terminal"][-1]
+    c.facts["terminal"] = last
+    c.claim("the turn stopped, and says why", last.get("stopped_by") == "deny_and_stop")
+    c.claim("no process was started", s["thread"]["runs"] == 1 and not s["live"])
+    c.claim("the thread takes prompts", s["thread"]["status"] == "idle")
+    a.op("prompt", thread=t, text="Why was your last call stopped? Quote the reason exactly.")
+    a.wait(lambda: a.kinds().count("turn.terminal") >= 2)
+    text = " ".join(e["event"].get("text", "") for e in a.op("events", since=0)["ok"]["events"]
+                    if e["event"]["kind"] == "message")
+    c.claim("the next prompt carried the reason", "reason-marker-8821" in text)
+    c.claim("the tool didn't run", c.effects() == [])
+    a.kill()
+
+
+def park_question(c):
+    c.write("effect.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True,
+             tools=["Bash", "AskUserQuestion"])["ok"]["thread"]
+    a.op("prompt", thread=t, text=(
+        "Use the AskUserQuestion tool once. Question: 'Which word should I use?' Options: "
+        "marble2122 and gannet9745. After the answer, run this Bash command with the chosen "
+        "word in place of WORD, then reply with only the word done: sh effect.sh WORD"))
+    s = a.wait_settled(t)
+    q = s["inputs"][0]["kind"]
+    c.claim("a question parked", q["kind"] == "question" and s["thread"]["status"] == "parked")
+    c.claim("its process has gone", a.gone(t))
+    text = q["questions"][0]["question"]
+    a.op("answer", id=s["thread"]["pending"][0], answers={text: "gannet9745"})
+    s = a.wait(lambda: a.pending(t) or "turn.terminal" in a.kinds())
+    if not isinstance(s, bool):
+        p = a.pending(t)
+        c.claim("the Bash call it led to parked too", p and "gannet9745" in json.dumps(p[0]["kind"]))
+        a.op("answer", id=p[0]["id"], allow=True)
+    a.wait(lambda: "turn.terminal" in a.kinds())
+    c.facts["effects"] = c.effects()
+    c.claim("the answer reached the tool", len(c.effects()) == 1 and "gannet9745" in c.effects()[0])
+    a.kill()
+
+
+def park_batch(c):
+    c.write("effect.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True)["ok"]["thread"]
+    a.op("prompt", thread=t, text=(
+        "Make these two Bash calls in parallel, as two tool uses in one message: "
+        "sh effect.sh one AND sh effect.sh two. Then reply with only the word done."))
+    answered, parks = [], 0
+    while True:
+        a.wait(lambda: a.pending(t) or "turn.terminal" in a.kinds())
+        p = a.pending(t)
+        if not p:
+            break
+        parks += 1
+        assert parks < 6, "parked too often"
+        a.wait(lambda: not a.status(t)["live"])
+        c.claim(f"park {parks} left no process", a.gone(t))
+        for r in p:
+            answered.append(json.loads(json.dumps(r["kind"]["input"]))["command"])
+            a.op("answer", id=r["id"], allow=True)
+        a.wait(lambda: a.pending(t) != p)
+    s = a.status(t)
+    c.facts.update(parks=parks, answered=answered, effects=c.effects(),
+                   inputs=[i["delivery"] for i in s["inputs"]])
+    done = sorted(e.split()[1] for e in c.effects())
+    c.claim("each call ran once", done == ["one", "two"])
+    c.claim("a person was asked once a call", parks == len(answered) and len(answered) <= 2)
+    c.claim("the turn ended once", a.kinds().count("turn.terminal") == 1)
+    a.kill()
+
+
+def park_subagent(c):
+    """A subagent's request kills the process, and the subagent with it."""
+    c.write("effect.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=True, tools=["Agent", "Bash"])["ok"]["thread"]
+    a.op("prompt", thread=t, text=(
+        "Use your Agent tool once with run_in_background false, subagent_type general-purpose, "
+        "description 'marker'. Prompt it: 'Run this exact Bash command, then reply done: "
+        "sh effect.sh inner'. Then reply with only the word finished."))
+    s = a.wait_settled(t, 180)
+    r = s["inputs"][0] if s["inputs"] else {}
+    c.claim("a subagent's request parks the run", s["thread"]["status"] == "parked")
+    c.claim("it's the subagent's", r.get("agent") is not None)
+    c.claim("nothing is left running", a.gone(t))
+    kinds = a.kinds()
+    c.facts["subagent_end_seen_before_resume"] = "subagent.ended" in kinds
+    asks = 0
+    while True:
+        p = a.pending(t)
+        if not p:
+            break
+        asks += 1
+        if asks > 4:
+            break
+        a.op("answer", id=p[0]["id"], allow=True)
+        a.wait(lambda: a.pending(t) != p or "turn.terminal" in a.kinds(), 180)
+        a.wait(lambda: a.pending(t) or "turn.terminal" in a.kinds(), 180)
+    s = a.status(t)
+    c.facts.update(asks=asks, effects=c.effects(),
+                   inputs=[i["delivery"] for i in s["inputs"]])
+    kinds = a.kinds()
+    c.facts["subagents_started"] = kinds.count("subagent.started")
+    c.claim("the turn finished", "turn.terminal" in kinds)
+    c.claim("the tool ran once", len(c.effects()) == 1)
+    a.kill()
+
+
+def live_without_park(c):
+    c.write("effect.sh", EFFECT)
+    a = c.service()
+    t = a.op("create", cwd=str(c.cwd), park=False)["ok"]["thread"]
+    a.op("prompt", thread=t, text=prompt_for("sh effect.sh live"))
+    a.wait(lambda: a.pending(t), 90)
+    s = a.status(t)
+    c.claim("the process stays", s["live"] and not a.gone(t))
+    c.claim("the route is live", s["inputs"][0]["route"] == "live")
+    a.op("answer", id=s["thread"]["pending"][0], allow=True)
+    a.wait(lambda: "turn.terminal" in a.kinds())
+    s = a.status(t)
+    c.claim("it ran in the same process", len(c.effects()) == 1 and s["thread"]["runs"] == 1)
+    a.kill()
+
+
+def queue_across_threads(c):
+    a = c.service()
+    ids = []
+    for word in ("first", "second"):
+        c.write(f"{word}.sh", f"printf '{word}\\n' >> effects.log\n")
+        t = a.op("create", cwd=str(c.cwd), park=True)["ok"]["thread"]
+        a.op("prompt", thread=t, text=prompt_for(f"sh {word}.sh"))
+        a.wait_settled(t)
+        ids.append(t)
+    a.kill()
+    time.sleep(30)  # A wait no timeout survives, at this scale.
+    b = c.service()
+    q = b.op("pending")["ok"]["pending"]
+    c.facts["waited_s"] = 30
+    c.claim("both are queued after a restart, oldest first",
+            [r["thread"] for r in q] == ids)
+    c.claim("they name their calls", "first" in json.dumps(q[0]["kind"]))
+    c.claim("nothing started by itself", not any(b.status(t)["live"] for t in ids))
+    b.op("answer", id=q[0]["id"], allow=True)
+    b.wait(lambda: "turn.terminal" in b.kinds())
+    c.claim("answering one started its thread", b.status(ids[0])["thread"]["runs"] == 2)
+    c.claim("and only that one", b.status(ids[1])["thread"]["runs"] == 1
+            and len(b.op("pending")["ok"]["pending"]) == 1)
+    c.claim("its tool ran", c.effects() == ["first"])
     b.kill()
 
 
@@ -131,16 +429,19 @@ def crash_mid_tool(c):
     first = s["thread"]["pending"][0]
     a.op("answer", thread=t, id=first, allow=True)
     a.wait(lambda: "start" in c.effects(), 60)
+    a.wait(lambda: any(i["delivery"] == "delivered" and i["id"] != first
+                       for i in a.status(t)["inputs"]), 10)
     a.kill()
     b = c.service()
     r = b.ready["recovery"]
     c.facts["recovery"] = r
-    c.claim("the answer's outcome is unknown", r["outcome_unknown"] == [first])
+    c.claim("the answer's outcome is unknown", len(r["outcome_unknown"]) == 1)
+    unknown = r["outcome_unknown"]
     c.claim("the orphaned process was killed", r["reaped"] == 1)
     s = b.status(t)
     c.claim("nothing started again on restart", s["thread"]["status"] == "parked" and not s["live"])
     time.sleep(1)
-    c.claim("the thread shows it", s["thread"]["outcome_unknown"] == [first])
+    c.claim("the thread shows it", s["thread"]["outcome_unknown"] == unknown)
     b.op("continue", thread=t)
     s = b.wait_settled(t)
     p = [i for i in s["inputs"] if i["delivery"] == "pending"]
@@ -148,7 +449,7 @@ def crash_mid_tool(c):
     c.claim("the call came back undecided", len(p) == 1)
     c.claim("marked as maybe already run", p and p[0]["after_unknown_outcome"])
     c.claim("not re-applied", c.effects().count("start") == 1)
-    b.op("answer", thread=t, id=p[0]["id"], allow=False, message="Do not run it again.")
+    b.op("answer", id=p[0]["id"], allow=False, message="Do not run it again.")
     b.wait(lambda: "turn.terminal" in b.kinds())
     c.claim("a person's no ended it", b.kinds().count("turn.terminal") == 1)
     c.claim("the tool started exactly once", c.effects().count("start") == 1)
@@ -204,7 +505,14 @@ def restart_mid_run(c):
 
 
 CASES = {"restart-parked": park_across_restart, "crash-mid-tool": crash_mid_tool,
-         "live-pending-killed": pending_live_killed, "restart-mid-run": restart_mid_run}
+         "live-pending-killed": pending_live_killed, "restart-mid-run": restart_mid_run,
+         "queue-across-threads": queue_across_threads, "park-wildcard": park_wildcard,
+         "park-deny-flag": park_deny_flag, "park-deny-settings": park_deny_settings,
+         "park-ask": park_ask, "project-rules-ignored": project_rules, "park-allow": park_allow,
+         "park-edited": park_edited, "park-deny-message": park_deny_message,
+         "park-deny-stop-turn": park_deny_stop, "park-question": park_question,
+         "park-batch": park_batch, "park-subagent": park_subagent,
+         "live-without-park": live_without_park}
 
 
 def main():
@@ -212,9 +520,11 @@ def main():
         sys.exit("set AGENTS_REAL=spend-tokens")
     root = Path(sys.argv[1])
     names = sys.argv[2:] or list(CASES)
-    report = {}
+    meta = root / "run.json"
+    report = json.loads(meta.read_text())["cases"] if meta.exists() else {}
     for name in names:
         print(name, flush=True)
+        shutil.rmtree(root / name, ignore_errors=True)
         c = Case(name, root)
         try:
             CASES[name](c)
@@ -223,7 +533,7 @@ def main():
         report[name] = {"claims": c.claims, "facts": c.facts}
         shutil.rmtree(c.tmp, ignore_errors=True)
     version = subprocess.run(["claude", "--version"], capture_output=True, text=True).stdout
-    (root / "run.json").write_text(json.dumps(
+    meta.write_text(json.dumps(
         {"cli_version": version.strip(), "model": "haiku", "cases": report}, indent=1))
 
 
