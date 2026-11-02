@@ -1,0 +1,66 @@
+{
+ "frames": 92,
+ "counts": {
+  "system/init": 2,
+  "system/status": 3,
+  "stream_event": 57,
+  "assistant": 9,
+  "system/background_tasks_changed": 4,
+  "system/task_started": 2,
+  "user": 3,
+  "rate_limit_event": 1,
+  "result/success": 2,
+  "system/task_progress": 2,
+  "control_request": 1,
+  "system/task_updated": 2,
+  "system/task_notification": 2,
+  "system/thinking_tokens": 2
+ },
+ "approvals": [
+  {
+   "at": 4.784,
+   "tool": "Bash",
+   "allow": true,
+   "tool_use_id": "toolu_01XYWsorDLJwS8bCc6DCDRAX",
+   "agent_id": "a616f301f37aafc2c",
+   "keys": [
+    "agent_id",
+    "blocked_path",
+    "description",
+    "display_name",
+    "input",
+    "permission_suggestions",
+    "subtype",
+    "tool_name",
+    "tool_use_id"
+   ],
+   "held": false
+  }
+ ],
+ "subagent_transcripts": [
+  {
+   "name": "agent-a616f301f37aafc2c.jsonl",
+   "bytes": 71988
+  },
+  {
+   "name": "agent-a616f301f37aafc2c.meta.json",
+   "bytes": 228
+  }
+ ],
+ "first_result": "success",
+ "first_result_at": 2.264,
+ "sleep_running_before_close": true,
+ "closed_at": 5.641,
+ "exit": {
+  "rc": 0,
+  "exit_seconds": 8.824,
+  "hung_killed": false
+ },
+ "sleep_alive_after_exit": false,
+ "sleep_alive_at_horizon": false,
+ "marker_written": false,
+ "results": [
+  "success",
+  "success"
+ ]
+}

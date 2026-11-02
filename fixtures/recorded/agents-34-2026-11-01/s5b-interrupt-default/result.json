@@ -1,0 +1,77 @@
+{
+ "frames": 72,
+ "counts": {
+  "system/init": 2,
+  "system/status": 3,
+  "stream_event": 39,
+  "assistant": 7,
+  "system/background_tasks_changed": 4,
+  "system/task_started": 2,
+  "user": 4,
+  "rate_limit_event": 1,
+  "result/success": 2,
+  "system/task_progress": 2,
+  "control_request": 1,
+  "system/task_updated": 2,
+  "system/task_notification": 2,
+  "control_response": 1
+ },
+ "approvals": [
+  {
+   "at": 4.439,
+   "tool": "Bash",
+   "allow": true,
+   "tool_use_id": "toolu_016Gm6S77PakX4pyysXMzout",
+   "agent_id": "a8d01dbb589f693f1",
+   "keys": [
+    "agent_id",
+    "blocked_path",
+    "description",
+    "display_name",
+    "input",
+    "permission_suggestions",
+    "subtype",
+    "tool_name",
+    "tool_use_id"
+   ],
+   "held": false
+  }
+ ],
+ "subagent_transcripts": [
+  {
+   "name": "agent-a8d01dbb589f693f1.jsonl",
+   "bytes": 71166
+  },
+  {
+   "name": "agent-a8d01dbb589f693f1.meta.json",
+   "bytes": 238
+  }
+ ],
+ "subagent_bash_seen": true,
+ "sleep_running_before": true,
+ "interrupt_at": 5.18,
+ "interrupt_id": "c6fe4284-7e16-4671-95f3-bb80eaa9cb9b",
+ "result_after_interrupt": null,
+ "result_at": 35.186,
+ "sleep_alive_7s_after": false,
+ "task_ends_after_interrupt": [
+  {
+   "task_id": "a8d01dbb589f693f1",
+   "status": "stopped",
+   "summary": "sleeper"
+  },
+  {
+   "task_id": "ba0oy4xgu",
+   "status": "stopped",
+   "summary": "Sleep 44 seconds then create marker file"
+  }
+ ],
+ "second_turn": "success",
+ "exit": {
+  "rc": 0,
+  "exit_seconds": 0.18,
+  "hung_killed": false
+ },
+ "sleep_alive_at_horizon": false,
+ "marker_written": false
+}

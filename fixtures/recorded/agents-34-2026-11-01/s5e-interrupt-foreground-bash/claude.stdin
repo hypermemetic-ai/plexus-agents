@@ -1,0 +1,4 @@
+{"type": "user", "session_id": "", "parent_tool_use_id": null, "message": {"role": "user", "content": [{"type": "text", "text": "Use your Agent tool once with run_in_background false, subagent_type general-purpose, description 'sleeper'. Prompt it: 'Run this exact Bash command in the foreground: python3 -c 'import time; time.sleep(47)' and then reply done.' Do not run Bash yourself."}]}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "473326e8-0108-4f6a-9a01-cfb375dd1c45", "response": {"behavior": "allow", "updatedInput": {"command": "python3 -c 'import time; time.sleep(47)'", "description": "Sleep for 47 seconds using Python"}}}}
+{"type": "control_request", "request_id": "8936c4ac-fd49-4202-8ee6-57d3b0072a43", "request": {"subtype": "interrupt"}}
+{"type": "user", "session_id": "", "parent_tool_use_id": null, "message": {"role": "user", "content": [{"type": "text", "text": "Reply with the single word: resumed"}]}}

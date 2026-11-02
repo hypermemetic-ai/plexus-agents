@@ -1,0 +1,101 @@
+{
+ "frames": 70,
+ "counts": {
+  "system/init": 2,
+  "system/status": 3,
+  "stream_event": 41,
+  "assistant": 5,
+  "system/background_tasks_changed": 2,
+  "system/task_started": 1,
+  "user": 5,
+  "rate_limit_event": 1,
+  "system/task_progress": 1,
+  "control_request": 2,
+  "system/task_updated": 1,
+  "system/task_notification": 1,
+  "control_response": 1,
+  "result/error_during_execution": 1,
+  "system/thinking_tokens": 2,
+  "result/success": 1
+ },
+ "approvals": [
+  {
+   "at": 3.168,
+   "tool": "Bash",
+   "allow": true,
+   "tool_use_id": "toolu_01MjwJZjWLai1psSLttQKKfr",
+   "agent_id": "afe2e0c17959d5c0e",
+   "keys": [
+    "agent_id",
+    "decision_reason",
+    "decision_reason_type",
+    "description",
+    "display_name",
+    "input",
+    "permission_suggestions",
+    "subtype",
+    "tool_name",
+    "tool_use_id"
+   ],
+   "held": false
+  },
+  {
+   "at": 3.273,
+   "tool": "Bash",
+   "allow": true,
+   "tool_use_id": "toolu_01PhT3QRdat3fZd9Dr35raDp",
+   "agent_id": null,
+   "keys": [
+    "decision_reason",
+    "decision_reason_type",
+    "description",
+    "display_name",
+    "input",
+    "permission_suggestions",
+    "subtype",
+    "tool_name",
+    "tool_use_id"
+   ],
+   "held": false
+  }
+ ],
+ "subagent_transcripts": [
+  {
+   "name": "agent-afe2e0c17959d5c0e.jsonl",
+   "bytes": 49338
+  },
+  {
+   "name": "agent-afe2e0c17959d5c0e.meta.json",
+   "bytes": 238
+  }
+ ],
+ "both_sleeping_before": {
+  "time.sleep(58)": true,
+  "time.sleep(59)": true
+ },
+ "interrupt_at": 3.847,
+ "interrupt_id": "a184a6c5-a7b2-44fc-9ffd-bec42c893c25",
+ "result_after_interrupt": {
+  "subtype": "error_during_execution",
+  "is_error": true,
+  "stop_reason": "tool_use",
+  "terminal_reason": "aborted_tools"
+ },
+ "result_at": 3.861,
+ "sleep_alive_7s_after": false,
+ "task_ends_after_interrupt": [
+  {
+   "task_id": "afe2e0c17959d5c0e",
+   "status": "stopped",
+   "summary": "sleeper"
+  }
+ ],
+ "second_turn": "success",
+ "exit": {
+  "rc": 0,
+  "exit_seconds": 0.224,
+  "hung_killed": false
+ },
+ "sleep_alive_at_horizon": false,
+ "marker_written": false
+}

@@ -1,0 +1,83 @@
+{
+ "frames": 50,
+ "counts": {
+  "system/init": 2,
+  "system/status": 2,
+  "stream_event": 22,
+  "assistant": 4,
+  "system/task_started": 2,
+  "user": 5,
+  "rate_limit_event": 1,
+  "system/task_progress": 2,
+  "control_request": 1,
+  "system/background_tasks_changed": 2,
+  "control_response": 1,
+  "system/task_updated": 2,
+  "system/task_notification": 2,
+  "result/error_during_execution": 1,
+  "result/success": 1
+ },
+ "approvals": [
+  {
+   "at": 6.4,
+   "tool": "Bash",
+   "allow": true,
+   "tool_use_id": "toolu_013itBkLLL2KHznMJAnQYtWV",
+   "agent_id": "aac02f48e19be7263",
+   "keys": [
+    "agent_id",
+    "blocked_path",
+    "description",
+    "display_name",
+    "input",
+    "permission_suggestions",
+    "subtype",
+    "tool_name",
+    "tool_use_id"
+   ],
+   "held": false
+  }
+ ],
+ "subagent_transcripts": [
+  {
+   "name": "agent-aac02f48e19be7263.jsonl",
+   "bytes": 71610
+  },
+  {
+   "name": "agent-aac02f48e19be7263.meta.json",
+   "bytes": 189
+  }
+ ],
+ "subagent_bash_seen": true,
+ "sleep_running_before": true,
+ "interrupt_at": 6.939,
+ "interrupt_id": "a4271b6d-f012-4588-b3f8-4000f08305b3",
+ "result_after_interrupt": {
+  "subtype": "error_during_execution",
+  "is_error": true,
+  "stop_reason": "tool_use",
+  "terminal_reason": "aborted_tools"
+ },
+ "result_at": 6.949,
+ "sleep_alive_7s_after": false,
+ "task_ends_after_interrupt": [
+  {
+   "task_id": "b2wm42571",
+   "status": "stopped",
+   "summary": "Sleep 41 seconds then touch interrupt marker"
+  },
+  {
+   "task_id": "aac02f48e19be7263",
+   "status": "stopped",
+   "summary": "sleeper"
+  }
+ ],
+ "second_turn": "success",
+ "exit": {
+  "rc": 0,
+  "exit_seconds": 0.241,
+  "hung_killed": false
+ },
+ "sleep_alive_at_horizon": false,
+ "marker_written": false
+}

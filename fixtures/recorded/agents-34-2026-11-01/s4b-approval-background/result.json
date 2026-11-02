@@ -1,0 +1,81 @@
+{
+ "frames": 120,
+ "counts": {
+  "system/init": 2,
+  "system/status": 3,
+  "stream_event": 90,
+  "assistant": 8,
+  "system/background_tasks_changed": 2,
+  "system/task_started": 1,
+  "user": 3,
+  "rate_limit_event": 1,
+  "system/task_progress": 2,
+  "control_request": 2,
+  "result/success": 2,
+  "system/task_updated": 1,
+  "system/task_notification": 1,
+  "system/thinking_tokens": 2
+ },
+ "approvals": [
+  {
+   "at": 2.72,
+   "tool": "Bash",
+   "allow": true,
+   "tool_use_id": "toolu_01WmesWsfLibbmpxWfJHFDA7",
+   "agent_id": "ad7e10ad280ff167f",
+   "keys": [
+    "agent_id",
+    "blocked_path",
+    "description",
+    "display_name",
+    "input",
+    "permission_suggestions",
+    "subtype",
+    "tool_name",
+    "tool_use_id"
+   ],
+   "held": false
+  },
+  {
+   "at": 2.961,
+   "tool": "Bash",
+   "allow": false,
+   "tool_use_id": "toolu_01JbLS99pVREUsnBQZ4dAnPs",
+   "agent_id": "ad7e10ad280ff167f",
+   "keys": [
+    "agent_id",
+    "blocked_path",
+    "description",
+    "display_name",
+    "input",
+    "permission_suggestions",
+    "subtype",
+    "tool_name",
+    "tool_use_id"
+   ],
+   "held": false
+  }
+ ],
+ "subagent_transcripts": [
+  {
+   "name": "agent-ad7e10ad280ff167f.jsonl",
+   "bytes": 65361
+  },
+  {
+   "name": "agent-ad7e10ad280ff167f.meta.json",
+   "bytes": 231
+  }
+ ],
+ "settled": true,
+ "results": [
+  "success",
+  "success"
+ ],
+ "exit": {
+  "rc": 0,
+  "exit_seconds": 0.345,
+  "hung_killed": false
+ },
+ "approve_marker": true,
+ "refused_marker": false
+}

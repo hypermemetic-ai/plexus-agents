@@ -1,0 +1,36 @@
+{
+ "frames": 38,
+ "counts": {
+  "system/init": 1,
+  "system/status": 2,
+  "stream_event": 23,
+  "assistant": 3,
+  "system/task_started": 1,
+  "user": 3,
+  "rate_limit_event": 1,
+  "system/task_progress": 1,
+  "system/task_updated": 1,
+  "system/task_notification": 1,
+  "result/success": 1
+ },
+ "approvals": [],
+ "subagent_transcripts": [
+  {
+   "name": "agent-ac433046e61086103.jsonl",
+   "bytes": 58233
+  },
+  {
+   "name": "agent-ac433046e61086103.meta.json",
+   "bytes": 205
+  }
+ ],
+ "settled": true,
+ "results": [
+  "success"
+ ],
+ "exit": {
+  "rc": 0,
+  "exit_seconds": 0.398,
+  "hung_killed": false
+ }
+}

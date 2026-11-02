@@ -1,0 +1,2 @@
+{"type": "user", "session_id": "", "parent_tool_use_id": null, "message": {"role": "user", "content": [{"type": "text", "text": "Use your Agent tool once with run_in_background false, subagent_type general-purpose, description 'held'. Prompt it: 'Run the Bash command touch held.marker and then reply done.' Do not run Bash yourself."}]}}
+{"type": "control_request", "request_id": "ddaa4286-c434-4f0d-ae9e-3b0ca8eb07eb", "request": {"subtype": "interrupt"}}

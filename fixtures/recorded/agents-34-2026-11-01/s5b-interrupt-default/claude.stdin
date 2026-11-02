@@ -1,0 +1,4 @@
+{"type": "user", "session_id": "", "parent_tool_use_id": null, "message": {"role": "user", "content": [{"type": "text", "text": "Use your Agent tool once, subagent_type general-purpose, description 'sleeper'. Prompt it: 'Run the Bash command sleep 44 && touch interrupt-default.marker and then reply done.' Do not run Bash yourself."}]}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "8f850169-546e-41b6-9162-f2d09aa97513", "response": {"behavior": "allow", "updatedInput": {"command": "sleep 44 && touch interrupt-default.marker", "description": "Sleep 44 seconds then create marker file", "run_in_background": true}}}}
+{"type": "control_request", "request_id": "c6fe4284-7e16-4671-95f3-bb80eaa9cb9b", "request": {"subtype": "interrupt"}}
+{"type": "user", "session_id": "", "parent_tool_use_id": null, "message": {"role": "user", "content": [{"type": "text", "text": "Reply with the single word: resumed"}]}}

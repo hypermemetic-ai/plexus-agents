@@ -1,0 +1,12 @@
+{
+ "claims": {
+  "no terminal lacks a start": true,
+  "the prompt's turn ended once": true,
+  "the self-started turn says so": true,
+  "the subagent's frames are its own": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {
+  "turns": 2
+ }
+}

@@ -1,0 +1,3 @@
+{"label": "before-close", "at": 5.641, "claude_alive": true, "procs": [{"pid": 19540, "ppid": 19538, "pgid": 19540, "etime": "00:06", "cmd": "<home>/.local/bin/claude -p --input-format stream-json --output-format stream-json --include-partial-messages --verbose --permission-prompt-tool stdio "}, {"pid": 19978, "ppid": 19540, "pgid": 19978, "etime": "00:01", "cmd": "/bin/zsh -c source <home>/.claude/shell-snapshots/snapshot-zsh-1793586400447-6jkf6a.sh 2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL"}, {"pid": 19979, "ppid": 19978, "pgid": 19978, "etime": "00:01", "cmd": "sleep 27"}]}
+{"label": "after-exit", "at": 14.514, "claude_alive": false, "procs": []}
+{"label": "after-sleep-horizon", "at": 44.58, "claude_alive": false, "procs": []}

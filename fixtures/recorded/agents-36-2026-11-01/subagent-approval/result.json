@@ -1,0 +1,12 @@
+{
+ "claims": {
+  "a subagent started": true,
+  "the input.requested event names it too": true,
+  "the subagent's approval names it": true,
+  "the tool ran": true
+ },
+ "cli_version": "2.1.316 (Claude Code)",
+ "facts": {
+  "requests": 1
+ }
+}
