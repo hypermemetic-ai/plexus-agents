@@ -331,6 +331,23 @@ async fn exactly_the_listed_methods_are_public() {
     assert_eq!(public, ["agents.harnesses", "claudecode.describe"]);
 }
 
+/// What the gate gives a `public` call by anon: an empty reach, live, that allows
+/// nothing, so even a method that read it couldn't reach a thread or a placement.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_public_methods_reach_is_empty_for_anon() {
+    let s = service().await;
+    let ada = connect(s.port, &token(ADA, "ada")).await;
+    let thread = start(&ada).await;
+    let gate = plexus_agents::auth::gate(&s.runtime, vec![], grants());
+    let grant = plexus_auth_core::grants::Grant::new("agents.harnesses");
+    let reach = gate.reach_of_public(None, &grant);
+    assert!(reach.is_empty());
+    assert!(reach.held_on().is_empty());
+    assert!(!reach.is_everywhere());
+    assert!(!reach.allows(&thread));
+    assert!(!reach.allows("local"));
+}
+
 /// What anon's own view lists: the public methods, and no thread data anywhere.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_anonymous_view_lists_only_public_methods() {
