@@ -40,6 +40,14 @@ impl<E: Environment> Environment for RecordingEnvironment<E> {
         self.inner.name()
     }
 
+    fn identity(&self, pid: u32) -> BoxFuture<'static, Option<String>> {
+        self.inner.identity(pid)
+    }
+
+    fn reap(&self, pid: u32, identity: &str) -> BoxFuture<'static, bool> {
+        self.inner.reap(pid, identity)
+    }
+
     fn spawn(&self, plan: LaunchPlan) -> BoxFuture<'static, Result<Process, SpawnError>> {
         let n = self.spawned.fetch_add(1, Ordering::SeqCst) + 1;
         let base = self.dir.join(format!("{n}-claude"));

@@ -11,6 +11,7 @@ plexus-harness = { path = "../plexus-harness" }
 plexus-core = "0.7.0"
 futures = "0.3"
 libc = "0.2"
+rusqlite = { version = "0.31", features = ["bundled"] }
 schemars = "1.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -20,6 +21,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 plexus-macros = "0.7.0"
+tempfile = "3"
 async-stream = "0.3"
 async-trait = "0.1"
 jsonrpsee = { version = "0.26", features = ["server", "macros"] }

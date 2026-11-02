@@ -38,6 +38,23 @@ impl Environment for LocalEnvironment {
     fn spawn(&self, plan: LaunchPlan) -> BoxFuture<'static, Result<Process, SpawnError>> {
         start(plan).boxed()
     }
+
+    fn identity(&self, pid: u32) -> BoxFuture<'static, Option<String>> {
+        async move { started_at(pid) }.boxed()
+    }
+
+    fn reap(&self, pid: u32, identity: &str) -> BoxFuture<'static, bool> {
+        let identity = identity.to_string();
+        async move {
+            if started_at(pid).as_deref() != Some(&identity) {
+                return false;
+            }
+            tokio::task::spawn_blocking(move || kill_tree(pid as i32))
+                .await
+                .is_ok_and(|r| r.is_ok())
+        }
+        .boxed()
+    }
 }
 
 /// Reads host env vars. The only place a secret's value enters this crate.
@@ -276,6 +293,16 @@ async fn start(plan: LaunchPlan) -> Result<Process, SpawnError> {
         wait,
         secrets: Arc::new(HostSecrets),
     })
+}
+
+/// When `pid` started, which tells it from a later process with the same pid.
+fn started_at(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 fn exit_info(status: ExitStatus) -> ExitInfo {

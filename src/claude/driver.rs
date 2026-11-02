@@ -739,15 +739,8 @@ async fn on_deferred(shared: &Shared, queue: &MemoryInputQueue, frame: Frame) {
         .session
         .clone()
         .unwrap_or_else(|| SessionId::new(""));
-    let event = shared.log.append_as(
-        who,
-        AgentEventKind::TurnParked {
-            turn: turn.id,
-            calls: ids,
-        },
-        Some(raw),
-    );
-    let parked = ParkedRun {
+    // Set before the event, so whoever reads `turn.parked` can read this.
+    shared.state().parked = Some(ParkedRun {
         harness: "claude".into(),
         session,
         cwd: shared.spec.cwd.clone(),
@@ -756,9 +749,15 @@ async fn on_deferred(shared: &Shared, queue: &MemoryInputQueue, frame: Frame) {
         calls,
         reported,
         parked_at_ms: now_ms(),
-        last_seq: event.map_or(EventSeq(0), |e| e.seq),
-    };
-    shared.state().parked = Some(parked);
+    });
+    shared.emit_as(
+        who,
+        AgentEventKind::TurnParked {
+            turn: turn.id,
+            calls: ids,
+        },
+        Some(raw),
+    );
     // The CLI exits by itself, but only a process that has gone counts as parked.
     let _ = shared.close_stdin().await;
     let signal = shared.signal.clone();
