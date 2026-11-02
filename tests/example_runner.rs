@@ -43,7 +43,7 @@ fn the_wire_harness_runs_through_the_example_runner() {
     assert!(text.contains(r#""status":"completed""#), "{text}");
     assert!(text.contains(r#""kind":"run.ended""#), "{text}");
     assert!(
-        text.contains(r#""names":"HOME"#),
+        text.contains(r#"\"names\":\"HOME"#),
         "only named env reaches it: {text}"
     );
     assert!(!text.contains("AGENTS31_RUNNER_LEAK"), "{text}");

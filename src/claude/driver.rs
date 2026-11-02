@@ -10,16 +10,17 @@ use futures::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use futures::lock::Mutex as AsyncMutex;
 use futures::stream::{BoxStream, StreamExt};
 use plexus_harness::{
-    AgentEvent, AgentEventKind, BoxAsyncRead, BoxAsyncWrite, CancelReason, DriveError, EnvName,
-    EnvValue, EventLog, EventSeq, ExitInfo, FailureKind, InputAnswer, InputKind, InputOutcome,
-    InputQueue, InputRequest, InputRequestId, InputResponder, Interrupt, InterruptOutcome,
-    McpTransport, MemoryInputQueue, ModelName, Process, ProcessSignal, ResolvedSecret, Run,
-    RunEndReason, RunError, RunId, RunInfo, RunSpec, SecretResolver, SessionId, SessionMode,
-    Signal, StopCause, StopMode, StopReport, ThreadDisposition, ToolName, ToolUseId, TurnFailure,
-    TurnId, TurnStatus, TurnTerminal, UserInput,
+    AgentEvent, AgentEventKind, Attribution, BoxAsyncRead, BoxAsyncWrite, CancelReason, DriveError,
+    EnvName, EnvValue, EventLog, EventSeq, ExitInfo, FailureKind, InputAnswer, InputKind,
+    InputOutcome, InputQueue, InputRequest, InputRequestId, InputResponder, Interrupt,
+    InterruptOutcome, McpTransport, MemoryInputQueue, ModelName, Process, ProcessSignal, RawFrame,
+    ResolvedSecret, Run, RunEndReason, RunError, RunId, RunInfo, RunSpec, SecretResolver,
+    SessionId, SessionMode, Signal, StopCause, StopMode, StopReport, SubagentId, TaskId,
+    ThreadDisposition, ToolName, ToolUseId, TurnFailure, TurnId, TurnOrigin, TurnStatus,
+    TurnTerminal, UserInput,
 };
 use serde_json::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -33,13 +34,39 @@ const STDERR_TAIL: usize = 8192;
 struct OpenTurn {
     id: TurnId,
     stop: Option<StopCause>,
+    origin: TurnOrigin,
+    /// The CLI's `system/init` for this turn has come. Each turn gets one.
+    began: bool,
+}
+
+/// A task the CLI announced with `task_started`.
+struct Task {
+    /// `task_type: local_agent`. Everything else stays a task.
+    subagent: bool,
+    /// The turn that started it. Its events stay there, even after that turn ends.
+    turn: Option<TurnId>,
+    /// The subagent that owns it, for a task that isn't one.
+    owner: Option<String>,
+}
+
+/// One line of stdout: the parsed frame, and the bytes as they came.
+struct Frame {
+    v: Value,
+    raw: RawFrame,
 }
 
 #[derive(Default)]
 struct State {
     next_turn: u64,
-    /// In order: the CLI queues prompts sent during a turn.
+    /// In order: the CLI queues prompts sent during a turn. The front is running.
     turns: VecDeque<OpenTurn>,
+    tasks: HashMap<String, Task>,
+    /// Tasks that have started and not ended.
+    live_tasks: HashSet<String>,
+    /// Which subagent an Agent `tool_use` started.
+    agent_of_tool: HashMap<String, String>,
+    /// Which turn a `tool_use` was made in.
+    turn_of_tool: HashMap<String, TurnId>,
     session: Option<SessionId>,
     session_reported: bool,
     /// The run itself is being stopped.
@@ -62,6 +89,8 @@ struct Shared {
     signal: Arc<dyn ProcessSignal>,
     stderr: Mutex<String>,
     ended: watch::Sender<bool>,
+    /// How many tasks are live, for an interrupt with no turn to wait on.
+    live: watch::Sender<usize>,
     next_control: AtomicU64,
 }
 
@@ -89,8 +118,38 @@ impl Shared {
         )
     }
 
-    fn emit(&self, kind: AgentEventKind, raw: Option<Value>) {
-        self.log.append(kind, raw);
+    /// Emits an event of the root agent, in the turn now running.
+    fn emit(&self, kind: AgentEventKind, raw: Option<RawFrame>) {
+        let turn = self.state().turns.front().map(|t| t.id);
+        let who = Attribution { turn, agent: None };
+        self.log.append_as(who, kind, raw);
+    }
+
+    fn emit_as(&self, who: Attribution, kind: AgentEventKind, raw: Option<RawFrame>) {
+        self.log.append_as(who, kind, raw);
+    }
+
+    /// Whose `agent` is: its own turn, or the one running if it's unknown.
+    fn who_of(&self, agent: Option<&str>) -> Attribution {
+        let g = self.state();
+        let turn = agent
+            .and_then(|a| g.tasks.get(a))
+            .and_then(|t| t.turn)
+            .or_else(|| g.turns.front().map(|t| t.id));
+        Attribution {
+            turn,
+            agent: agent.map(SubagentId::new),
+        }
+    }
+
+    /// Who a message frame belongs to. `agent_id` names a subagent directly, and
+    /// `parent_tool_use_id` is the Agent call that started it.
+    fn who(&self, f: &Value) -> Attribution {
+        let agent = f["agent_id"].as_str().map(str::to_string).or_else(|| {
+            let tool = f["parent_tool_use_id"].as_str()?;
+            self.state().agent_of_tool.get(tool).cloned()
+        });
+        self.who_of(agent.as_deref())
     }
 
     fn terminal(
@@ -99,7 +158,7 @@ impl Shared {
         status: TurnStatus,
         thread_disposition: ThreadDisposition,
         stopped_by: Option<StopCause>,
-        raw: Option<Value>,
+        raw: Option<RawFrame>,
     ) {
         let t = TurnTerminal {
             turn,
@@ -107,26 +166,76 @@ impl Shared {
             thread_disposition,
             stopped_by,
         };
-        self.emit(AgentEventKind::TurnTerminal(t), raw);
+        self.emit_as(
+            Attribution::turn(turn),
+            AgentEventKind::TurnTerminal(t),
+            raw,
+        );
     }
 
-    /// The oldest open turn, or a turn for a frame no prompt asked for: a resume
-    /// that fails reports it before reading any stdin.
-    fn take_turn(&self) -> OpenTurn {
-        let mut g = self.state();
-        g.turns.pop_front().unwrap_or_else(|| {
+    /// Opens a turn nobody asked for, and says so, so a terminal is never without
+    /// a start.
+    fn open_unasked(&self, origin: TurnOrigin) -> OpenTurn {
+        let turn = {
+            let mut g = self.state();
             g.next_turn += 1;
             OpenTurn {
                 id: TurnId(g.next_turn),
                 stop: g.stopping,
+                origin,
+                began: true,
             }
+        };
+        let (id, who) = (turn.id, Attribution::turn(turn.id));
+        self.emit_as(who, AgentEventKind::TurnStarted { turn: id, origin }, None);
+        turn
+    }
+
+    /// The turn a `result` ends. A `result` with an `origin` ends only a turn the
+    /// agent started itself, and one without ends only a turn that was asked for,
+    /// so a background turn can't end a prompt's. With no such turn open, the frame
+    /// is a resume failing before reading stdin, or a self-started turn whose init
+    /// was taken for a queued prompt's.
+    fn take_turn(&self, by_itself: bool) -> OpenTurn {
+        let found = {
+            let mut g = self.state();
+            let at = g
+                .turns
+                .iter()
+                .position(|t| (t.origin == TurnOrigin::TaskNotification) == by_itself);
+            match at {
+                Some(i) => g.turns.remove(i),
+                None => {
+                    if by_itself {
+                        if let Some(t) = g.turns.front_mut() {
+                            t.began = false;
+                        }
+                    }
+                    None
+                }
+            }
+        };
+        found.unwrap_or_else(|| {
+            self.open_unasked(if by_itself {
+                TurnOrigin::TaskNotification
+            } else {
+                TurnOrigin::Resume
+            })
         })
     }
 
     fn cancel_pending(&self, queue: &MemoryInputQueue, reason: CancelReason) {
         for r in queue.cancel_all(reason) {
             let outcome = InputOutcome::Cancelled(reason);
-            self.emit(AgentEventKind::InputResolved { id: r.id, outcome }, None);
+            let who = Attribution {
+                turn: Some(r.turn),
+                agent: r.agent,
+            };
+            self.emit_as(
+                who,
+                AgentEventKind::InputResolved { id: r.id, outcome },
+                None,
+            );
         }
     }
 
@@ -172,8 +281,8 @@ impl Shared {
     }
 
     /// Fails the open turn and kills the run: this CLI can't be driven safely.
-    async fn refuse(&self, failure: FailureKind, detail: String, raw: Value) {
-        let turn = self.take_turn();
+    async fn refuse(&self, failure: FailureKind, detail: String, raw: RawFrame) {
+        let turn = self.take_turn(false);
         self.state().refused = true;
         let status = TurnStatus::Failed(TurnFailure { failure, detail });
         self.terminal(turn.id, status, ThreadDisposition::Broken, None, Some(raw));
@@ -208,7 +317,12 @@ impl InputResponder for Responder {
             let frame = frames::control_response(&native, &request.raw["request"], &answer);
             shared.write(&frame).await.map_err(|e| e.to_string())?;
             let outcome = answer.outcome();
-            shared.emit(
+            let who = Attribution {
+                turn: Some(request.turn),
+                agent: request.agent,
+            };
+            shared.emit_as(
+                who,
                 AgentEventKind::InputResolved {
                     id: request.id,
                     outcome,
@@ -237,26 +351,36 @@ async fn drain_stderr(shared: Arc<Shared>, mut stderr: BoxAsyncRead) {
     }
 }
 
-fn on_init(shared: &Shared, f: Value) -> Option<(FailureKind, String, Value)> {
+fn on_init(shared: &Shared, frame: Frame) -> Option<(FailureKind, String, RawFrame)> {
+    let Frame { v: f, raw } = frame;
     let version = f["claude_code_version"].as_str().map(str::to_string);
     if let Some(v) = &version {
         if !SUPPORTED_CLI_VERSIONS.contains(&v.as_str()) {
             let detail =
                 format!("claude {v} is not supported; supported: {SUPPORTED_CLI_VERSIONS:?}");
-            return Some((FailureKind::UnsupportedVersion, detail, f));
+            return Some((FailureKind::UnsupportedVersion, detail, raw));
         }
     }
     let mode = f["permissionMode"].as_str().map(str::to_string);
     if mode.as_deref() == Some("bypassPermissions") {
         let detail = "the CLI reports bypassed permissions; refusing to drive it".to_string();
-        return Some((FailureKind::Protocol, detail, f));
+        return Some((FailureKind::Protocol, detail, raw));
     }
     let id = SessionId::new(f["session_id"].as_str().unwrap_or(""));
-    let first = {
+    let (first, by_itself) = {
         let mut g = shared.state();
         g.session = Some(id.clone());
-        !std::mem::replace(&mut g.session_reported, true)
+        let first = !std::mem::replace(&mut g.session_reported, true);
+        if let Some(t) = g.turns.iter_mut().find(|t| !t.began) {
+            t.began = true;
+        }
+        (first, g.turns.is_empty() && !first)
     };
+    if by_itself {
+        // An init nothing asked for: a background task woke the agent up.
+        let turn = shared.open_unasked(TurnOrigin::TaskNotification);
+        shared.state().turns.push_front(turn);
+    }
     if first {
         let kind = AgentEventKind::SessionStarted {
             session: id,
@@ -264,19 +388,20 @@ fn on_init(shared: &Shared, f: Value) -> Option<(FailureKind, String, Value)> {
             harness_version: version,
             permission_mode: mode,
         };
-        shared.emit(kind, Some(f));
+        shared.emit(kind, Some(raw));
     } else {
         shared.emit(
             AgentEventKind::Native {
                 name: "system/init".into(),
             },
-            Some(f),
+            Some(raw),
         );
     }
     None
 }
 
-fn on_stream_event(shared: &Shared, f: Value) {
+fn on_stream_event(shared: &Shared, frame: Frame) {
+    let Frame { v: f, raw } = frame;
     let delta = &f["event"]["delta"];
     let text = |k: &str| delta[k].as_str().unwrap_or("").to_string();
     let kind = match delta["type"].as_str() {
@@ -292,10 +417,12 @@ fn on_stream_event(shared: &Shared, f: Value) {
             AgentEventKind::Native { name }
         }
     };
-    shared.emit(kind, Some(f));
+    shared.emit_as(shared.who(&f), kind, Some(raw));
 }
 
-fn on_assistant(shared: &Shared, f: Value) {
+fn on_assistant(shared: &Shared, frame: Frame) {
+    let Frame { v: f, raw } = frame;
+    let who = shared.who(&f);
     let blocks = f["message"]["content"]
         .as_array()
         .cloned()
@@ -303,44 +430,44 @@ fn on_assistant(shared: &Shared, f: Value) {
     let mut said = false;
     for b in blocks {
         said = true;
-        match b["type"].as_str() {
-            Some("text") => {
-                let text = b["text"].as_str().unwrap_or("").to_string();
-                shared.emit(AgentEventKind::Message { text }, Some(f.clone()));
-            }
+        let kind = match b["type"].as_str() {
+            Some("text") => AgentEventKind::Message {
+                text: b["text"].as_str().unwrap_or("").to_string(),
+            },
             Some("tool_use") => {
-                let kind = AgentEventKind::ToolCall {
-                    id: ToolUseId::new(b["id"].as_str().unwrap_or("")),
+                let id = b["id"].as_str().unwrap_or("");
+                if let Some(turn) = who.turn {
+                    shared.state().turn_of_tool.insert(id.to_string(), turn);
+                }
+                AgentEventKind::ToolCall {
+                    id: ToolUseId::new(id),
                     name: ToolName::new(b["name"].as_str().unwrap_or("")),
                     input: b["input"].clone(),
-                };
-                shared.emit(kind, Some(f.clone()));
+                }
             }
-            _ => {
-                let name = format!("assistant/{}", b["type"].as_str().unwrap_or("?"));
-                shared.emit(AgentEventKind::Native { name }, Some(f.clone()));
-            }
-        }
+            _ => AgentEventKind::Native {
+                name: format!("assistant/{}", b["type"].as_str().unwrap_or("?")),
+            },
+        };
+        shared.emit_as(who.clone(), kind, Some(raw.clone()));
     }
     if !said {
-        shared.emit(
-            AgentEventKind::Native {
-                name: "assistant".into(),
-            },
-            Some(f),
-        );
+        let kind = AgentEventKind::Native {
+            name: "assistant".into(),
+        };
+        shared.emit_as(who, kind, Some(raw));
     }
 }
 
-fn on_user(shared: &Shared, f: Value) {
+fn on_user(shared: &Shared, frame: Frame) {
+    let Frame { v: f, raw } = frame;
+    let who = shared.who(&f);
     let results = frames::tool_results(&f);
     if results.is_empty() {
-        shared.emit(
-            AgentEventKind::Native {
-                name: "user".into(),
-            },
-            Some(f),
-        );
+        let kind = AgentEventKind::Native {
+            name: "user".into(),
+        };
+        shared.emit_as(who, kind, Some(raw));
         return;
     }
     for (id, is_error, output) in results {
@@ -349,43 +476,181 @@ fn on_user(shared: &Shared, f: Value) {
             is_error,
             output,
         };
-        shared.emit(kind, Some(f.clone()));
+        shared.emit_as(who.clone(), kind, Some(raw.clone()));
     }
 }
 
-fn on_control_request(shared: &Shared, queue: &MemoryInputQueue, f: Value) {
+/// `system/task_started`. Only `task_type: local_agent` is a subagent, and an id
+/// seen before is that subagent starting again.
+fn on_task_started(shared: &Shared, frame: Frame) {
+    let Frame { v: f, raw } = frame;
+    let id = f["task_id"].as_str().unwrap_or("").to_string();
+    let subagent = f["task_type"] == "local_agent";
+    let tool_use = f["tool_use_id"].as_str();
+    let parent = f["parent_task_id"].as_str().map(str::to_string);
+    let (resumed, who) = {
+        let mut g = shared.state();
+        let turn = tool_use
+            .and_then(|t| g.turn_of_tool.get(t).copied())
+            .or_else(|| parent.as_ref().and_then(|p| g.tasks.get(p)?.turn))
+            .or_else(|| g.turns.front().map(|t| t.id));
+        let resumed = g
+            .tasks
+            .insert(
+                id.clone(),
+                Task {
+                    subagent,
+                    turn,
+                    owner: parent.clone(),
+                },
+            )
+            .is_some();
+        if let (true, Some(tool)) = (subagent, tool_use) {
+            g.agent_of_tool.insert(tool.to_string(), id.clone());
+        }
+        g.live_tasks.insert(id.clone());
+        let count = g.live_tasks.len();
+        drop(g);
+        shared.live.send_replace(count);
+        let owner = if subagent { Some(&id) } else { parent.as_ref() };
+        let agent = owner.cloned().map(SubagentId::new);
+        (resumed, Attribution { turn, agent })
+    };
+    let text = |k: &str| f[k].as_str().unwrap_or("").to_string();
+    let tool_use = tool_use.map(ToolUseId::new);
+    let kind = if subagent {
+        AgentEventKind::SubagentStarted {
+            id: SubagentId::new(&id),
+            parent: parent.map(SubagentId::new),
+            tool_use,
+            agent_type: f["subagent_type"].as_str().map(str::to_string),
+            description: text("description"),
+            prompt: f["prompt"].as_str().map(str::to_string),
+            background: f["is_backgrounded"].as_bool().unwrap_or(false),
+            depth: f["spawn_depth"].as_u64().unwrap_or(1) as u32,
+            resumed,
+        }
+    } else {
+        AgentEventKind::BackgroundTaskStarted {
+            id: TaskId::new(&id),
+            owner: parent.map(SubagentId::new),
+            tool_use,
+            task_type: text("task_type"),
+            description: text("description"),
+        }
+    };
+    shared.emit_as(who, kind, Some(raw));
+}
+
+/// Whose a task frame is: the subagent itself, or the owner of a task that isn't one.
+fn who_of_task(shared: &Shared, f: &Value) -> (Attribution, bool) {
+    let id = f["task_id"].as_str().unwrap_or("");
+    let (subagent, owner) = {
+        let g = shared.state();
+        match g.tasks.get(id) {
+            Some(t) if t.subagent => (true, Some(id.to_string())),
+            Some(t) => (false, t.owner.clone()),
+            None => (false, None),
+        }
+    };
+    let mut who = shared.who_of(owner.as_deref());
+    if owner.is_none() {
+        let turn = shared.state().tasks.get(id).and_then(|t| t.turn);
+        who.turn = turn.or(who.turn);
+    }
+    (who, subagent)
+}
+
+fn on_task_progress(shared: &Shared, frame: Frame) {
+    let Frame { v: f, raw } = frame;
+    let (who, subagent) = who_of_task(shared, &f);
+    let kind = if subagent {
+        AgentEventKind::SubagentProgress {
+            id: SubagentId::new(f["task_id"].as_str().unwrap_or("")),
+            description: f["description"].as_str().unwrap_or("").to_string(),
+            last_tool: f["last_tool_name"].as_str().map(ToolName::new),
+            usage: frames::subagent_usage(&f),
+        }
+    } else {
+        AgentEventKind::Native {
+            name: "system/task_progress".into(),
+        }
+    };
+    shared.emit_as(who, kind, Some(raw));
+}
+
+/// `system/task_notification`: ended for now. The same id can start again.
+fn on_task_notification(shared: &Shared, frame: Frame) {
+    let Frame { v: f, raw } = frame;
+    let (who, subagent) = who_of_task(shared, &f);
+    let id = f["task_id"].as_str().unwrap_or("");
+    let count = {
+        let mut g = shared.state();
+        g.live_tasks.remove(id);
+        g.live_tasks.len()
+    };
+    shared.live.send_replace(count);
+    let status = frames::subagent_status(&f);
+    let summary = f["summary"].as_str().map(str::to_string);
+    let kind = if subagent {
+        AgentEventKind::SubagentEnded {
+            id: SubagentId::new(id),
+            status,
+            summary,
+            usage: frames::subagent_usage(&f),
+        }
+    } else {
+        AgentEventKind::BackgroundTaskEnded {
+            id: TaskId::new(id),
+            status,
+            summary,
+        }
+    };
+    shared.emit_as(who, kind, Some(raw));
+}
+
+fn on_control_request(shared: &Shared, queue: &MemoryInputQueue, frame: Frame) {
+    let Frame { v: f, raw } = frame;
     let kind: InputKind = frames::input_kind(&f["request"]);
     let native = f["request_id"].as_str().unwrap_or("").to_string();
-    let turn = shared.state().turns.front().map_or(TurnId(0), |t| t.id);
-    let r = queue.enqueue(turn, kind, f.clone());
+    let who = shared.who_of(f["request"]["agent_id"].as_str());
+    let turn = who.turn.unwrap_or(TurnId(0));
+    let r = queue.enqueue_as(turn, who.agent.clone(), kind, f);
     {
         let mut g = shared.state();
         g.native_of.insert(r.id.clone(), native.clone());
         g.by_native.insert(native, r.id.clone());
     }
-    shared.emit(AgentEventKind::InputRequested { id: r.id }, Some(f));
+    shared.emit_as(who, AgentEventKind::InputRequested { id: r.id }, Some(raw));
 }
 
-fn on_cancel(shared: &Shared, queue: &MemoryInputQueue, f: Value) {
+fn on_cancel(shared: &Shared, queue: &MemoryInputQueue, frame: Frame) {
+    let Frame { v: f, raw } = frame;
     let native = f["request_id"].as_str().unwrap_or("").to_string();
     let id = shared.state().by_native.get(&native).cloned();
     let cancelled = id.and_then(|id| queue.cancel(&id, CancelReason::WithdrawnByAgent));
     match cancelled {
         Some(r) => {
             let outcome = InputOutcome::Cancelled(CancelReason::WithdrawnByAgent);
-            shared.emit(AgentEventKind::InputResolved { id: r.id, outcome }, Some(f));
+            let who = Attribution {
+                turn: Some(r.turn),
+                agent: r.agent,
+            };
+            let kind = AgentEventKind::InputResolved { id: r.id, outcome };
+            shared.emit_as(who, kind, Some(raw));
         }
         // Our interrupt usually got there first, and a late cancel moves nothing.
         None => shared.emit(
             AgentEventKind::Native {
                 name: "control_cancel_request".into(),
             },
-            Some(f),
+            Some(raw),
         ),
     }
 }
 
-fn on_control_response(shared: &Shared, f: Value) {
+fn on_control_response(shared: &Shared, frame: Frame) {
+    let Frame { v: f, raw } = frame;
     let id = f["response"]["request_id"].as_str().unwrap_or("");
     if let Some(tx) = shared.state().awaiting.remove(id) {
         let _ = tx.send(f.clone());
@@ -394,14 +659,16 @@ fn on_control_response(shared: &Shared, f: Value) {
         AgentEventKind::Native {
             name: "control_response".into(),
         },
-        Some(f),
+        Some(raw),
     );
 }
 
-fn on_result(shared: &Shared, f: Value) {
-    let turn = shared.take_turn();
+fn on_result(shared: &Shared, frame: Frame) {
+    let Frame { v: f, raw } = frame;
+    let turn = shared.take_turn(!f["origin"].is_null());
     if let Some(usage) = frames::usage(&f) {
-        shared.emit(
+        shared.emit_as(
+            Attribution::turn(turn.id),
             AgentEventKind::Tokens {
                 turn: turn.id,
                 usage,
@@ -410,7 +677,7 @@ fn on_result(shared: &Shared, f: Value) {
         );
     }
     let (status, disposition, stopped_by) = classify(&f, turn.stop);
-    shared.terminal(turn.id, status, disposition, stopped_by, Some(f));
+    shared.terminal(turn.id, status, disposition, stopped_by, Some(raw));
 }
 
 /// Reads a result in light of what the driver did. A clean result means the turn
@@ -463,8 +730,8 @@ async fn pump(
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let Ok(f) = serde_json::from_slice::<Value>(&line) else {
-            let raw = Value::String(String::from_utf8_lossy(&line).trim_end().to_string());
+        let raw = RawFrame::new(String::from_utf8_lossy(&line).trim_end().to_string());
+        let Ok(v) = serde_json::from_slice::<Value>(&line) else {
             shared.emit(
                 AgentEventKind::Native {
                     name: "unparsed".into(),
@@ -473,26 +740,36 @@ async fn pump(
             );
             continue;
         };
-        let ty = f["type"].as_str().unwrap_or("").to_string();
-        match ty.as_str() {
-            "system" if f["subtype"] == "init" => {
+        let ty = v["type"].as_str().unwrap_or("").to_string();
+        let subtype = v["subtype"].as_str().map(str::to_string);
+        let f = Frame { v, raw };
+        match (ty.as_str(), subtype.as_deref()) {
+            ("system", Some("init")) => {
                 if let Some((failure, detail, raw)) = on_init(&shared, f) {
                     shared.refuse(failure, detail, raw).await;
                 }
             }
-            "stream_event" => on_stream_event(&shared, f),
-            "assistant" => on_assistant(&shared, f),
-            "user" => on_user(&shared, f),
-            "control_request" => on_control_request(&shared, &queue, f),
-            "control_cancel_request" => on_cancel(&shared, &queue, f),
-            "control_response" => on_control_response(&shared, f),
-            "result" => on_result(&shared, f),
-            other => {
-                let name = match f["subtype"].as_str() {
+            ("system", Some("task_started")) => on_task_started(&shared, f),
+            ("system", Some("task_progress")) => on_task_progress(&shared, f),
+            ("system", Some("task_notification")) => on_task_notification(&shared, f),
+            ("system", Some("task_updated")) => {
+                let (who, _) = who_of_task(&shared, &f.v);
+                let name = "system/task_updated".to_string();
+                shared.emit_as(who, AgentEventKind::Native { name }, Some(f.raw));
+            }
+            ("stream_event", _) => on_stream_event(&shared, f),
+            ("assistant", _) => on_assistant(&shared, f),
+            ("user", _) => on_user(&shared, f),
+            ("control_request", _) => on_control_request(&shared, &queue, f),
+            ("control_cancel_request", _) => on_cancel(&shared, &queue, f),
+            ("control_response", _) => on_control_response(&shared, f),
+            ("result", _) => on_result(&shared, f),
+            (other, subtype) => {
+                let name = match subtype {
                     Some(s) => format!("{other}/{s}"),
                     None => other.to_string(),
                 };
-                shared.emit(AgentEventKind::Native { name }, Some(f));
+                shared.emit(AgentEventKind::Native { name }, Some(f.raw));
             }
         }
     }
@@ -521,7 +798,7 @@ fn finish(shared: &Shared, queue: &MemoryInputQueue, exit: ExitInfo) {
     let mut open = open;
     if open.is_empty() && in_use {
         // The CLI refused the id before reading anything, so no prompt got through.
-        open.push_back(shared.take_turn());
+        open.push_back(shared.take_turn(false));
     }
     for t in open {
         let cause = t.stop.or(stopping);
@@ -668,6 +945,7 @@ pub async fn drive(
         signal,
         stderr: Mutex::new(String::new()),
         ended: watch::channel(false).0,
+        live: watch::channel(0).0,
         next_control: AtomicU64::new(1),
     });
     let queue = Arc::new(MemoryInputQueue::new(
@@ -715,13 +993,31 @@ impl Interrupt for ClaudeRun {
         // Subscribed before the frame goes out, so a fast terminal can't be missed.
         let events = shared.log.subscribe(EventSeq(0));
         let turn = self.begin_stop(StopCause::Interrupt);
+        let background = turn.is_none() && !shared.state().live_tasks.is_empty();
+        if background {
+            shared.cancel_pending(&self.queue, CancelReason::Interrupted);
+        }
         async move {
-            let Some(turn) = turn else {
-                return Ok(InterruptOutcome::Idle);
-            };
-            let id = shared.control_id("interrupt");
-            shared.write(&frames::interrupt(&id)).await?;
             let timeout = shared.options.interrupt_timeout;
+            let id = shared.control_id("interrupt");
+            let Some(turn) = turn else {
+                if !background {
+                    return Ok(InterruptOutcome::Idle);
+                }
+                // The CLI stops its tasks and sends no `result`: there's no turn to
+                // end, so what's waited on is the tasks.
+                let mut live = shared.live.subscribe();
+                shared.write(&frames::interrupt(&id)).await?;
+                let stopped = tokio::time::timeout(timeout, live.wait_for(|n| *n == 0))
+                    .await
+                    .is_ok_and(|r| r.is_ok());
+                if stopped {
+                    return Ok(InterruptOutcome::BackgroundStopped);
+                }
+                shared.force(StopCause::Force).await?;
+                return Ok(InterruptOutcome::Forced);
+            };
+            shared.write(&frames::interrupt(&id)).await?;
             if tokio::time::timeout(timeout, turn_ended(events, turn))
                 .await
                 .is_ok()
@@ -758,10 +1054,23 @@ impl Run for ClaudeRun {
                 }
                 g.next_turn += 1;
                 let id = TurnId(g.next_turn);
-                g.turns.push_back(OpenTurn { id, stop: None });
+                g.turns.push_back(OpenTurn {
+                    id,
+                    stop: None,
+                    origin: TurnOrigin::Prompt,
+                    began: false,
+                });
                 id
             };
-            shared.emit(AgentEventKind::TurnStarted { turn }, None);
+            let who = Attribution::turn(turn);
+            let origin = TurnOrigin::Prompt;
+            shared.emit_as(
+                who.clone(),
+                AgentEventKind::TurnStarted { turn, origin },
+                None,
+            );
+            let text = input.text.clone();
+            shared.emit_as(who, AgentEventKind::UserMessage { text }, None);
             shared.write(&frames::user(&input.text)).await?;
             Ok(turn)
         }
@@ -794,7 +1103,8 @@ impl Run for ClaudeRun {
                 shared.force(cause).await?;
                 return Ok(shared.report(cause, true));
             }
-            if open.is_some() {
+            let background = !shared.state().live_tasks.is_empty();
+            if open.is_some() || background {
                 let id = shared.control_id("interrupt");
                 // Losing this race to the process exiting is the same as stopping.
                 let _ = shared.write(&frames::interrupt(&id)).await;

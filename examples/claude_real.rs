@@ -20,7 +20,7 @@ use plexus_harness::{
     FailureKind, Harness, InputAnswer, InputError, InputFilter, InputKind, InputOutcome,
     InputRequest, InputState, InterruptOutcome, McpServer, McpTransport, ModelName, Run, RunSpec,
     SecretRef, SessionId, SessionMode, StopCause, StopMode, ThreadDisposition, ToolName,
-    ToolPolicy, TurnStatus, TurnTerminal, UserInput,
+    ToolPolicy, TurnOrigin, TurnStatus, TurnTerminal, UserInput,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -930,6 +930,159 @@ async fn config_dir(c: &mut Ctx) {
     l.close().await;
 }
 
+/// Reads a run to the end, allowing what `allow` passes and denying the rest, and
+/// closing input once `done` is true of what's been seen.
+async fn drain(
+    l: &mut Live,
+    allow: impl Fn(&InputRequest) -> bool,
+    done: impl Fn(&[AgentEvent]) -> bool,
+) -> Vec<AgentEvent> {
+    let mut events = l.run.events(EventSeq(0));
+    let mut all = Vec::new();
+    let mut closed = false;
+    while let Ok(Some(e)) = tokio::time::timeout(WAIT, events.next()).await {
+        if let AgentEventKind::InputRequested { id } = &e.kind {
+            let q = l.run.inputs().expect("queue");
+            let request = q.get(id).await.expect("request");
+            let answer = if allow(&request) {
+                InputAnswer::Allow {
+                    updated_input: None,
+                }
+            } else {
+                InputAnswer::Deny {
+                    message: "not this one".into(),
+                    stop_turn: false,
+                }
+            };
+            let _ = q.answer(id, answer).await;
+        }
+        all.push(e);
+        if !closed && done(&all) {
+            closed = true;
+            let _ = l.run.close_input().await;
+        }
+    }
+    all
+}
+
+fn subagent_tools(c: &Ctx) -> RunSpec {
+    RunSpec {
+        tools: tools(&["Agent", "Bash"], &[]),
+        ..c.spec()
+    }
+}
+
+async fn subagent_approval(c: &mut Ctx) {
+    let mut l = c.start(subagent_tools(c)).await;
+    l.send(
+        "Use your Agent tool once with run_in_background false, subagent_type general-purpose, \
+         description 'marker'. Prompt it: 'Run this exact Bash command, then reply done: \
+         touch subagent.marker'. Then reply with only the word finished.",
+    )
+    .await;
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = requests.clone();
+    let all = drain(
+        &mut l,
+        move |r| {
+            seen.lock().unwrap().push(r.clone());
+            matches!(&r.kind, InputKind::ToolApproval { tool, .. }
+                if tool.as_str() == "Bash" || tool.as_str() == "Agent")
+        },
+        |all| {
+            all.iter()
+                .any(|e| matches!(e.kind, AgentEventKind::TurnTerminal(_)))
+        },
+    )
+    .await;
+    let started: Vec<_> = all
+        .iter()
+        .filter_map(|e| match &e.kind {
+            AgentEventKind::SubagentStarted { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    let requests = requests.lock().unwrap().clone();
+    let theirs: Vec<_> = requests.iter().filter(|r| r.agent.is_some()).collect();
+    c.claim("a subagent started", !started.is_empty());
+    c.claim(
+        "the subagent's approval names it",
+        theirs
+            .iter()
+            .any(|r| started.contains(r.agent.as_ref().unwrap())),
+    );
+    c.claim("the tool ran", c.file("subagent.marker").exists());
+    c.claim(
+        "the input.requested event names it too",
+        all.iter()
+            .any(|e| matches!(e.kind, AgentEventKind::InputRequested { .. }) && e.agent.is_some()),
+    );
+    c.fact("requests", requests.len());
+}
+
+async fn background_self_started(c: &mut Ctx) {
+    let mut l = c.start(subagent_tools(c)).await;
+    l.send(
+        "Use your Agent tool once with run_in_background true, subagent_type general-purpose, \
+         description 'bg'. Prompt it: 'Reply with only the word pong'. Do not wait for it. \
+         Reply with only the word launched.",
+    )
+    .await;
+    let all = drain(
+        &mut l,
+        |r| matches!(&r.kind, InputKind::ToolApproval { tool, .. } if tool.as_str() == "Agent"),
+        |all| {
+            let self_started = all.iter().find_map(|e| match e.kind {
+                AgentEventKind::TurnStarted {
+                    turn,
+                    origin: TurnOrigin::TaskNotification,
+                } => Some(turn),
+                _ => None,
+            });
+            self_started.is_some_and(|t| {
+                all.iter()
+                    .any(|e| matches!(&e.kind, AgentEventKind::TurnTerminal(x) if x.turn == t))
+            })
+        },
+    )
+    .await;
+    let mut started = vec![];
+    let mut phantom = false;
+    let mut ended = vec![];
+    for e in &all {
+        match &e.kind {
+            AgentEventKind::TurnStarted { turn, origin } => started.push((*turn, *origin)),
+            AgentEventKind::TurnTerminal(t) => {
+                phantom |= !started.iter().any(|(s, _)| *s == t.turn);
+                ended.push(t.turn);
+            }
+            _ => {}
+        }
+    }
+    c.claim("no terminal lacks a start", !phantom);
+    c.claim(
+        "the self-started turn says so",
+        started
+            .iter()
+            .any(|(_, o)| *o == TurnOrigin::TaskNotification),
+    );
+    c.claim("the prompt's turn ended once", {
+        let first = started[0].0;
+        ended.iter().filter(|t| **t == first).count() == 1
+    });
+    c.claim(
+        "the subagent's frames are its own",
+        all.iter()
+            .filter(|e| {
+                e.raw
+                    .as_ref()
+                    .is_some_and(|r| r.as_str().contains("\"agent_id\""))
+            })
+            .all(|e| e.agent.is_some()),
+    );
+    c.fact("turns", started.len());
+}
+
 macro_rules! scenarios {
     ($($name:literal => $f:ident),+ $(,)?) => {
         const NAMES: &[&str] = &[$($name),+];
@@ -957,6 +1110,8 @@ scenarios! {
     "mcp-over-control-channel" => mcp,
     "minimum-env" => minimum_env,
     "config-dir-loses-login" => config_dir,
+    "subagent-approval" => subagent_approval,
+    "background-self-started" => background_self_started,
 }
 
 fn arg(args: &[String], flag: &str) -> Option<String> {

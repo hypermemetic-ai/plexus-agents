@@ -1,10 +1,11 @@
 //! AGENTS-10: the shared suite, against the Claude harness, replaying real sessions.
 
 use plexus_agents::{ClaudeHarness, SUPPORTED_CLI_VERSIONS};
-use plexus_harness::conformance::replay::{fixture_meta, fixtures_root, ReplayScript};
+use plexus_harness::conformance::replay::{fixture_meta, fixtures_root, ExitTrigger, ReplayScript};
 use plexus_harness::conformance::wire::agents3_script;
 use plexus_harness::conformance::{run_suite, Case, Subject};
 use plexus_harness::{Harness, ModelName, RunSpec};
+use std::path::Path;
 use std::sync::Arc;
 
 struct Claude;
@@ -20,6 +21,13 @@ impl Subject for Claude {
         }
     }
     fn script(&self, case: Case) -> Result<ReplayScript, String> {
+        if case == Case::Subagents {
+            // Two background subagents, three results for one prompt (AGENTS-34).
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/recorded/agents-34-2026-11-01/s2b-parallel-default");
+            let exit = ReplayScript::exit_from_rc(0);
+            return ReplayScript::load(&dir, "claude", exit, ExitTrigger::OnInputClose, 0);
+        }
         agents3_script(case)
     }
 }

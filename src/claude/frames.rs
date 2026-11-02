@@ -2,7 +2,7 @@
 
 use plexus_harness::{
     FailureKind, InputAnswer, InputKind, McpServer, McpTransport, Question, QuestionOption,
-    ResolvedSecret, TokenUsage, ToolName, ToolUseId,
+    ResolvedSecret, SubagentStatus, SubagentUsage, TokenUsage, ToolName, ToolUseId,
 };
 use serde_json::{json, Map, Value};
 
@@ -143,8 +143,27 @@ pub fn usage(result: &Value) -> Option<TokenUsage> {
         output: n("output_tokens"),
         cache_read: n("cache_read_input_tokens"),
         cache_write: n("cache_creation_input_tokens"),
-        cost_usd: result["total_cost_usd"].as_f64(),
+        cumulative_cost_usd: result["total_cost_usd"].as_f64(),
     })
+}
+
+pub fn subagent_usage(frame: &Value) -> SubagentUsage {
+    let u = &frame["usage"];
+    let n = |k: &str| u[k].as_u64().unwrap_or(0);
+    SubagentUsage {
+        total_tokens: n("total_tokens"),
+        tool_uses: n("tool_uses"),
+        duration_ms: n("duration_ms"),
+    }
+}
+
+pub fn subagent_status(frame: &Value) -> SubagentStatus {
+    match frame["status"].as_str() {
+        Some("completed") => SubagentStatus::Completed,
+        Some("stopped" | "killed") => SubagentStatus::Stopped,
+        Some("failed") => SubagentStatus::Failed,
+        _ => SubagentStatus::Unknown,
+    }
 }
 
 /// What a `result` frame's text says went wrong, where that decides the thread.

@@ -17,7 +17,7 @@ use std::sync::Arc;
 #[serde(tag = "wire", rename_all = "snake_case")]
 enum WireEvent {
     Capabilities { capabilities: Capabilities },
-    Agent { event: AgentEvent },
+    Agent { event: Box<AgentEvent> },
     Inputs { requests: Vec<InputRequest> },
 }
 
@@ -55,12 +55,16 @@ impl HarnessActivation {
         let event = AgentEvent {
             seq: EventSeq(1),
             at_ms: 0,
+            in_turn: None,
+            agent: None,
             kind: AgentEventKind::Native {
                 name: "shape".into(),
             },
             raw: None,
         };
-        stream::iter(vec![WireEvent::Agent { event }])
+        stream::iter(vec![WireEvent::Agent {
+            event: Box::new(event),
+        }])
     }
 
     /// Answers a request.
