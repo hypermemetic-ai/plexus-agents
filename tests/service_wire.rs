@@ -675,3 +675,47 @@ fn plexus_harness_has_no_plexus_crate_under_it() {
         .collect();
     assert!(plexus.is_empty(), "{plexus:?}");
 }
+
+/// The history (SUPERCONDUCTOR UI history): a page of finished items over the
+/// wire, its `last_seq` the thread's, a `title` and `last_activity` on the row,
+/// another user's thread refused, and `watch {settled}` taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn history_pages_a_thread_and_threads_carry_its_title() {
+    let s = service().await;
+    let ada = connect(s.port, &token(ADA, "ada")).await;
+    let thread = start(&ada).await;
+    until_pending(&ada).await;
+    let page = call(&ada, "agents.history", json!({"thread": thread})).await;
+    assert_eq!(page["type"], "history", "{page}");
+    let items = page["items"].as_array().unwrap();
+    assert!(items.iter().any(|i| i["item"] == "user"), "{page}");
+    assert!(items.iter().all(|i| i["kind"].is_null()), "items, not events");
+    let rows = call(&ada, "agents.threads", json!({"thread": thread})).await;
+    let row = &rows["threads"][0];
+    assert_eq!(row["last_seq"], page["last_seq"], "{row}");
+    assert_eq!(row["title"], "the recorded prompt", "{row}");
+    assert!(row["last_activity"].as_u64().unwrap() > 0, "{row}");
+
+    let one = call(&ada, "agents.history", json!({"thread": thread, "limit": 1})).await;
+    assert_eq!(one["items"].as_array().unwrap().len(), 1, "{one}");
+    let older = call(
+        &ada,
+        "agents.history",
+        json!({"thread": thread, "before": one["next_before"], "limit": 500}),
+    )
+    .await;
+    assert_eq!(older["next_before"], Value::Null, "the start: {older}");
+
+    let ben = connect(s.port, &token(BEN, "ben")).await;
+    let refused = call(&ben, "agents.history", json!({"thread": thread})).await;
+    assert_ne!(refused["type"], "history", "{refused}");
+
+    let mut settled = open(
+        &ada,
+        "agents.watch",
+        json!({"thread": thread, "since": 0, "settled": true}),
+    )
+    .await;
+    let item = settled.next().await.unwrap().unwrap();
+    assert_eq!(item["content"]["type"], "event", "{item}");
+}

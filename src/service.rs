@@ -17,8 +17,8 @@ use crate::hosts::{Hosts, HostsActivation};
 use crate::on::OnRouter;
 use crate::peer::Peer;
 use crate::runtime::{
-    GlobalSeq, InputRecord, ReadFilter, RuntimeError, StoredEvent, Supervisor, ThreadId,
-    ThreadOptions, ThreadView,
+    GlobalSeq, HistoryPage, InputRecord, ReadFilter, RuntimeError, StoredEvent, Supervisor,
+    ThreadId, ThreadOptions, ThreadView, DEFAULT_LIMIT,
 };
 use anyhow::Context;
 use futures::stream::{self, Stream, StreamExt};
@@ -98,6 +98,8 @@ pub enum AgentsEvent {
     Event {
         event: Box<StoredEvent>,
     },
+    /// A page of a thread's history: `agents.history`.
+    History(Box<HistoryPage>),
     Sent {
         thread: ThreadId,
         turn: TurnId,
@@ -320,13 +322,26 @@ impl AgentsActivation {
         since: Option<GlobalSeq>,
         /** include each event's raw frame; default false */
         raw: Option<bool>,
+        /** with a thread: leave out the deltas of messages already finished; default false */
+        settled: Option<bool>,
     ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
         let filter = ReadFilter {
             thread,
             without_raw: !raw.unwrap_or(false),
         };
-        let mut events = self.runtime.read(filter, since.unwrap_or_default());
+        let since = since.unwrap_or_default();
+        let read = if settled.unwrap_or(false) {
+            self.runtime.read_settled(filter, since)
+        } else {
+            Ok(self.runtime.read(filter, since))
+        };
+        let refused = read.as_ref().err().map(failed);
+        let mut events = read.unwrap_or_else(|_| futures::stream::empty().boxed());
         async_stream::stream! {
+            if let Some(refused) = refused {
+                yield refused;
+                return;
+            }
             while let Some(event) = events.next().await {
                 if !caller.stands() {
                     yield AgentsEvent::Ended;
@@ -337,6 +352,27 @@ impl AgentsActivation {
                 }
             }
         }
+    }
+
+    /// A page of a thread's history, finished items only: the newest page, or
+    /// the one before `before`; each oldest first. Then `watch {since: last_seq}`.
+    #[plexus_rpc::macros::method(target = "thread")]
+    pub async fn history(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the thread */
+        thread: ThreadId,
+        /** the page's `next_before`, for the page older than it; the newest if omitted */
+        before: Option<GlobalSeq>,
+        /** at most this many items; 50 if omitted, 500 at most */
+        limit: Option<u32>,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        if !caller.sees(&thread) {
+            return one(failed(RuntimeError::NoThread(thread)));
+        }
+        let limit = limit.map_or(DEFAULT_LIMIT, |l| l as usize);
+        let page = self.runtime.history(&thread, before, limit);
+        outcome(page.map(|p| AgentsEvent::History(Box::new(p))))
     }
 
     /// Sends a prompt, starting or resuming a process if there's none.

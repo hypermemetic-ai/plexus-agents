@@ -59,7 +59,7 @@
 //! component can't declare: its `uses` is a list of fixed method names, checked
 //! by the bus and linted at push, and a host's name is data. So the same calls
 //! are `hosts.<method>` with the host as a parameter, `host`: `hosts.threads`,
-//! `hosts.start`, `hosts.watch`, `hosts.send`, `hosts.interrupt`,
+//! `hosts.start`, `hosts.watch`, `hosts.history`, `hosts.send`, `hosts.interrupt`,
 //! `hosts.pending` and `hosts.answer`. Each is its owner's, and only its
 //! owner's, checked here as `agents.on.<host>` checks it, then goes out on the
 //! host's socket exactly as `agents.on.<host>.<method>` does: what the host
@@ -115,11 +115,12 @@ const WAITING_SINCE: &str = "host_waiting_since";
 /// Unpaired keys waiting at once, from anywhere.
 const MAX_WAITING: usize = 1024;
 /// What `agents.on.<host>.` reaches: a host's own `agents` surface.
-pub const HOST_METHODS: [&str; 11] = [
+pub const HOST_METHODS: [&str; 12] = [
     "start",
     "threads",
     "harnesses",
     "watch",
+    "history",
     "send",
     "interrupt",
     "stop",
@@ -1472,9 +1473,31 @@ impl HostsActivation {
         thread: Option<ThreadId>,
         /** the last sequence seen; from the start if omitted */
         since: Option<GlobalSeq>,
+        /** with a thread: leave out the deltas of messages already finished */
+        settled: Option<bool>,
     ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
-        let params = json!({ "thread": thread, "since": since });
+        let params = json!({ "thread": thread, "since": since, "settled": settled });
         self.forward(&caller, &host, "watch", params).await
+    }
+
+    /// A page of a thread's history on one of your hosts, read there:
+    /// `agents.history` there. A host older than it answers that it has no such
+    /// method; replay it with `hosts.watch` instead.
+    #[plexus_rpc::macros::method]
+    pub async fn history(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the host */
+        host: HostName,
+        /** the thread */
+        thread: ThreadId,
+        /** the page's `next_before`, for the page older than it; the newest if omitted */
+        before: Option<GlobalSeq>,
+        /** at most this many items; 50 if omitted */
+        limit: Option<u32>,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        let params = json!({ "thread": thread, "before": before, "limit": limit });
+        self.forward(&caller, &host, "history", params).await
     }
 
     /// Sends a prompt to a thread on one of your hosts: `agents.send` there.

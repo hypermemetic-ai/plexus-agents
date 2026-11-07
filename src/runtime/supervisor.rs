@@ -158,6 +158,13 @@ pub struct ThreadView {
     pub outcome_unknown: Vec<InputRequestId>,
     /// This thread's newest event: a `since` that picks up from here.
     pub last_seq: GlobalSeq,
+    /// Its first prompt, whitespace collapsed, cut to [`super::TITLE_CHARS`].
+    /// Kept as the thread advances. Missing from a host older than this field.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// When its newest event happened, Unix milliseconds. Kept as it advances.
+    #[serde(default)]
+    pub last_activity: Option<u64>,
 }
 
 /// What a restart found.
@@ -264,6 +271,8 @@ struct ThreadRow {
     parked: Option<ParkedRun>,
     /// What the next prompt has to carry: a stopped turn's answers.
     note: Option<String>,
+    title: Option<String>,
+    last_ms: Option<i64>,
 }
 
 struct Inner {
@@ -577,25 +586,28 @@ impl Inner {
     fn thread(&self, id: &ThreadId) -> Result<ThreadRow, RuntimeError> {
         let row = self.store.with(|c| {
             Ok(c.query_row(
-                "SELECT harness, spec, session, status, last_turn, started, parked, note
-                 FROM threads WHERE id = ?",
+                "SELECT harness, spec, session, status, last_turn, started, parked, note,
+                 title, last_ms FROM threads WHERE id = ?",
                 [id.as_str()],
                 |r| {
                     Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, Option<String>>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, i64>(4)?,
-                        r.get::<_, i64>(5)?,
-                        r.get::<_, Option<String>>(6)?,
-                        r.get::<_, Option<String>>(7)?,
+                        (
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, i64>(4)?,
+                            r.get::<_, i64>(5)?,
+                            r.get::<_, Option<String>>(6)?,
+                            r.get::<_, Option<String>>(7)?,
+                        ),
+                        (r.get::<_, Option<String>>(8)?, r.get::<_, Option<i64>>(9)?),
                     ))
                 },
             )
             .optional()?)
         })?;
-        let (harness, spec, session, status, last_turn, started, parked, note) =
+        let ((harness, spec, session, status, last_turn, started, parked, note), (title, last_ms)) =
             row.ok_or_else(|| RuntimeError::NoThread(id.clone()))?;
         Ok(ThreadRow {
             harness,
@@ -609,6 +621,8 @@ impl Inner {
                 .transpose()
                 .map_err(store_err)?,
             note,
+            title,
+            last_ms,
         })
     }
 
@@ -1494,6 +1508,34 @@ impl Supervisor {
         self.inner.store.read(filter, since)
     }
 
+    /// [`Self::read`] for a reader catching up on one thread: the deltas (and
+    /// native frames) of every message that had finished when it was asked are
+    /// left out, since its `message` event carries the whole text. What streams
+    /// after that point, and a reply still streaming, comes as ever.
+    pub fn read_settled(
+        &self,
+        filter: ReadFilter,
+        since: GlobalSeq,
+    ) -> Result<BoxStream<'static, StoredEvent>, RuntimeError> {
+        let settled = match &filter.thread {
+            Some(t) => self.inner.store.settled(t)?,
+            None => GlobalSeq(0),
+        };
+        Ok(self.inner.store.read_settled(filter, since, settled))
+    }
+
+    /// A page of a thread's history (see [`super::HistoryPage`]): the newest when
+    /// `before` is `None`, at most `limit` items.
+    pub fn history(
+        &self,
+        thread: &ThreadId,
+        before: Option<GlobalSeq>,
+        limit: usize,
+    ) -> Result<super::HistoryPage, RuntimeError> {
+        self.inner.thread(thread)?;
+        Ok(self.inner.store.history(thread, before, limit)?)
+    }
+
     /// A new thread. Nothing starts until its first prompt.
     pub fn create_thread(
         &self,
@@ -1808,6 +1850,8 @@ impl Supervisor {
             pending: select(Delivery::Pending),
             outcome_unknown: select(Delivery::OutcomeUnknown),
             last_seq,
+            title: row.title,
+            last_activity: row.last_ms.map(|ms| ms as u64),
         })
     }
 

@@ -8,10 +8,14 @@
 //! This is the layer below the `agents` activation (AGENTS-13), which adds no state
 //! of its own.
 
+mod history;
 mod store;
 mod supervisor;
 
-pub use store::{EventLog, ReadFilter, Store, StoreError, StoredEvent, Tx};
+pub use history::{
+    HistoryItem, HistoryPage, ItemBody, Resolution, ToolOutcome, DEFAULT_LIMIT, MAX_LIMIT,
+};
+pub use store::{EventLog, ReadFilter, Store, StoreError, StoredEvent, Tx, TITLE_CHARS};
 pub use supervisor::{
     Delivery, InputRecord, Recovery, RuntimeError, Supervisor, SupervisorConfig, ThreadHome,
     ThreadOptions, ThreadStatus, ThreadView,

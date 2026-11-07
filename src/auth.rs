@@ -38,9 +38,10 @@ pub const USER: &str = "user";
 pub const OWNER: &str = "owner";
 
 /// Every grant [`OWNER`] lists: what a thread's owner can do with it.
-pub const OWNER_GRANTS: [&str; 8] = [
+pub const OWNER_GRANTS: [&str; 9] = [
     "agents.threads",
     "agents.watch",
+    "agents.history",
     "agents.send",
     "agents.interrupt",
     "agents.stop",
@@ -55,7 +56,7 @@ pub const OWNER_GRANTS: [&str; 8] = [
 /// caller reaches: its own hosts, for a user with no other grant.
 /// SUPERCONDUCTOR-11: and a host's `agents` by a fixed name (`hosts.watch` with the
 /// host as a parameter, see [`crate::hosts`]), each checked for its owner inside.
-pub const HOST_USER_GRANTS: [&str; 13] = [
+pub const HOST_USER_GRANTS: [&str; 14] = [
     "hosts.pairing",
     "hosts.confirm",
     "hosts.unpair",
@@ -64,6 +65,7 @@ pub const HOST_USER_GRANTS: [&str; 13] = [
     "hosts.threads",
     "hosts.start",
     "hosts.watch",
+    "hosts.history",
     "hosts.send",
     "hosts.interrupt",
     "hosts.pending",

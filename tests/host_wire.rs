@@ -480,6 +480,13 @@ async fn a_run_starts_and_streams_over_the_socket_the_host_dialed() {
             break;
         }
     }
+    // The history is read at the host, by its name in the path and as a parameter.
+    let page = call(&ada, "agents.on.nat.history", json!({"thread": thread})).await;
+    assert_eq!(page["type"], "history", "{page}");
+    let by_name = call(&ada, "hosts.history", json!({"host": "nat", "thread": thread})).await;
+    assert_eq!(by_name["items"], page["items"], "{by_name}");
+    let rows = call(&ada, "hosts.threads", json!({"host": "nat", "thread": thread})).await;
+    assert_eq!(rows["threads"][0]["title"], "p", "{rows}");
     assert!(
         a.hosts.open_calls("nat") >= 1,
         "the watch is open at the host"
