@@ -114,6 +114,8 @@ fn env_list(name: &str) -> Vec<String> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Without a subscriber every tracing event (a refused sign-in among them) is dropped.
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_writer(std::io::stderr).try_init();
     if std::env::args().nth(1).as_deref() == Some("host") {
         return host().await;
     }

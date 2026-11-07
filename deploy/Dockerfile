@@ -9,7 +9,7 @@
 # (`git archive`, nothing of a working tree):
 #
 # pin plexus-harness 7f42216f8aa1868fc2969563d72b9fe9e36855a4
-# pin plexus-login b48bdac663d5928d9891bd3bdc287cc07a8222ae
+# pin plexus-login 5f37558b991c0bae8188ef20586e4752fcf19545
 #
 # (plexus-login by path too, for SUPERCONDUCTOR-25's allow list, until it is
 # published: Cargo.toml's [patch.crates-io].)

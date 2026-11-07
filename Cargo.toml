@@ -23,6 +23,8 @@ plexus-login = "0.3.1"
 plexus-ui-service = "0.2.1"
 plexus-webapp = "0.3.1"
 anyhow = "1"
+# Logs to stderr under RUST_LOG (plexus-login reports refused sign-ins there).
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-stream = "0.3"
 # The one public port: the page, the sign-in routes, and the socket in front.
 axum = { version = "0.8", features = ["ws"] }
