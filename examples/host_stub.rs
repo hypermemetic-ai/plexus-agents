@@ -3,7 +3,10 @@
 //! opens no port: it dials the service and serves its `agents` on that socket.
 //!
 //!     host_stub --server URL --name NAME --db FILE [--token-file F] [--key F]
-//!               [--pins DIR] [--margin-secs N]
+//!               [--pins DIR] [--margin-secs N] [--fixture DIR]
+//!
+//! `--fixture` replays another parked run laid out as restart-parked is
+//! (`svc1/`, `svc2/`): tests/ui_review_transcript.rs's scripted run.
 //!
 //! The pairing code and link go to stdout, as `plexus-agents host` prints them.
 
@@ -42,9 +45,11 @@ impl Environment for Sequence {
     }
 }
 
-fn parked_run() -> Sequence {
-    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("fixtures/recorded/agents-9-2026-11-01/restart-parked");
+fn parked_run(fixture: Option<PathBuf>) -> Sequence {
+    let dir = fixture.unwrap_or_else(|| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/recorded/agents-9-2026-11-01/restart-parked")
+    });
     let steps = [
         phase(dir.join("svc1"), true),
         phase(dir.join("svc2"), false),
@@ -71,7 +76,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(m) = value("--margin-secs") {
         config.margin = Duration::from_secs(m.parse()?);
     }
-    let env: Arc<dyn Environment> = Arc::new(parked_run());
+    let env: Arc<dyn Environment> = Arc::new(parked_run(value("--fixture").map(Into::into)));
     let harnesses: Vec<Arc<dyn Harness>> = vec![Arc::new(ClaudeHarness::default())];
     let (runtime, _) = Supervisor::open(SupervisorConfig {
         db: need("--db")?.into(),

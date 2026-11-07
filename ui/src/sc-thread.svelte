@@ -1,27 +1,48 @@
-<!-- SUPERCONDUCTOR-11: `#/h/:host/t/:thread` — a thread as a transcript
-     (SUPERCONDUCTOR-27's 4-6): your messages, the agent's text as it streams, each
-     tool call a one-line row that expands, a turn's calls folded into one summary
-     row once it ends, an approval card inline where the agent stopped, one status
-     for the thread, Stop whenever it runs, and the composer: a message sent while
-     it runs is queued (in this page) and goes when the turn ends.
+<!-- SC-31: `#/h/:host/t/:thread` — the thread's main section (the frame draws the
+     top bar and the nav): a thin header (the thread's title from its first
+     prompt, the host and folder in words, one status pill) and the transcript.
+     Transcript, not bubbles (SUPERCONDUCTOR-27): your prompt set apart, Claude's
+     prose through sc-text at a reading measure, each run of tool calls one
+     sentence (sc-toolrun), the approval card inline where Claude stopped
+     (sc-approval), a footer at each turn's end (sc-turnfoot), and the composer
+     (sc-composer) at the bottom. What the runtime says to Claude (a resume after
+     your answer, a restart) is a small system line, never a message of yours.
 
-     The transcript is a `live` collection keyed by `seq`: `hosts.watch` replays the
-     thread and follows it, each `event` an upsert. Its snapshot is
-     `hosts.threads { host, thread }`, which answers no row: plexus-ui's `live` has
-     no shape for a stream alone (a gap, in the report). Everything the agent says
-     is drawn as text, never HTML. -->
+     The transcript is a `live` collection keyed by `seq`: `hosts.watch` replays
+     the thread and follows it, each `event` an upsert, folded here in order.
+     Its snapshot `hosts.threads { host, thread }` answers no row (plexus-ui's
+     `live` has no shape for a stream alone); the folder comes from the same
+     method, called once. -->
 <script module>
-  export const uses = ["hosts.threads", "hosts.watch", "hosts.send", "hosts.interrupt", "hosts.pending"];
+  export const uses = ["hosts.threads", "hosts.watch", "hosts.pending"];
+
+  /** What the runtime told Claude, in the operator's words. */
+  function runtimeWords(text) {
+    if (/stopped while waiting for a decision/.test(text)) return "Picked up again with your answer.";
+    if (/isn't known whether it ran/.test(text)) return "Picked up again. An earlier command may or may not have run; Claude was told to check.";
+    if (/did finish/.test(text)) return "Picked up again after a restart.";
+    return "Picked up again.";
+  }
+
+  const OUTCOME = { allowed: "You allowed", denied: "You denied", answered: "You answered", refused: "Refused" };
+  /** What an answered request was for: its command, its file, or its tool. */
+  function askedFor(rec) {
+    const k = rec?.request?.kind ?? {};
+    return k.input?.command ?? k.input?.file_path ?? k.tool ?? k.name ?? "";
+  }
 </script>
 
 <script>
   import { untrack } from "svelte";
   import { bus, live } from "plexus-ui/host";
-  import Top from "./sc-top.svelte";
-  import Nav from "./sc-nav.svelte";
   import Pill from "./sc-pill.svelte";
-  import Tool from "./sc-tool.svelte";
+  import Text from "./sc-text.svelte";
+  import ToolRun from "./sc-toolrun.svelte";
+  import TurnFoot from "./sc-turnfoot.svelte";
   import Approval from "./sc-approval.svelte";
+  import Composer from "./sc-composer.svelte";
+  import Empty from "./sc-empty.svelte";
+  import { editOf } from "./sc-diff.svelte";
 
   let { host, thread } = $props();
   const b = bus();
@@ -34,55 +55,141 @@
     on: { event: "upsert:event" },
   });
 
+  // The thread's folder, once.
+  let folder = $state("");
+  $effect(() => {
+    const h = host, t = thread;
+    untrack(async () => {
+      const r = await b.call("hosts.threads", { host: h, thread: t });
+      const v = (r.events ?? []).find((e) => e.type === "threads")?.threads?.find((x) => x.id === t);
+      if (v?.cwd) folder = v.cwd;
+    });
+  });
+
   // The transcript, folded from the events in order.
   let items = $state([]);
   let running = $state(false);
+  let thinking = $state(false);
   let failed = $state(false);
-  let meta = $state("");
-  let asks = $state({});           // request id → its pending record
-  let unresolved = new Set();
+  let asks = $state({});           // request id → its pending record, while it waits
+  let unresolved = $state(new Set());
   let seen = 0;
-  let turn = 0;
   let reply = null;
-  let tools = new Map();
-  let opened = $state({});          // a folded turn's key → expanded
+  let tools = new Map();           // tool_use id → its call (state)
+  let turns = new Map();           // turn id → { start, waited, waitFrom, calls }
+  let asked = new Map();           // request id → its "ask" item (state)
+  let helpers = new Set();         // the top-level helpers started
 
   function reset() {
-    items = []; running = false; failed = false; meta = ""; asks = {};
-    unresolved = new Set(); seen = 0; turn = 0; reply = null; tools = new Map();
+    items = []; running = false; thinking = false; failed = false; asks = {}; unresolved = new Set();
+    seen = 0; reply = null; tools = new Map(); turns = new Map(); asked = new Map(); helpers = new Set();
   }
   function push(item) { items.push(item); return items[items.length - 1]; }
+  function note(text, tone = "quiet") { reply = null; return push({ type: "note", key: "n" + seen, text, tone }); }
+  function turnOf(ev) {
+    const id = ev.turn ?? ev.in_turn ?? "-";
+    if (!turns.has(id)) turns.set(id, { start: ev.at_ms ?? 0, waited: 0, waitFrom: null, calls: [] });
+    return turns.get(id);
+  }
+
   function fold(row) {
     if (row.seq <= seen) return;
     seen = row.seq;
     const ev = row.event ?? {};
+    // A helper's own steps stay in the helper; only its start and end are drawn.
+    if (ev.agent && !/^subagent\./.test(ev.kind)) return;
     switch (ev.kind) {
-      case "turn.started": turn += 1; running = true; failed = false; reply = null; break;
-      case "user.message": push({ type: "user", text: ev.text ?? "", turn }); reply = null; break;
-      case "session.started": meta = [ev.model, ev.harness_version && "Claude " + ev.harness_version].filter(Boolean).join(" · "); break;
+      case "turn.started": turnOf(ev); running = true; failed = false; reply = null; break;
+      case "user.message": {
+        const text = ev.text ?? "";
+        if (/^\[runtime\]/.test(text)) note(runtimeWords(text));
+        else push({ type: "user", key: "u" + seen, text });
+        reply = null;
+        break;
+      }
+      case "thinking.delta": thinking = true; break;
       case "text.delta":
-        if (!reply) reply = push({ type: "agent", text: "", turn });
+        thinking = false;
+        if (!reply) reply = push({ type: "agent", key: "t" + seen, text: "" });
         reply.text += ev.text ?? "";
         break;
       case "message":
-        if (reply) reply.text = ev.text ?? reply.text; else push({ type: "agent", text: ev.text ?? "", turn });
+        thinking = false;
+        if (reply) reply.text = ev.text ?? reply.text;
+        else if (ev.text) push({ type: "agent", key: "t" + seen, text: ev.text });
         reply = null;
         break;
-      case "tool.call": tools.set(ev.id, push({ type: "tool", id: ev.id, name: ev.name, input: ev.input, output: null, is_error: false, done: false, turn })); reply = null; break;
-      case "tool.result": { const t = tools.get(ev.id); if (t) { t.output = ev.output; t.is_error = !!ev.is_error; t.done = true; } break; }
-      case "input.requested": unresolved.add(ev.id); break;
-      case "input.resolved": unresolved.delete(ev.id); delete asks[ev.id]; break;
-      case "turn.parked": push({ type: "note", text: "Waiting for your answer; the process is parked.", turn }); break;
-      case "turn.terminal": {
-        running = false; reply = null;
-        const st = ev.status && typeof ev.status === "object" ? ev.status : { status: ev.status };
-        push({ type: "end", turn, status: st.status, text: st.status === "interrupted" ? "Stopped." : st.status && st.status !== "completed" ? `The turn failed: ${st.failure ?? st.status}${st.detail ? " · " + st.detail : ""}` : "" });
-        failed = !!st.status && st.status !== "completed" && st.status !== "interrupted";
+      case "tool.call": {
+        thinking = false;
+        reply = null;
+        const last = items[items.length - 1];
+        const run = last?.type === "run" ? last : push({ type: "run", key: "r" + seen, calls: [] });
+        // A call the park stopped is made again on resume: the first goes.
+        for (const c of tools.values()) {
+          if (c.parked && !c.hidden && c.name === ev.name && JSON.stringify(c.input) === JSON.stringify(ev.input)) c.hidden = true;
+        }
+        run.calls.push({ id: ev.id, name: ev.name, input: ev.input, output: null, is_error: false, done: false, parked: false, hidden: false });
+        const call = run.calls[run.calls.length - 1];
+        tools.set(ev.id, call);
+        turnOf(ev).calls.push(call);
         break;
       }
-      case "run.ended": running = false; break;
+      case "tool.result": {
+        const c = tools.get(ev.id);
+        if (c) { c.output = ev.output; c.is_error = !!ev.is_error; c.done = true; }
+        break;
+      }
+      case "input.requested": {
+        unresolved.add(ev.id); unresolved = new Set(unresolved);
+        const t = turnOf(ev); t.waitFrom = ev.at_ms ?? null;
+        reply = null;
+        asked.set(ev.id, push({ type: "ask", key: "a" + ev.id, id: ev.id, outcome: null, record: null }));
+        break;
+      }
+      case "input.resolved": {
+        unresolved.delete(ev.id); unresolved = new Set(unresolved);
+        const t = turnOf(ev);
+        if (t.waitFrom != null && ev.at_ms) { t.waited += ev.at_ms - t.waitFrom; t.waitFrom = null; }
+        const a = asked.get(ev.id);
+        if (a) { a.outcome = typeof ev.outcome === "string" ? ev.outcome : "cancelled"; a.record = asks[ev.id] ?? a.record; }
+        delete asks[ev.id];
+        break;
+      }
+      case "input.outcome_unknown": note("An answer reached Claude but the result was lost in a restart. The tool may or may not have run.", "warn"); break;
+      case "turn.parked":
+        for (const id of ev.calls ?? []) { const c = tools.get(id); if (c && !c.done) c.parked = true; }
+        break;
+      case "subagent.started": if (!ev.parent && !ev.resumed) { helpers.add(ev.id); note(`Started a helper: ${ev.description}`); } break;
+      case "subagent.ended": if (helpers.has(ev.id)) note(ev.status === "failed" ? "A helper failed." : "A helper finished."); break;
+      case "task.started": note(`Started in the background: ${ev.description}`); break;
+      case "task.ended": note(ev.status === "failed" ? "A background task failed." : "A background task finished."); break;
+      case "turn.terminal": {
+        running = false; thinking = false; reply = null;
+        const st = ev.status && typeof ev.status === "object" ? ev.status : { status: ev.status };
+        const t = turnOf(ev);
+        const edits = new Map();
+        for (const c of t.calls) {
+          if (c.hidden || (c.done && c.is_error)) continue;
+          const e = editOf(c.name, c.input);
+          if (!e) continue;
+          const f = edits.get(e.path) ?? { add: 0, del: 0 };
+          f.add += e.add; f.del += e.del; edits.set(e.path, f);
+        }
+        let add = 0, del = 0;
+        for (const f of edits.values()) { add += f.add; del += f.del; }
+        // Calls the turn ended under never finish: they stop being live.
+        for (const c of t.calls) if (!c.done) { c.done = true; c.is_error = st.status !== "completed"; }
+        push({
+          type: "foot", key: "f" + seen, status: st.status ?? "completed", failure: st.failure, detail: st.detail,
+          stopped_by: ev.stopped_by, ms: Math.max(0, (ev.at_ms ?? t.start) - t.start - t.waited), files: edits.size, add, del,
+        });
+        failed = st.status === "failed";
+        break;
+      }
+      case "run.ended": running = false; thinking = false; break;
     }
   }
+
   let asking = false;
   async function ask() {
     const missing = [...unresolved].filter((id) => !asks[id]);
@@ -92,165 +199,157 @@
     asking = false;
     const ev = (r.events ?? []).find((e) => e.type === "pending");
     for (const rec of ev?.requests ?? []) {
-      if (rec.thread === thread && unresolved.has(rec.request?.id)) asks[rec.request.id] = rec;
+      if (rec.thread === thread && unresolved.has(rec.request?.id)) {
+        asks[rec.request.id] = rec;
+        const a = asked.get(rec.request.id);
+        if (a) a.record = rec;
+      }
     }
   }
 
-  // The collection, as it moves: a whole answer rebuilds, an upsert folds on.
-  // Untracked: the fold writes the state this effect would otherwise read.
-  $effect(() => untrack(() => {
-    return log.subscribe((value, change) => {
-      const whole = !change || change.replace;
-      if (whole) reset();
-      const rows = whole ? value.rows : (change.upsert ?? []);
-      const stick = atEnd();
-      for (const row of [...rows].sort((a, b) => a.seq - b.seq)) fold(row);
-      ask();
-      if (stick) follow();
-      flush();
-    });
-  }));
+  $effect(() => untrack(() => log.subscribe((value, change) => {
+    const whole = !change || change.replace;
+    if (whole) reset();
+    const rows = whole ? value.rows : (change.upsert ?? []);
+    for (const row of [...rows].sort((x, y) => x.seq - y.seq)) fold(row);
+    ask();
+  })));
 
-  // Turns that ended fold their tool calls into one summary row.
-  const ended = $derived(new Set(items.filter((i) => i.type === "end").map((i) => i.turn)));
-  const blocks = $derived.by(() => {
-    const out = [];
-    for (const i of items) {
-      const last = out[out.length - 1];
-      if (i.type === "tool" && ended.has(i.turn)) {
-        if (last?.type === "tools" && last.turn === i.turn) last.calls.push(i);
-        else out.push({ type: "tools", turn: i.turn, key: "g" + i.id, calls: [i] });
-      } else out.push(i);
-    }
-    return out;
+  const status = $derived(unresolved.size ? "needs" : running ? "working" : failed ? "failed" : "idle");
+  const title = $derived.by(() => {
+    const first = items.find((i) => i.type === "user")?.text ?? "";
+    const line = first.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
+    return line.length > 90 ? line.slice(0, 88).trimEnd() + "…" : line;
   });
-  const status = $derived(Object.keys(asks).length || unresolved.size ? "needs" : running ? "working" : failed ? "failed" : "idle");
+  const place = $derived(folder ? folder.replace(/^\/(Users|home)\/[^/]+/, "~") : "");
+  // The live line: what Claude is doing when nothing else on the page shows it.
+  const last = $derived(items[items.length - 1]);
+  const busyLine = $derived(
+    status !== "working" ? ""
+    : thinking ? "Thinking"
+    : last?.type === "run" && last.calls.some((c) => !c.done && !c.hidden) ? ""
+    : last?.type === "agent" ? ""
+    : "Working",
+  );
 
-  // The composer.
-  let text = $state("");
-  let queued = $state([]);
-  let error = $state("");
-  async function send(prompt) {
-    error = "";
-    const r = await b.call("hosts.send", { host, thread, prompt });
-    const f = (r.events ?? []).find((e) => e.type === "failed");
-    if (!r.ok || f) { error = f ? f.message : (r.message ?? "not sent"); return false; }
-    return true;
-  }
-  async function submit(ev) {
-    ev?.preventDefault();
-    const prompt = text.trim();
-    if (!prompt) return;
-    text = "";
-    if (running) queued.push(prompt);
-    else if (!(await send(prompt))) text = prompt;
-  }
-  async function flush() {
-    if (running || !queued.length || log.status !== "live") return;
-    const next = queued.shift();
-    if (!(await send(next))) queued.unshift(next);
-  }
-  function keydown(ev) {
-    if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); submit(); }
-  }
-  async function stop() {
-    const r = await b.call("hosts.interrupt", { host, thread });
-    const f = (r.events ?? []).find((e) => e.type === "failed");
-    if (!r.ok || f) error = f ? f.message : (r.message ?? "not stopped");
-  }
-  b.keys({ escape: { to: () => { if (running) stop(); }, label: "stop the turn", in_inputs: true } });
-
-  // Follow the end while it's in view; else offer to jump there.
-  let scroller = $state(null);
+  // Follow the end while the reader is there; when they scroll up, stop, and offer the way back.
+  let root = $state(null);
   let behind = $state(false);
-  function atEnd() { return !scroller || scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80; }
-  function follow() { requestAnimationFrame(() => { if (scroller) scroller.scrollTop = scroller.scrollHeight; behind = false; }); }
-  function scrolled() { behind = !atEnd(); }
+  function scroller() {
+    for (let p = root?.parentElement; p; p = p.parentElement) {
+      const o = getComputedStyle(p).overflowY;
+      if ((o === "auto" || o === "scroll") && p.scrollHeight > p.clientHeight) return p;
+    }
+    return document.scrollingElement ?? document.documentElement;
+  }
+  function atEnd() {
+    if (!root) return true;
+    const s = scroller();
+    return s.scrollHeight - s.scrollTop - s.clientHeight < 96;
+  }
+  let stuck = true;                // the reader is at the end: growth follows them there
+  function follow() {
+    stuck = true;
+    requestAnimationFrame(() => { const s = scroller(); s.scrollTop = s.scrollHeight; behind = false; });
+  }
+  $effect(() => {
+    if (!root) return;
+    const on = () => { stuck = atEnd(); behind = !stuck; };
+    addEventListener("scroll", on, { capture: true, passive: true });
+    const grew = new ResizeObserver(() => { if (stuck) follow(); else behind = true; });
+    grew.observe(root);
+    return () => { removeEventListener("scroll", on, { capture: true }); grew.disconnect(); };
+  });
 </script>
 
-<div class="page">
-  <Top/>
-  <div class="body">
-    <Nav/>
-    <main>
-      <div class="bar">
-        <a href={`#/h/${encodeURIComponent(host)}`}>{host}</a><span class="muted">›</span>
-        <code title={thread}>{String(thread).slice(0, 8)}</code>
-        <Pill {status}/>
-        <span class="muted meta">{meta}</span>
-        {#if log.status !== "live" && log.status !== "pending"}<span class="error">{log.message ?? log.status}</span>{/if}
-      </div>
-      <div class="log" bind:this={scroller} onscroll={scrolled}>
-        {#each blocks as blk (blk.key ?? blk)}
-          {#if blk.type === "user"}
-            <div class="user">{blk.text}</div>
-          {:else if blk.type === "agent"}
-            <div class="agent">{blk.text}</div>
-          {:else if blk.type === "tool"}
-            <Tool call={blk}/>
-          {:else if blk.type === "tools"}
-            <div class="group">
-              <button class="summary" type="button" onclick={() => (opened[blk.key] = !opened[blk.key])} aria-expanded={!!opened[blk.key]}>
-                {opened[blk.key] ? "▾" : "▸"} {blk.calls.length} tool call{blk.calls.length === 1 ? "" : "s"}{blk.calls.some((c) => c.is_error) ? ", " + blk.calls.filter((c) => c.is_error).length + " failed" : ""}
-              </button>
-              {#if opened[blk.key]}{#each blk.calls as c (c.id)}<Tool call={c}/>{/each}{/if}
-            </div>
-          {:else if blk.type === "note"}
-            <div class="note">{blk.text}</div>
-          {:else if blk.type === "end" && blk.text}
-            <div class="note" data-status={blk.status}>{blk.text}</div>
-          {/if}
-        {/each}
-        {#each Object.values(asks) as rec (rec.request.id)}
-          <Approval {host} {thread} record={rec}/>
-        {/each}
-        {#if log.status === "pending"}<p class="muted">…</p>{/if}
-      </div>
-      {#if behind}<button class="jump" type="button" onclick={follow}>Jump to latest ↓</button>{/if}
-      <div class="composer">
-        {#if running}
-          <div class="strip"><span>Working…</span><button class="stop" type="button" onclick={stop}>■ Stop</button></div>
+<div class="sc-thread" bind:this={root}>
+  <header class="head">
+    <div class="titles">
+      <h1 class="title">{title || "New thread"}</h1>
+      <p class="where">On <a href={`#/h/${encodeURIComponent(host)}`}>{host}</a>{#if place}, in <span class="folder" title={folder}>{place}</span>{/if}</p>
+    </div>
+    <Pill {status}/>
+  </header>
+
+  <div class="log" aria-live="polite">
+    {#if log.status === "error" || log.status === "refused" || log.status === "closed"}
+      <Empty title="This thread can't be shown right now." body={`${log.message ?? "The host didn't answer."} Check that ${host} is online, then reload.`}/>
+    {:else if log.status === "pending" && !items.length}
+      <p class="quiet">Loading the conversation…</p>
+    {/if}
+    {#each items as it (it.key)}
+      {#if it.type === "user"}
+        <section class="user" aria-label="Your message"><Text text={it.text}/></section>
+      {:else if it.type === "agent"}
+        <div class="agent"><Text text={it.text}/></div>
+      {:else if it.type === "run"}
+        <div class="run"><ToolRun calls={it.calls} {folder}/></div>
+      {:else if it.type === "ask"}
+        {#if !it.outcome && asks[it.id]}
+          <div class="ask"><Approval {host} {thread} record={asks[it.id]}/></div>
+        {:else if !it.outcome}
+          <p class="note" data-tone="needs">Claude is waiting for your answer. Loading the request…</p>
+        {:else if it.record}
+          <p class="note" data-tone="answer">{OUTCOME[it.outcome] ?? "Withdrawn"}{#if askedFor(it.record)}&nbsp;<code>{askedFor(it.record)}</code>{/if}</p>
         {/if}
-        {#each queued as q, n (n + q)}
-          <div class="queued"><span class="muted">Queued:</span> <span class="q">{q}</span> <button class="x" type="button" aria-label="take it back" onclick={() => queued.splice(n, 1)}>✕</button></div>
-        {/each}
-        <form onsubmit={submit}>
-          <textarea rows="2" value={text} oninput={(e) => (text = e.currentTarget.value)} onkeydown={keydown} placeholder={running ? "Queue a follow-up… (Enter)" : "Reply… (Enter sends, Shift+Enter for a new line)"}></textarea>
-          <button class="primary" type="submit">{running ? "Queue" : "Send"}</button>
-        </form>
-        {#if error}<p class="error">{error}</p>{/if}
-      </div>
-    </main>
+      {:else if it.type === "note"}
+        <p class="note" data-tone={it.tone}>{it.text}</p>
+      {:else if it.type === "foot"}
+        <TurnFoot foot={it} {host}/>
+      {/if}
+    {/each}
+    {#if busyLine}<p class="busy"><span class="dot" aria-hidden="true"></span>{busyLine}</p>{/if}
+    {#if !items.length && log.status === "live"}
+      <Empty title="Nothing here yet." body="Send Claude a message below to start."/>
+    {/if}
+  </div>
+
+  <div class="dock">
+    {#if behind}<button class="jump" type="button" onclick={follow}>Jump to latest</button>{/if}
+    <Composer {host} {thread} {status}/>
   </div>
 </div>
 
 <style>
-  .page { display: grid; grid-template-rows: auto 1fr; height: 100vh; }
-  .body { display: flex; min-height: 0; }
-  main { position: relative; flex: 1; display: grid; grid-template-rows: auto 1fr auto; min-width: 0; }
-  .bar { display: flex; align-items: center; gap: 8px; padding: 8px 20px; border-bottom: var(--border) solid var(--line); background: var(--panel); flex-wrap: wrap; }
-  .meta { margin-left: auto; font-size: 12px; }
-  .log { overflow-y: auto; padding: 16px 20px 24px; min-height: 0; }
-  .user { margin: 14px 0 8px; padding: 8px 12px; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--sel); border-left: 3px solid var(--accent); border-radius: var(--radius); }
-  .agent { margin: 6px 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; }
-  .group { margin: 2px 0; }
-  .summary { padding: 2px 6px; color: var(--muted); font: 12px/1.6 var(--font-text); background: none; border: none; border-radius: var(--radius); cursor: pointer; }
-  .summary:hover { background: var(--hover); color: var(--ink); }
-  .note { margin: 6px 0; color: var(--muted); font-size: 12px; }
-  .note[data-status=failed] { color: var(--warn); }
-  .jump { position: absolute; right: 24px; bottom: 120px; padding: 4px 12px; background: var(--card); border: var(--border) solid var(--line); border-radius: var(--radius-pill); cursor: pointer; }
-  .composer { padding: 10px 20px 14px; border-top: var(--border) solid var(--line); background: var(--panel); }
-  .strip { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; color: var(--st-working-fg); }
-  .stop { margin-left: auto; padding: 4px 12px; color: var(--warn); background: var(--card); border: var(--border) solid var(--warn); border-radius: var(--radius); cursor: pointer; }
-  .queued { display: flex; gap: 6px; align-items: baseline; margin-bottom: 6px; padding: 4px 8px; background: var(--card); border: var(--border) dashed var(--line); border-radius: var(--radius); }
-  .q { flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .x { background: none; border: none; color: var(--muted); cursor: pointer; }
-  form { display: flex; gap: 8px; align-items: flex-end; }
-  textarea { flex: 1; padding: 8px 10px; color: var(--ink); background: var(--bg); border: var(--border) solid var(--line); border-radius: var(--radius); resize: vertical; }
-  textarea:focus-visible { outline: none; border-color: var(--focus); }
-  .primary { padding: 8px 16px; color: var(--on-accent); background: var(--accent); border: none; border-radius: var(--radius); cursor: pointer; }
-  code { font-family: var(--font-text); font-size: 12px; }
-  .muted { color: var(--muted); }
-  .error { color: var(--warn); font-size: 12px; }
-  @media (max-width: 700px) { .body :global(.sc-nav) { display: none; } .log, .composer, .bar { padding-left: 12px; padding-right: 12px; } }
+  .sc-thread { display: flex; flex-direction: column; min-height: 100%; min-width: 0; }
+  .head { display: flex; align-items: flex-start; gap: var(--s3); padding: var(--s4) var(--s5) var(--s3); border-bottom: 1px solid var(--line); }
+  .head, .log, .dock > :global(*) { box-sizing: border-box; }
+  .titles { flex: 1; min-width: 0; }
+  .title { display: -webkit-box; margin: 0; overflow: hidden; font-size: 17px; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .where { margin: 2px 0 0; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+  .where a { color: inherit; text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
+  .where a:hover { color: var(--ink); }
+  .folder { font-family: var(--font-mono); font-size: 12.5px; color: var(--ink); }
+  .head :global(.pill) { margin-top: 3px; flex: none; }
+
+  .log { flex: 1; width: 100%; max-width: calc(72ch + 2 * var(--s5)); padding: var(--s4) var(--s5) var(--s6); }
+  .user { margin: var(--s5) 0 var(--s4); padding: var(--s3) var(--s4); background: var(--sel); border-radius: var(--radius-md); }
+  .user:first-child { margin-top: var(--s2); }
+  .agent { margin: var(--s3) 0; max-width: 72ch; }
+  .run { margin: var(--s1) 0; }
+  .ask { margin: var(--s3) 0; }
+  .note { margin: var(--s2) 0; padding-left: var(--s3); color: var(--muted); font-size: 12.5px; border-left: 2px solid var(--line); overflow-wrap: anywhere; }
+  .note[data-tone=warn] { color: var(--st-failed-fg); border-left-color: var(--st-failed-fg); }
+  .note[data-tone=needs] { color: var(--st-needs-fg); border-left-color: var(--st-needs-fg); }
+  .note code { font-family: var(--font-mono); font-size: 12px; color: var(--ink); overflow-wrap: anywhere; }
+  .note[data-tone=answer] { border-left-color: var(--st-needs-fg); }
+  .quiet { color: var(--muted); }
+  .busy { display: flex; align-items: center; gap: var(--s2); margin: var(--s3) 0; color: var(--st-working-fg); font-size: 13px; }
+  .dot { width: 7px; height: 7px; border-radius: var(--radius-pill); background: var(--st-working-fg); animation: beat 1.2s ease-out infinite alternate; }
+
+  .dock { position: sticky; bottom: 0; z-index: 1; padding: var(--s3) var(--s5) var(--s4); background: var(--bg); border-top: 1px solid var(--line); }
+  .dock > :global(:not(.jump)) { max-width: 72ch; }
+  .jump { position: absolute; left: min(50%, calc(var(--s5) + 36ch)); bottom: calc(100% + var(--s3)); transform: translateX(-50%); min-height: 36px; padding: 0 var(--s4); color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-pill); cursor: pointer; }
+  .jump:hover { background: var(--hover); }
+  .jump:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+  @keyframes beat { from { opacity: 1; } to { opacity: .35; } }
+  @media (prefers-reduced-motion: reduce) { .dot { animation: none; } }
+  @media (max-width: 719px) {
+    .head { padding: var(--s3) var(--s4); }
+    .log { padding: var(--s3) var(--s4) var(--s5); }
+    .dock { padding: var(--s2) var(--s4) calc(var(--s3) + env(safe-area-inset-bottom)); }
+    .user { padding: var(--s3); }
+    .jump { min-height: 44px; }
+  }
 </style>
