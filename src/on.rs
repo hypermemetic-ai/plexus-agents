@@ -324,7 +324,15 @@ impl ChildRouter for OnTarget {
             if hosts.owner_of(&self.name).as_deref() != Some(principal.as_str()) {
                 return Err(crate::hosts::not_yours(&self.name));
             }
-            if is_service(&principal) {
+            // A service's own key goes no further. A person signed in by key
+            // (SUPERCONDUCTOR-19: `--admin key:<hex>` where there's no WorkOS)
+            // owns the hosts it confirmed, and reaches them.
+            let agent = auth.and_then(|a| a.get_metadata_string("agent"));
+            let from_service = matches!(
+                agent.as_deref(),
+                Some("plexus-agents" | crate::hosts::HOST_AGENT)
+            );
+            if is_service(&principal) && from_service {
                 return Ok(depth_refused(&self.name));
             }
             return Ok(hosts.call(&self.name, method, params, principal).await);

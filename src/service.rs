@@ -478,6 +478,31 @@ pub fn hub_with_hosts(
     Arc::new(hub.register(agents))
 }
 
+/// [`hub_with_hosts`], with `auth.*` mounted over `backend` (SUPERCONDUCTOR-19):
+/// sign-in, `whoami`, `login {browser}` for `synapse _login`. The auth activation's
+/// gate is built from the same rules as [`auth::gate_with_hosts`].
+pub fn hub_with_login(
+    runtime: Supervisor,
+    harnesses: Vec<Arc<dyn Harness>>,
+    grants: Vec<Grant>,
+    peers: Vec<Arc<Peer>>,
+    hosts: Option<Arc<Hosts>>,
+    backend: Arc<dyn plexus_core::plexus::AuthBackend>,
+) -> Arc<DynamicHub> {
+    let names: Vec<String> = peers.iter().map(|p| p.name().to_string()).collect();
+    let store = hosts.as_ref().map(|h| h.store());
+    let gate = auth::gate_with_hosts(&runtime, names.clone(), grants.clone(), store.clone());
+    let setup = auth::auth_setup(&runtime, names.clone(), grants, store, backend);
+    let mut agents = AgentsActivation::new(runtime.clone(), harnesses, gate, peers);
+    let mut hub = DynamicHub::new("plexus-agents");
+    if let Some(hosts) = hosts {
+        hosts.reserve(names.into_iter().chain(runtime.placements()));
+        agents = agents.with_hosts(hosts.clone());
+        hub = hub.register(HostsActivation::new(hosts));
+    }
+    Arc::new(hub.register(agents).with_auth(setup))
+}
+
 /// Where tokens come from.
 #[derive(Debug, Clone)]
 pub struct TokenIssuer {

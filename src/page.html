@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>plexus-agents</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1b1b1b; --bg: #fafafa; --muted: #6b6b6b; --line: #ddd; --accent: #2457d6; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #eee; --bg: #151515; --muted: #9a9a9a; --line: #333; --accent: #7aa2ff; } }
+  body { font: 15px/1.5 system-ui, sans-serif; color: var(--fg); background: var(--bg); margin: 0; }
+  main { max-width: 34rem; margin: 0 auto; padding: 1.5rem 1rem; }
+  header { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+  h1 { font-size: 1.1rem; margin: 0; }
+  .who { color: var(--muted); font-size: .9rem; overflow-wrap: anywhere; }
+  table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+  td { padding: .4rem .2rem; border-bottom: 1px solid var(--line); }
+  .on { color: #1a8f3c; } .off { color: var(--muted); }
+  .code { font: 600 2rem/1.2 ui-monospace, monospace; letter-spacing: .1em; margin: .5rem 0 1rem; }
+  button, input { font: inherit; padding: .4rem .8rem; }
+  button.primary { background: var(--accent); color: #fff; border: 0; border-radius: 4px; }
+  .error { color: #c62828; } .muted { color: var(--muted); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <header><h1>plexus-agents</h1><span class="who" id="who"></span></header>
+  <section id="view"><p class="muted">Loading…</p></section>
+</main>
+<script>
+"use strict";
+const view = document.getElementById("view");
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const show = (html) => { view.innerHTML = html; };
+
+// The route lives in the hash, so it survives the sign-in's round trip: the
+// sign-in page keeps it in its address and carries it into `next`.
+function route() {
+  const h = location.hash.replace(/^#/, "") || "/";
+  const [path, query] = h.split("?");
+  return { path, params: new URLSearchParams(query || "") };
+}
+function signIn() {
+  // plexus-login carries what follows the `#` into every way in's `next` (TETHER-12).
+  location.href = "/login?next=%2F" + location.hash;
+}
+
+// One socket, same origin; each call is a `plexus-agents.call` subscription.
+let socket, opened, nextId = 1;
+const waiting = new Map(), subs = new Map();
+function connect() {
+  if (opened) return opened;
+  const url = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+  socket = new WebSocket(url);
+  socket.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.id != null && waiting.has(m.id)) {
+      const w = waiting.get(m.id); waiting.delete(m.id);
+      if (m.error) w.reject(new Error(m.error.message)); else subs.set(String(m.result), w);
+    } else if (m.params && m.params.subscription != null) {
+      const w = subs.get(String(m.params.subscription));
+      const item = m.params.result;
+      if (!w || !item) return;
+      if (item.type === "data") { subs.delete(String(m.params.subscription)); w.resolve(item.content); }
+      else if (item.type === "error") { subs.delete(String(m.params.subscription)); w.reject(new Error(item.message)); }
+    }
+  };
+  socket.onclose = () => { opened = null; for (const w of [...waiting.values(), ...subs.values()]) w.reject(new Error("the connection closed")); waiting.clear(); subs.clear(); };
+  opened = new Promise((ok, no) => { socket.onopen = ok; socket.onerror = () => no(new Error("can't reach the service")); });
+  return opened;
+}
+async function call(method, params) {
+  await connect();
+  const id = nextId++;
+  const p = new Promise((resolve, reject) => waiting.set(id, { resolve, reject }));
+  socket.send(JSON.stringify({ jsonrpc: "2.0", id, method: "plexus-agents.call", params: { method, params: params || {} } }));
+  const out = await p;
+  if (out && out.type === "failed") throw new Error(out.message);
+  return out;
+}
+
+async function hosts() {
+  const r = await call("hosts.list");
+  const rows = r.hosts.map((h) => `<tr><td>${esc(h.name)}</td><td class="${h.online ? "on" : "off"}">${h.online ? "online" : "offline"}</td>
+    <td class="muted">${esc(h.mode)}</td><td><button data-unpair="${esc(h.name)}">Unpair</button></td></tr>`).join("");
+  show(`<h2>Your hosts</h2>${rows ? `<table>${rows}</table>` : `<p class="muted">None yet. Run <code>plexus-agents host --server … --name …</code> on a machine, and open the link it prints.</p>`}
+    <p><a href="#/pair">Pair a host by its code</a></p>`);
+  view.querySelectorAll("[data-unpair]").forEach((b) => b.onclick = async () => {
+    if (!confirm(`Unpair ${b.dataset.unpair}? Its key is refused from now on.`)) return;
+    try { await call("hosts.unpair", { name: b.dataset.unpair }); hosts(); } catch (e) { alert(e.message); }
+  });
+}
+
+function typeCode(error) {
+  show(`<h2>Pair a host</h2><p>Type the code the host's terminal shows.</p>
+    <form id="f"><input id="code" autocomplete="off" placeholder="XXXX-XXXX" size="10" autofocus> <button class="primary">Find</button></form>
+    ${error ? `<p class="error">${esc(error)}</p>` : ""}`);
+  document.getElementById("f").onsubmit = (e) => { e.preventDefault(); pending({ code: document.getElementById("code").value }); };
+}
+
+async function pending(by) {
+  let p;
+  try { p = await call("hosts.pairing", by); } catch (e) { return by.code != null ? typeCode(e.message) : show(`<p class="error">${esc(e.message)}</p><p><a href="#/pair">Type the code instead</a></p>`); }
+  show(`<h2>Pair <code>${esc(p.name)}</code>?</h2>
+    <p>Does your terminal show this code?</p><div class="code">${esc(p.code)}</div>
+    <p class="muted">If it shows anything else, someone is in the middle: don't pair.</p>
+    <button class="primary" id="pair">Pair</button> <a href="#/">Cancel</a>`);
+  document.getElementById("pair").onclick = async () => {
+    try { const done = await call("hosts.confirm", { pairing_id: p.pairing_id }); show(`<p><code>${esc(done.name)}</code> is yours. It goes on as itself now.</p><p><a href="#/">Your hosts</a></p>`); }
+    catch (e) { show(`<p class="error">${esc(e.message)}</p>`); }
+  };
+}
+
+async function render() {
+  const r = route();
+  try {
+    if (r.path === "/pair") { const id = r.params.get("id"); return id ? pending({ pairing_id: id }) : typeCode(); }
+    return hosts();
+  } catch (e) { show(`<p class="error">${esc(e.message)}</p>`); }
+}
+
+async function start() {
+  const me = await fetch("/login/me", { credentials: "same-origin" });
+  if (!me.ok) {
+    show(`<p>Sign in to see your hosts${route().path === "/pair" ? " and confirm the pairing" : ""}.</p><button class="primary" id="in">Sign in</button>`);
+    document.getElementById("in").onclick = signIn;
+    return;
+  }
+  const who = await me.json();
+  document.getElementById("who").innerHTML = `${esc(who.name || who.principal)} · <form method="post" action="/logout" style="display:inline"><button>Sign out</button></form>`;
+  window.onhashchange = render;
+  render();
+}
+start();
+</script>
+</body>
+</html>

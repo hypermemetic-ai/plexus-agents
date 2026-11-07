@@ -227,6 +227,67 @@ impl Resolve for Homes {
     }
 }
 
+/// SUPERCONDUCTOR-19: `auth.role_set`, `auth.grant` and `auth.revoke` change
+/// nothing here. Roles are this module's, and memberships come from flags
+/// (`--grant`, `--admin`) and the host store.
+fn fixed() -> plexus_core::plexus::StoreError {
+    plexus_core::plexus::StoreError::new(
+        "roles and grants here are set by flags (--grant, --admin) and pairing",
+    )
+}
+
+#[async_trait::async_trait]
+impl plexus_core::plexus::RoleStore for AgentsRoles {
+    async fn set(
+        &self,
+        _role: &RoleName,
+        _grants: GrantSet,
+    ) -> Result<(), plexus_core::plexus::StoreError> {
+        Err(fixed())
+    }
+}
+
+#[async_trait::async_trait]
+impl plexus_core::plexus::MembershipStore for Members {
+    async fn grant(&self, _m: Membership) -> Result<(), plexus_core::plexus::StoreError> {
+        Err(fixed())
+    }
+
+    async fn revoke(
+        &self,
+        _principal: &Principal,
+        _role: Option<&RoleName>,
+        _scope: &ScopeRef,
+    ) -> Result<Vec<RoleName>, plexus_core::plexus::StoreError> {
+        Err(fixed())
+    }
+}
+
+/// `auth.*` over this module's rules (SUPERCONDUCTOR-19): what
+/// `DynamicHub::with_auth` takes, with `backend` the login's.
+pub fn auth_setup(
+    runtime: &Supervisor,
+    peers: Vec<String>,
+    grants: impl IntoIterator<Item = Grant>,
+    hosts: Option<Arc<crate::hosts::HostStore>>,
+    backend: Arc<dyn plexus_core::plexus::AuthBackend>,
+) -> plexus_core::plexus::AuthSetup {
+    let mut members = Members::new(grants);
+    members.1 = hosts.clone();
+    plexus_core::plexus::AuthSetup::new(
+        backend,
+        Arc::new(AgentsRoles {
+            table: roles(),
+            hosts,
+        }),
+        Arc::new(members),
+        Arc::new(Homes {
+            runtime: runtime.clone(),
+            peers,
+        }),
+    )
+}
+
 /// The gate for a runtime: default deny, on every call.
 pub fn gate(
     runtime: &Supervisor,
@@ -310,10 +371,12 @@ impl Access {
             return Err(sign_in());
         }
         let principal = ctx.principal().ok_or_else(sign_in)?;
+        // plexus-idp's tokens say `username`; plexus-login's sessions, `name`.
+        let name = ctx.get_metadata_string("username");
         Ok(Caller {
             actor: Actor {
                 id: principal.to_string(),
-                name: ctx.get_metadata_string("username"),
+                name: name.or_else(|| ctx.get_metadata_string("name")),
             },
             reach: current_reach(),
         })

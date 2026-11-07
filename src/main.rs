@@ -1,35 +1,61 @@
 //! `plexus-agents`: the `agents` service.
 //!
 //! ```text
-//! plexus-agents --db FILE [--issuer URL --audience AUD]
-//!               [--port 4470] [--bind 127.0.0.1] [--placement NAME]...
-//!               [--grant PRINCIPAL=ROLE@SCOPE]... [--record DIR]
-//!               [--key-audience URL]... [--service-key FILE] [--peer NAME=URL]...
+//! plexus-agents --db FILE [--port 4470] [--bind 127.0.0.1] [--public-url URL]
+//!               [--placement NAME]... [--no-local] [--grant PRINCIPAL=ROLE@SCOPE]...
+//!               [--admin PRINCIPAL]... [--record DIR]
+//!               [--workos-client CLIENT [--workos-api-key-file FILE]] [--identity SPEC]
+//!               [--issuer URL --audience AUD] [--key-audience URL]...
+//!               [--server-key FILE [--generate-server-key]] [--trusted-proxy CIDR]...
+//!               [--sessions-file FILE] [--service-key FILE] [--peer NAME=URL]...
 //! ```
 //!
-//! `--placement` names a place a thread can run; `local` if none is given. `--grant`
-//! gives a role: `user@local` lets a principal start runs on `local`, `admin@*` lets
-//! it do everything. A caller with no grant can see only its own threads, and has
-//! none. There is no way to run with auth off.
+//! One port serves everything (SUPERCONDUCTOR-19): `GET /` is the page (your
+//! hosts, `/#/pair`), `/login*` is plexus-login's sign-in, and an upgrade on any
+//! path (`/`, `/ws`) is the Plexus socket. A browser's upgrade must come from this
+//! service's own origin; a client sending no `Origin` may connect.
 //!
-//! `--key-audience` admits key proofs naming that URL, and proofs naming this
-//! service's own `ws://127.0.0.1:<port>` whenever one is given. A peer needs a
-//! `--grant key:<hex>=admin@*` here before a proof gets it anything. `--peer` names a
-//! service reachable at `agents.on.<name>`, dialed with `--service-key`, a 32-byte
-//! Ed25519 seed in a file of mode 0600. `--print-key FILE` prints that key's principal
-//! and exits, so a script can write the peer's `--grant`.
+//! **Signing in.** Key sign-in (`key:<hex>`) is always on: key proofs naming this
+//! service's sockets (`ws://127.0.0.1:<port>`, `ws://localhost:<port>`, and the
+//! public URL's `wss://host` and `wss://host/ws`) or a `--key-audience`. WorkOS by
+//! emailed code is on given `--workos-client` and its API key, from
+//! `--workos-api-key-file` or `AGENTS_WORKOS_API_KEY`; without a key there's no
+//! WorkOS button. `--identity` takes a whole plexus-login identity spec instead.
+//! `--issuer`/`--audience` admit plexus-idp tokens as before. `--admin` makes a
+//! principal `admin` everywhere (`key:<hex>` where there's no WorkOS).
+//! `auth.*` (`login`, `whoami`, `providers`, …) is mounted, so `synapse _login`
+//! works against the service.
+//!
+//! `--public-url` is where people and hosts reach this service: `https://host` or
+//! `wss://host/ws`, the same origin either way. `--trusted-proxy` names the proxy
+//! in front (a CIDR, or `none`): its `X-Forwarded-For` is believed.
+//!
+//! `--placement` names a place a thread can run; `local` if none is given, and none
+//! with `--no-local`: a hosted service runs nothing itself. `--grant` gives a role:
+//! `user@local` lets a principal start runs on `local`, `admin@*` lets it do
+//! everything. A caller with no grant can see only its own threads, and has none.
+//! There is no way to run with auth off.
+//!
+//! A peer needs a `--grant key:<hex>=admin@*` here before a proof gets it anything.
+//! `--peer` names a service reachable at `agents.on.<name>`, dialed with
+//! `--service-key`, a 32-byte Ed25519 seed in a file of mode 0600. `--print-key
+//! FILE` prints that key's principal and exits, so a script can write the peer's
+//! `--grant`.
 //!
 //! Hosts behind NAT dial in (SUPERCONDUCTOR-15) and are reached at
 //! `agents.on.<host>`, given `--server-key FILE`: this service's Ed25519 identity
-//! (`key_s`, a 32-byte seed, mode 0600), which hosts pin and every call to a host is
-//! signed with (SUPERCONDUCTOR-18). `--generate-server-key` makes that file if it's
-//! missing: for development. Without `--server-key` there are no hosts. A host
-//! pairs by a code both sides show; `hosts.pairing`, `hosts.confirm`,
-//! `hosts.unpair` and `hosts.list` are a signed-in user's, in the same `--db`.
-//! `--public-url` is the URL hosts dial: a host's key proof must name it.
-//! `--no-local` serves no `local` placement when none is named: a hosted service
-//! runs nothing itself. `--trusted-proxy CIDR` names a proxy whose
-//! `X-Forwarded-For` is believed, for the per-address limit on pairing requests.
+//! (`key_s`, a 32-byte seed, mode 0600, the same format as `--service-key`), which
+//! hosts pin and every call to a host is signed with (SUPERCONDUCTOR-18).
+//! `--generate-server-key` makes that file if it's missing: for development.
+//! Without `--server-key` there are no hosts. A host pairs by a code both sides
+//! show; `hosts.pairing`, `hosts.confirm`, `hosts.unpair` and `hosts.list` are a
+//! signed-in user's, in the same `--db`.
+//!
+//! Every flag can come from the environment instead: `AGENTS_DB`, `AGENTS_PORT`,
+//! `AGENTS_BIND`, `AGENTS_PUBLIC_URL`, `AGENTS_SERVER_KEY`, `AGENTS_NO_LOCAL=1`,
+//! `AGENTS_WORKOS_CLIENT`, `AGENTS_WORKOS_API_KEY_FILE`, `AGENTS_IDENTITY`,
+//! `AGENTS_SESSIONS_FILE`, and the lists `AGENTS_ADMINS`, `AGENTS_TRUSTED_PROXIES`,
+//! `AGENTS_PLACEMENTS`, `AGENTS_KEY_AUDIENCES` (comma-separated). A flag wins.
 //!
 //! ```text
 //! plexus-agents host --server URL --name NAME --db FILE
@@ -46,33 +72,65 @@
 
 use anyhow::{anyhow, Context};
 use plexus_agents::auth::Grant;
+use plexus_agents::front::{self, SignInConfig};
 use plexus_agents::host::{self, HostConfig};
 use plexus_agents::hosts::Hosts;
 use plexus_agents::pairing::{self, ServerKey};
 use plexus_agents::peer::{self, Peer, PeerConfig};
 use plexus_agents::runtime::{Supervisor, SupervisorConfig};
-use plexus_agents::service::{self, SignIn, TokenIssuer};
+use plexus_agents::service::{self, TokenIssuer};
 use plexus_agents::{ClaudeHarness, LocalEnvironment, RecordingEnvironment};
 use plexus_harness::{Environment, Harness};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+fn env_list(name: &str) -> Vec<String> {
+    let list = env(name).unwrap_or_default();
+    let items = list.split(',').map(str::trim).filter(|s| !s.is_empty());
+    items.map(str::to_string).collect()
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("host") {
         return host().await;
     }
-    let mut public_url = None;
-    let (mut server_key, mut generate_server_key, mut no_local) = (None, false, false);
-    let mut trusted_proxies = Vec::new();
-    let (mut db, mut issuer, mut audience, mut record) = (None, None, None, None);
-    let (mut port, mut bind) = (4470u16, IpAddr::from([127, 0, 0, 1]));
-    let (mut placements, mut grants) = (Vec::new(), Vec::<Grant>::new());
-    let (mut key_audiences, mut service_key, mut peers) = (Vec::new(), None, Vec::new());
+    let mut public_url = env("AGENTS_PUBLIC_URL");
+    let (mut db, mut issuer, mut audience, mut record) = (env("AGENTS_DB"), None, None, None);
+    let mut port = env("AGENTS_PORT")
+        .map_or(Ok(4470u16), |p| p.parse())
+        .context("AGENTS_PORT")?;
+    let mut bind: IpAddr = env("AGENTS_BIND")
+        .map_or(Ok(IpAddr::from([127, 0, 0, 1])), |b| b.parse())
+        .context("AGENTS_BIND")?;
+    let (mut placements, mut grants) = (env_list("AGENTS_PLACEMENTS"), Vec::<Grant>::new());
+    let (mut key_audiences, mut service_key, mut peers) =
+        (env_list("AGENTS_KEY_AUDIENCES"), None, Vec::new());
+    let mut server_key = env("AGENTS_SERVER_KEY");
+    let mut generate_server_key = false;
+    let mut no_local = env("AGENTS_NO_LOCAL").is_some_and(|v| v != "0" && v != "false");
+    let mut trusted_proxies = env_list("AGENTS_TRUSTED_PROXIES");
+    let mut admins = env_list("AGENTS_ADMINS");
+    let mut workos_client = env("AGENTS_WORKOS_CLIENT");
+    let mut workos_key_file = env("AGENTS_WORKOS_API_KEY_FILE").map(std::path::PathBuf::from);
+    let mut identity = env("AGENTS_IDENTITY");
+    let mut sessions_file = env("AGENTS_SESSIONS_FILE").map(std::path::PathBuf::from);
+    // A list flag given replaces the environment's list.
+    let mut replaced = std::collections::HashSet::new();
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(anyhow!("{flag} needs a value"));
+        let mut list = |l: &mut Vec<String>, v: String, name: &'static str| {
+            if replaced.insert(name) {
+                l.clear();
+            }
+            l.push(v);
+        };
         match flag.as_str() {
             "--db" => db = Some(value()?),
             "--issuer" => issuer = Some(value()?),
@@ -80,16 +138,21 @@ async fn main() -> anyhow::Result<()> {
             "--record" => record = Some(value()?),
             "--port" => port = value()?.parse().context("--port")?,
             "--bind" => bind = value()?.parse().context("--bind")?,
-            "--placement" => placements.push(value()?),
+            "--placement" => list(&mut placements, value()?, "placement"),
             "--grant" => grants.push(value()?.parse().map_err(|e: String| anyhow!(e))?),
-            "--key-audience" => key_audiences.push(value()?),
+            "--admin" => list(&mut admins, value()?, "admin"),
+            "--key-audience" => list(&mut key_audiences, value()?, "key-audience"),
             "--service-key" => service_key = Some(value()?),
             "--peer" => peers.push(value()?),
             "--public-url" => public_url = Some(value()?),
             "--server-key" => server_key = Some(value()?),
             "--generate-server-key" => generate_server_key = true,
             "--no-local" => no_local = true,
-            "--trusted-proxy" => trusted_proxies.push(value()?),
+            "--trusted-proxy" => list(&mut trusted_proxies, value()?, "trusted-proxy"),
+            "--workos-client" => workos_client = Some(value()?),
+            "--workos-api-key-file" => workos_key_file = Some(value()?.into()),
+            "--identity" => identity = Some(value()?),
+            "--sessions-file" => sessions_file = Some(value()?.into()),
             "--print-key" => {
                 println!(
                     "{}",
@@ -103,28 +166,45 @@ async fn main() -> anyhow::Result<()> {
     if placements.is_empty() && !no_local {
         placements.push("local".to_string());
     }
-    let tokens = match (issuer, audience) {
+    let idp = match (issuer, audience) {
         (Some(issuer), Some(audience)) => Some(TokenIssuer { issuer, audience }),
         (None, None) => None,
         _ => return Err(anyhow!("--issuer and --audience go together")),
     };
-    if let Some(url) = &public_url {
-        key_audiences.push(url.clone());
+    for admin in &admins {
+        grants.push(
+            format!("{admin}=admin@*")
+                .parse()
+                .map_err(|e: String| anyhow!("--admin: {e}"))?,
+        );
     }
-    if !key_audiences.is_empty() {
-        key_audiences.push(format!("ws://{bind}:{port}"));
-    }
-    let public_url = public_url.unwrap_or_else(|| {
-        key_audiences
-            .first()
-            .cloned()
-            .unwrap_or(format!("ws://{bind}:{port}"))
-    });
-    let sign_in = SignIn {
-        tokens,
+    let origin = public_url.as_deref().map(front::page_origin).transpose()?;
+    // What a host's calls out are stamped with: the socket it dials.
+    let socket = origin
+        .as_deref()
+        .map_or(format!("ws://{bind}:{port}"), front::socket_url);
+    let db: std::path::PathBuf = db.context("--db is required")?.into();
+    let sign_in = SignInConfig {
+        public_url: origin,
+        workos_client,
+        workos_key_file,
+        identity,
+        idp,
         key_audiences,
+        admins,
+        trusted_proxies: trusted_proxies.clone(),
+        sessions_file: Some(sessions_file.unwrap_or_else(|| db.with_extension("sessions"))),
+        loopback: bind.is_loopback(),
     };
-    let validator = sign_in.validator()?;
+    let login = front::sign_in(&sign_in, port)?;
+    eprintln!(
+        "plexus-agents: sign-in by key{}",
+        if login.workos {
+            " and WorkOS"
+        } else {
+            " (no WorkOS)"
+        }
+    );
     let peers = peers
         .iter()
         .map(|spec| {
@@ -142,12 +222,11 @@ async fn main() -> anyhow::Result<()> {
         .map(|p| (p, environment.clone()))
         .collect();
     let harnesses: Vec<Arc<dyn Harness>> = vec![Arc::new(ClaudeHarness::default())];
-    let db: std::path::PathBuf = db.context("--db is required")?.into();
     let hosts = match &server_key {
         Some(file) => {
             let key = ServerKey::load(file.as_ref(), generate_server_key)?;
             eprintln!("plexus-agents: hosts pin this service as {}", key.public());
-            Some(Hosts::open(&db, public_url, key)?)
+            Some(Hosts::open(&db, socket, key)?)
         }
         None => {
             eprintln!("plexus-agents: no --server-key, so no hosts dial in");
@@ -163,13 +242,14 @@ async fn main() -> anyhow::Result<()> {
     .await
     .map_err(|e| anyhow!("{e}"))?;
     eprintln!("plexus-agents: on {bind}:{port}, recovered {recovery:?}");
-    let hub = service::hub_with_hosts(runtime, harnesses, grants, peers, hosts.clone());
+    let backend = login.backend();
+    let hub = service::hub_with_login(runtime, harnesses, grants, peers, hosts.clone(), backend);
     let serving = service::Serving {
         hosts,
         trusted_proxies,
         ..service::Serving::new(bind, port)
     };
-    service::serve_with(hub, validator, serving).await
+    front::serve_public(hub, login, serving).await
 }
 
 /// `plexus-agents host`: see the module docs.

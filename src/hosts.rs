@@ -59,7 +59,7 @@
 //! SQLite. A public key, never a private one, and no token. `key_s`'s seed is a file
 //! the deploy holds, never the store.
 
-use crate::auth::{is_service, Access, AgentsRequest, Caller};
+use crate::auth::{Access, AgentsRequest, Caller};
 use crate::pairing::{self, ServerKey};
 use crate::peer::{meta, one, timed_out, unavailable};
 use async_trait::async_trait;
@@ -714,13 +714,17 @@ impl Hosts {
     }
 
     /// A signed-in user confirms a pending pairing: it becomes theirs.
+    /// The gate let only a user, or a key granted it (`--admin key:<hex>` where
+    /// there's no WorkOS), this far; a host's own key never confirms.
     fn confirm(&self, caller: &str, id: &str) -> Result<HostsEvent, String> {
-        if is_service(caller) {
-            return Err("confirm as a signed-in user, not as a key".into());
-        }
         let mut pending = self.pending.lock().expect("hosts");
         let p = pending.get(id).filter(|p| p.standing());
         let p = p.ok_or("no such pairing is pending")?;
+        if let Some(key) = caller.strip_prefix("key:") {
+            if key == p.key || self.store.by_key(key).is_some() {
+                return Err("a host's key can't confirm a pairing".into());
+            }
+        }
         let event = self.pair(caller, &p.name, &p.key)?;
         let p = pending.remove(id).expect("found above");
         drop(pending);

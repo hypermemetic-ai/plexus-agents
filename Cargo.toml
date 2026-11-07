@@ -12,8 +12,13 @@ plexus-core = "0.7.0"
 plexus-macros = "0.7.0"
 plexus-transport = { version = "0.6.0", default-features = false }
 plexus-auth-core = { version = "0.2.2", features = ["adapters"] }
+# SUPERCONDUCTOR-19: sign-in (WorkOS, key), sessions and the auth activation, as
+# menger links it. 0.2.x is the Plexus 0.7 line; 0.3 is Plexus 0.8.
+plexus-login = "0.2.3"
 anyhow = "1"
 async-stream = "0.3"
+# The one public port: the page, the sign-in routes, and the socket in front.
+axum = { version = "0.8", features = ["ws"] }
 async-trait = "0.1"
 base64 = "0.22"
 ed25519-dalek = "2"

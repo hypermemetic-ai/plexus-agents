@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod claude;
+pub mod front;
 pub mod host;
 pub mod hosts;
 mod local;
