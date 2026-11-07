@@ -52,10 +52,18 @@
       else other = true;
     }
   }
-  $effect(() => {
-    host;
+  function fresh() {
     info = undefined; recent = []; folder = ""; other = false; said = "";
     load();
+  }
+  $effect(() => {
+    host;
+    fresh();
+    // The engine may keep this page mounted between visits: coming back to it
+    // re-reads the folders.
+    const here = () => { if (location.hash === `#/h/${encodeURIComponent(host)}/new`) fresh(); };
+    window.addEventListener("hashchange", here);
+    return () => window.removeEventListener("hashchange", here);
   });
   $effect(() => { if (info?.online && field) field.focus(); });
 
@@ -123,6 +131,7 @@
 
     <fieldset class="folders" disabled={!info?.online}>
       <legend>Folder on {host}</legend>
+      {#if recent.length}
       <div class="chips" role="radiogroup" aria-label="Folder">
         {#each recent as path (path)}
           <button type="button" class="chip" role="radio" aria-checked={!other && folder === path} onclick={() => pick(path)} title={path}>
@@ -133,6 +142,7 @@
           <span class="chip-name">Other folder…</span>
         </button>
       </div>
+      {/if}
       {#if other}
         <Field hint={recent.length ? "" : `Folders you use here show up as choices next time.`}>
           <input class="path" value={folder} oninput={(e) => (folder = e.currentTarget.value)} placeholder="/Users/you/project" aria-label="Folder path" spellcheck="false" autocapitalize="off" autocomplete="off"/>
@@ -156,7 +166,7 @@
 
 <style>
   .sc-page { max-width: 760px; padding: var(--s6) var(--s5); }
-  form { display: grid; gap: var(--s4); }
+  form { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s4); }
   .head { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--s3); }
   h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
   .on { color: var(--muted); display: inline-flex; align-items: baseline; gap: var(--s2); }
@@ -170,16 +180,17 @@
   .prompt:focus { outline: none; border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
   .prompt:disabled { background: var(--hover); }
 
-  fieldset { margin: 0; padding: 0; border: 0; min-width: 0; display: grid; gap: var(--s3); }
+  fieldset { margin: 0; padding: 0; border: 0; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s3); }
   legend { padding: 0; margin-bottom: var(--s2); font-weight: 500; }
   .chips { display: flex; flex-wrap: wrap; gap: var(--s2); }
-  .chip { display: inline-flex; flex-direction: column; align-items: flex-start; justify-content: center; min-height: 44px; max-width: 100%; padding: var(--s1) var(--s3); text-align: left; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-sm); cursor: pointer; }
+  .chip { overflow: hidden; display: inline-flex; flex-direction: column; align-items: flex-start; justify-content: center; min-height: 44px; max-width: 100%; padding: var(--s1) var(--s3); text-align: left; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-sm); cursor: pointer; }
   .chip:hover { background: var(--hover); }
   .chip[aria-checked=true] { background: var(--sel); border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
   .chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
   .chip:disabled { color: var(--disabled); cursor: default; }
   .chip-name { font-weight: 500; }
-  .chip-path { max-width: 32ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--font-mono); color: var(--muted); }
+  .chip-name, .chip-path { max-width: 100%; }
+  .chip-path { width: 32ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--font-mono); color: var(--muted); }
   .path { width: 100%; min-height: 44px; padding: 0 var(--s3); font: 15px var(--font-mono); color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-sm); }
   .path:focus { outline: none; border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
 
@@ -195,7 +206,7 @@
     .prompt { min-height: 140px; }
     .chips { flex-direction: column; }
     .chip { width: 100%; }
-    .chip-path { max-width: 100%; }
+    .chip-path { width: 100%; }
     .hint { display: none; }
     .foot :global(.sc-button) { width: 100%; }
   }
