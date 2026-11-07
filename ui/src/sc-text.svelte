@@ -34,8 +34,9 @@
   .sc-text :global(p) { margin: 0 0 var(--s3); }
   .sc-text :global(p:last-child) { margin-bottom: 0; }
   .sc-text :global(ul), .sc-text :global(ol) { margin: 0 0 var(--s3); padding-left: var(--s5); }
-  .sc-text :global(code) { font-family: var(--font-mono); font-size: .9em; padding: 0 3px; background: var(--hover); border-radius: var(--radius-xs); }
+  .sc-text :global(:not(pre) > code) { font-family: var(--font-mono); font-size: .9em; padding: 0 3px; background: var(--hover); border-radius: var(--radius-xs); }
   .sc-text :global(h1), .sc-text :global(h2), .sc-text :global(h3) { margin: var(--s4) 0 var(--s2); font-size: 1.05em; font-weight: 600; }
+  .sc-text :global(td code) { white-space: nowrap; }
   .sc-text :global(a) { color: var(--accent); }
   .sc-text :global(table) { border-collapse: collapse; margin: 0 0 var(--s3); display: block; overflow-x: auto; }
   .sc-text :global(td), .sc-text :global(th) { padding: 2px var(--s2); border: 1px solid var(--line); }
