@@ -1,61 +1,164 @@
-# SUPERCONDUCTOR-11: the superconductor's tokens, menger's (menger/ui/theme.toml)
-# trimmed to what these pages paint, with one pair per thread status. Compiled by
-# plexus-ui build to theme.css, which index.html loads first; every component's
-# <style> paints with these, never a literal. [light, dark, what it paints].
+# SC-30: the superconductor's tokens. plexus-ui build compiles this to theme.css,
+# which index.html loads first; every component paints with these, never a
+# literal (--strict-colours). Each line: [light, dark, what it paints].
+#
+# ── The design plan ─────────────────────────────────────────────────────────
+# Subject: a switchboard for Claude Code threads running on the operator's own
+# machines. Reader: the operator, glancing from a laptop or a phone between
+# other work. Job: see what needs you, answer it, read what the agent did.
+#
+# Palette (light / dark):
+#   rail      #E9EDF1 / #171B20   the chassis: top bar and nav rail, a cool grey
+#   paper     #F7F8FA / #111418   where the work is read; cool, never cream
+#   graphite  #1C2229 / #E1E6EC   ink
+#   cobalt    #2C5BA6 / #8AABE8   the one accent: actions, links, the focus ring
+#   amber     #F0A21B / #F2B23E   needs you, and nothing else; the only filled
+#                                 status, with ink #2A1C00 / #1F1500 on it
+# Status colours carry meaning only, as a lamp (a dot) beside a word: working
+# (cobalt, pulsing), waiting (slate teal), failed (brick), done (moss), idle and
+# offline (greys). Only "needs you" is a filled lozenge, so amber is the single
+# loud thing on any screen.
+#
+# Type: IBM Plex Sans (variable 100-700, latin) for everything a person reads;
+# IBM Plex Mono only for code, commands and paths. Both ship inside index.html as
+# data: URLs: the page policy is font-src 'self' data: and style-src 'self', so
+# Google Fonts cannot load, and a bundle carries no asset files. Scale on a 14px
+# body, steps 12 / 13 / 14 / 15 (prose) / 17 / 20 / 26; weights 400, 500 for
+# names and controls, 600 for titles; sentence case, no tracking games.
+#
+# Layout: one frame. Desktop: a 48px top bar and a 272px rail on the rail tone,
+# the page on paper beside it, left-aligned, prose at most 72ch. Phone (<720px):
+# one column, 16px gutters, every target at least 44px; `#/` is the rail (the
+# list of hosts and threads) with home's content under it; any other route is
+# the page alone, and the top bar's left end is a back control to `#/`.
+#
+#   desktop                                   phone, #/          phone, a thread
+#   ┌──────────────────────────────────────┐  ┌──────────────┐   ┌──────────────┐
+#   │ superconductor            you  Sign out│ │ sc       you │   │ ‹ Threads you │
+#   ├──────────┬───────────────────────────┤  ├──────────────┤   ├──────────────┤
+#   │ rail     │ page                      │  │ rail rows    │   │ page         │
+#   │ 272px    │ ≤72ch prose, left aligned │  │ home below   │   │              │
+#   └──────────┴───────────────────────────┘  └──────────────┘   └──────────────┘
+#
+# Principles: two surfaces (chassis and paper) and hairlines, no drop-shadowed
+# card grid; radii by size (3 a mark, 6 a control, 10 a card, 14 a sheet);
+# motion only where it answers an action, plus the working lamp's pulse; no
+# all-caps labels, no dot-joined meta, no arrows on buttons, mono never for a
+# label. Revised from the first pass: status pills were seven tinted chips
+# (the generic kit, and amber drowned among them) — now lamps, amber alone
+# filled; the accent moved off the stock #3b5bdb to a greyer cobalt so the blue
+# reads as ink for actions, not as brand.
 
 [colour.paper]
-"--bg"       = ['#fbfaf7', '#141412', 'the page']
-"--panel"    = ['#ffffff', '#1c1b19', 'the sidebar, the top bar']
-"--card"     = ['#ffffff', '#22211e', 'a control face, a card']
-"--hover"    = ['#f1efe9', '#26251f', 'a row or control under the pointer']
-"--sel"      = ['#eef1fc', '#1d2235', 'the selected row, a user message']
-"--skeleton" = ['#ebe8e1', '#2a2925', 'something still loading']
+"--bg"       = ['#f7f8fa', '#111418', 'the page: where the work is read']
+"--panel"    = ['#e9edf1', '#171b20', 'the chassis: the top bar and the nav rail; a code block']
+"--card"     = ['#ffffff', '#1c2127', 'a control face, a card lifted off the paper']
+"--hover"    = ['#dfe4ea', '#232930', 'a row or control under the pointer']
+"--sel"      = ['#d9e3f3', '#1d2a3f', 'the selected row, the current page in the rail']
+"--skeleton" = ['#e1e6eb', '#20262c', 'something still loading']
+"--shadow"   = ['#1c22291f', '#00000099', 'the lift under a sheet or the palette']
+"--scrim"    = ['#1c222966', '#000000a6', 'behind a sheet or the palette']
 
 [colour.ink]
-"--ink"      = ['#1d1c1a', '#ecebe6', 'text']
-"--muted"    = ['#6b6860', '#9b988f', 'labels, counts, hints']
-"--disabled" = ['#a19e96', '#6b6860', 'a control that will not act']
+"--ink"      = ['#1c2229', '#e1e6ec', 'text']
+"--muted"    = ['#556170', '#919ba7', 'secondary text, hints, counts']
+"--disabled" = ['#99a2ad', '#58616b', 'a control that will not act']
 
 [colour.line]
-"--line" = ['#e4e1d9', '#2e2d29', 'hairlines']
+"--line"        = ['#d3d9e0', '#2a3139', 'hairlines']
+"--line-strong" = ['#b4bdc7', '#3b444e', 'a field edge, a control edge']
 
 [colour.accent]
-"--accent" = ['#3b5bdb', '#8ea6ff', 'links, the primary button']
-"--on-accent" = ['#ffffff', '#141412', "the primary button's text"]
-"--focus"  = ['#3b5bdb', '#8ea6ff', 'the keyboard ring']
+"--accent"       = ['#2c5ba6', '#8aabe8', 'links, the primary button']
+"--accent-hover" = ['#234c8e', '#a3bdee', 'the primary button under the pointer']
+"--on-accent"    = ['#ffffff', '#0d1626', "the primary button's text"]
+"--focus"        = ['#2c5ba6', '#8aabe8', 'the keyboard ring']
 
-[colour.signal]
-"--warn" = ['#b3261e', '#ff8a80', 'offline, a refusal, a failure']
-"--live" = ['#2f7a2a', '#6cc66a', 'online, done']
+[colour.signal]   # amber is "needs you" and nothing else
+"--signal"      = ['#f0a21b', '#f2b23e', 'needs you: the approval edge, the count']
+"--on-signal"   = ['#2a1c00', '#1f1500', 'text on amber']
+"--signal-wash" = ['#fff1d6', '#2e2410', 'the ground of a card that needs you']
+"--danger"      = ['#b3261e', '#ff8f84', 'a destructive action, an error']
+"--danger-wash" = ['#fbe6e4', '#3a1a18', 'the ground of an error']
+"--warn"        = ['#b3261e', '#ff8f84', 'old name for --danger (pages written before SC-30)']
+"--live"        = ['#2f7a3a', '#79c98a', 'online']
 
-[colour.status]   # one pill per thread, in priority order
-"--st-needs-bg"   = ['#f3e8c8', '#3a3115', 'needs you: an approval or a question']
-"--st-needs-fg"   = ['#7a5d00', '#e8cf7a', 'needs you']
-"--st-working-bg" = ['#e3ecf7', '#1b2e46', 'working']
-"--st-working-fg" = ['#2b5b8c', '#a3c6ee', 'working']
-"--st-failed-bg"  = ['#fdecec', '#3d1a1c', 'failed']
-"--st-failed-fg"  = ['#aa2233', '#f09a9a', 'failed']
-"--st-idle-bg"    = ['#ecebe7', '#2c2b28', 'idle']
-"--st-idle-fg"    = ['#5f5d57', '#b9b6ae', 'idle']
+[colour.status]   # one status per thread, in priority order; fg the lamp and word (and an edge), bg a wash behind a row or card. The needs pill itself is filled with --signal.
+"--st-needs-fg"   = ['#8a5300', '#f2b23e', 'needs you: words and edges in amber']
+"--st-needs-bg"   = ['#fff1d6', '#2e2410', 'needs you: the wash behind a row or card']
+"--st-working-fg" = ['#2c5ba6', '#8aabe8', 'working']
+"--st-working-bg" = ['#e1e9f6', '#1b2738', 'working']
+"--st-waiting-fg" = ['#2f6f7a', '#7cc3cf', 'waiting in the background']
+"--st-waiting-bg" = ['#ddedef', '#142c30', 'waiting']
+"--st-failed-fg"  = ['#b3261e', '#ff8f84', 'failed']
+"--st-failed-bg"  = ['#fbe6e4', '#3a1a18', 'failed']
+"--st-done-fg"    = ['#2f7a3a', '#79c98a', 'done, unread']
+"--st-done-bg"    = ['#dff0e1', '#16301c', 'done']
+"--st-idle-fg"    = ['#556170', '#919ba7', 'idle']
+"--st-idle-bg"    = ['#e4e8ec', '#22282e', 'idle']
+"--st-offline-fg" = ['#7d8792', '#6d7680', 'offline']
+"--st-offline-bg" = ['#eceff2', '#1c2025', 'offline']
+
+[colour.code]   # code painted by language (@lezer/highlight classes), on --panel
+"--code-keyword"  = ['#9a2c97', '#c678dd', 'a keyword, an atom, a boolean']
+"--code-string"   = ['#3b7d3a', '#98c379', 'a string, a literal, a URL']
+"--code-number"   = ['#8e6200', '#d19a66', 'a number']
+"--code-comment"  = ['#6c7480', '#7f8893', 'a comment (italic)']
+"--code-type"     = ['#93600a', '#e5c07b', 'a type, a class, a namespace']
+"--code-def"      = ['#2c5ba6', '#61afef', 'a definition']
+"--code-property" = ['#0a6c93', '#56b6c2', 'a property name']
+"--code-meta"     = ['#b53a2b', '#e06c75', 'a macro, an attribute']
+
+[colour.diff]
+"--diff-add-bg" = ['#dff0e1', '#15301b', 'an added line']
+"--diff-add-fg" = ['#256b2f', '#8fd39a', "an added line's text, the +N"]
+"--diff-del-bg" = ['#fbe6e4', '#3a1b1d', 'a removed line']
+"--diff-del-fg" = ['#a3262f', '#f09a9a', "a removed line's text, the −N"]
 
 [type]
-"--font-text"     = ['"Geist Mono", ui-monospace, monospace', '"Geist Mono", ui-monospace, monospace', 'code, tool rows, the pairing code']
-"--sans"          = ['"Geist", system-ui, sans-serif', '"Geist", system-ui, sans-serif', 'the app']
-"--text-size"     = ['14px', '14px', 'the body size']
-"--weight-medium" = ['500', '500', 'a head']
-"--weight-bold"   = ['700', '700', 'a title, a count']
+"--font-text"     = ['"IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif', 'everything a person reads']
+"--font-mono"     = ['"IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace', 'code, commands, paths']
+"--sans"          = ['"IBM Plex Sans", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif', 'old name for --font-text']
+"--text-size"     = ['14px', 'the body size']
+"--text-small"    = ['12px', 'a pill, a caption']
+"--text-note"     = ['13px', 'a hint, a secondary line']
+"--text-prose"    = ['15px', "the agent's and your words"]
+"--text-h3"       = ['17px', 'a section head']
+"--text-h2"       = ['20px', 'a page title']
+"--text-h1"       = ['26px', 'the one big line of an empty screen']
+"--leading"       = ['1.5', 'body line height']
+"--leading-prose" = ['1.6', 'prose line height']
+"--measure"       = ['72ch', 'the longest prose line']
+"--weight-medium" = ['500', 'a name, a control']
+"--weight-strong" = ['600', 'a title']
+"--weight-bold"   = ['600', 'old name: a title, a count']
 
 [space]
-"--pitch"  = ['30px', '30px', 'a row']
-"--border" = ['1px', '1px', 'every hairline']
-"--side"   = ['280px', '280px', 'the sidebar']
+"--s1"     = ['4px', 'a hair']
+"--s2"     = ['8px', 'inside a control']
+"--s3"     = ['12px', 'between controls']
+"--s4"     = ['16px', 'the phone gutter']
+"--s5"     = ['24px', 'the desktop gutter, between blocks']
+"--s6"     = ['32px', 'between sections']
+"--gutter" = ['24px', "a page's side padding (the frame sets 16px on a phone)"]
+"--tap"    = ['44px', 'the smallest thing a thumb is asked to hit']
+"--rail"   = ['272px', 'the nav rail']
+"--side"   = ['272px', 'old name for --rail']
+"--topbar" = ['48px', 'the top bar']
+"--pitch"  = ['32px', 'a row in the rail (44px on a phone)']
+"--border" = ['1px', 'every hairline']
+"--ind"    = ['0', 'the indent of a code line in columns (code-card sets it per line)']
 
 [shape]
-"--radius"      = ['4px', '4px', 'a control']
-"--radius-lg"   = ['8px', '8px', 'a card']
-"--radius-pill" = ['999px', '999px', 'a status pill']
+"--radius-xs"   = ['3px', 'a mark, a key']
+"--radius-sm"   = ['6px', 'a control, a field']
+"--radius-md"   = ['10px', 'a card']
+"--radius-lg"   = ['14px', 'a sheet, the palette']
+"--radius-pill" = ['999px', 'a status pill, a count']
+"--radius"      = ['6px', 'old name for --radius-sm']
 
-[motion]
-"--motion-fast"  = ['.12s', '.12s', 'a hover']
-"--motion-pulse" = ['1.2s', '1.2s', 'working, pulsing']
-"--ease"         = ['ease-out', 'ease-out', 'all of them']
+[motion]   # reduced motion: plexus-ui sets every one to 0s
+"--motion-fast"  = ['.12s', 'a hover, a press']
+"--motion-open"  = ['.2s', 'a sheet opening, a row expanding']
+"--motion-pulse" = ['1.4s', 'the working lamp']
+"--ease"         = ['cubic-bezier(.2, .7, .3, 1)', 'all of them']
