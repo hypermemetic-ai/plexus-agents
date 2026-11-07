@@ -1,41 +1,49 @@
-//! SUPERCONDUCTOR-19: signing people in, and the one public port.
+//! SUPERCONDUCTOR-19, -11, -25: signing people in, and the one public port.
 //!
-//! People sign in through `plexus-login` 0.2 (the Plexus 0.7 line), linked as menger
-//! links it: WorkOS by emailed code when a client and its API key are configured
-//! (the same client as menger's matching environment, so one person is one
-//! `oidc:workos/user_…` id), and key sign-in (`key:<hex>`) always. With no WorkOS
-//! key there is no WorkOS button, and admins are named with `--admin key:<hex>`.
-//! Sessions (the host-only cookie, `mgs_` tokens) are this service's own.
+//! People sign in through `plexus-login` 0.3 (the Plexus 0.8 line), linked as menger
+//! links it: WorkOS when a client and its API key are configured (the same client
+//! as menger's matching environment, so one person is one `oidc:workos/user_…` id),
+//! and key sign-in (`key:<hex>`) always, for CLIs, agents and hosts. WorkOS is
+//! **GitHub only** (`social=github,email=off,sso=off`), and an allow list
+//! (SUPERCONDUCTOR-25, `--allow github:<numeric id>`) says who gets a session: a
+//! WorkOS sign-in is admitted by its linked GitHub account's numeric id, and with any
+//! rule set a WorkOS bearer token is refused at the socket. WorkOS on a public URL
+//! with no rule refuses to start. Sessions (the host-only cookie, `mgs_` tokens) are
+//! this service's own.
 //!
 //! ```text
-//!   public port ──┬── GET /            the page (hosts, pairing): page.html
-//!                 ├── /login*, /logout, /auth/cli   plexus-login's routes
-//!                 └── an upgrade, on any path (/, /ws)  ──▶ 127.0.0.1:<inner>
-//!                     Origin checked here: none (a CLI), or this service's own
+//!   public port ──┬── an upgrade, on any path (/, /ws)  ──▶ 127.0.0.1:<inner>
+//!                 │   Origin checked here: none (a CLI), or this service's own
+//!                 ├── /login*, /logout, /auth/cli       plexus-login's routes
+//!                 └── GET /, /app/, /app/<hash>/…        plexus-ui's shell: the live
+//!                                                        bundle, from `ui.db`
 //! ```
 //!
-//! plexus-transport 0.6 serves nothing but the socket on its port, so it listens on
+//! The page is no part of this crate (SUPERCONDUCTOR-11): it is a plexus-ui bundle
+//! (`ui/` in the repository) pushed with `plexus-ui push` and served from the store
+//! by plexus-ui-service's routes, stamped with this port as the socket's
+//! (`{{WS_PORT}}`) and `plexus-agents` as the service (`{{SERVICE}}`). Until a push
+//! the shell answers plexus-ui's own placeholder.
+//!
+//! plexus-transport serves nothing but the socket on its port, so it listens on
 //! loopback and this front proxies upgrades to it, adding the client's address to
 //! `X-Forwarded-For` (the inner transport trusts loopback and the configured
 //! proxies, so the waiting room's per-address limit sees the real client).
 
-use crate::service::{serve_with, Serving, TokenIssuer};
+use crate::service::{serve_with, Serving, TokenIssuer, SERVICE};
 use axum::extract::ws::{Message as AxMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
-use axum::http::{header, HeaderValue, Method, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
-use plexus_rpc::core::plexus::{DynamicHub, SessionValidator};
 use plexus_login::simple::SimpleAccess;
-use plexus_login::{Branding, LoginOptions, Wired, Wiring};
+use plexus_login::{Allow, Branding, LoginOptions, Wired, Wiring};
+use plexus_rpc::core::plexus::{DynamicHub, SessionValidator};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message as TMessage;
-
-/// The page: sign in, your hosts, confirm a pairing.
-pub const PAGE: &str = include_str!("page.html");
 
 /// The app's name as plexus-login uses it: cookies (`agents_session…`) and
 /// `AGENTS_WORKOS_API_KEY`.
@@ -45,6 +53,9 @@ pub const BRANDING: Branding = Branding {
     mark: "◇",
     motto: "your hosts, wherever they are",
 };
+
+/// The shell's title, stamped as `{{TITLE}}`.
+pub const TITLE: &str = "superconductor";
 
 /// How people and services sign in.
 #[derive(Debug, Clone, Default)]
@@ -71,6 +82,10 @@ pub struct SignInConfig {
     pub sessions_file: Option<PathBuf>,
     /// Whether the public port listens on loopback only.
     pub loopback: bool,
+    /// SUPERCONDUCTOR-25: `--allow` rules, `github:<numeric id>` or
+    /// `principal:<principal>`, each one or several comma-separated. None: everyone
+    /// gets a session, which WorkOS on a public URL refuses to start with.
+    pub allow: Vec<String>,
 }
 
 /// `https://host`, `wss://host/ws` or `ws://127.0.0.1:4470` as the page's origin:
@@ -97,6 +112,18 @@ pub fn socket_url(origin: &str) -> String {
     format!("{ws}/ws")
 }
 
+/// Whether an origin from [`page_origin`] names this machine only: `127.0.0.1`,
+/// `[::1]`, `localhost`, with any port.
+pub fn loopback_origin(origin: &str) -> bool {
+    let authority = origin.split_once("://").map_or(origin, |(_, a)| a);
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 /// Sign-in, wired: the session gate, the `auth` backend, the page's routes.
 pub struct Login {
     pub wired: Wired<SimpleAccess>,
@@ -104,6 +131,8 @@ pub struct Login {
     pub origins: Vec<String>,
     /// Whether WorkOS sign-in is on.
     pub workos: bool,
+    /// Who may have a session (SUPERCONDUCTOR-25): everyone when empty.
+    pub allow: Allow,
 }
 
 impl Login {
@@ -120,9 +149,19 @@ impl Login {
     }
 }
 
-/// Wires sign-in for a service on `port`.
+/// The identity spec for WorkOS sign-in by GitHub alone (SUPERCONDUCTOR-25):
+/// no emailed code, no SSO, and the API key from `key_file`, else from the
+/// environment (`key` absent).
+pub fn github_only(client: &str, key_file: Option<&std::path::Path>) -> String {
+    let key = key_file.map_or(String::new(), |f| format!(",key=@{}", f.display()));
+    format!("workos:{client},social=github,email=off,sso=off{key}")
+}
+
+/// Wires sign-in for a service on `port`. Refuses WorkOS on a public URL with no
+/// `--allow` rule, and a rule that doesn't parse.
 pub fn sign_in(config: &SignInConfig, port: u16) -> anyhow::Result<Login> {
     let origin = config.public_url.as_deref().map(page_origin).transpose()?;
+    let allow = Allow::parse(&config.allow).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut providers = Vec::new();
     providers.push(if config.key_audiences.is_empty() {
         "key".to_string()
@@ -138,9 +177,10 @@ pub fn sign_in(config: &SignInConfig, port: u16) -> anyhow::Result<Login> {
             let env = plexus_login::backends::workos::ApiKey::env_var(BRANDING.app);
             let in_env = std::env::var(&env).is_ok_and(|v| !v.trim().is_empty());
             match &config.workos_key_file {
-                // Emailed codes need no redirect URI; SSO and social would, so off.
-                Some(file) => Some(format!("workos:{client},sso=off,key=@{}", file.display())),
-                None if in_env => Some(format!("workos:{client},sso=off")),
+                // GitHub alone: AuthKit's social sign-in, which comes back to
+                // `<public url>/login/callback` (a redirect URI WorkOS must list).
+                Some(file) => Some(github_only(client, Some(file))),
+                None if in_env => Some(github_only(client, None)),
                 None => {
                     eprintln!("plexus-agents: a WorkOS client but no key ({env} or --workos-api-key-file): key sign-in only");
                     None
@@ -152,7 +192,20 @@ pub fn sign_in(config: &SignInConfig, port: u16) -> anyhow::Result<Login> {
     let workos = identity
         .as_deref()
         .is_some_and(|s| s.starts_with("workos:"));
-    let mut opts = LoginOptions::new(BRANDING, port, port).with_providers(&providers)?;
+    let public = origin
+        .as_deref()
+        .map_or(!config.loopback, |o| !loopback_origin(o));
+    if workos && public && allow.is_empty() {
+        anyhow::bail!(
+            "WorkOS sign-in on {} with no allow rule would give anyone with a WorkOS \
+             account a session: name who may sign in with --allow github:<numeric id> \
+             (AGENTS_ALLOW), or sign in by key alone",
+            origin.as_deref().unwrap_or("a public address")
+        );
+    }
+    let mut opts = LoginOptions::new(BRANDING, port, port)
+        .with_providers(&providers)?
+        .allowing(allow.clone());
     opts.public_url = origin.clone();
     opts.identity = identity
         .as_deref()
@@ -178,6 +231,7 @@ pub fn sign_in(config: &SignInConfig, port: u16) -> anyhow::Result<Login> {
         wired,
         origins,
         workos,
+        allow,
     })
 }
 
@@ -187,7 +241,7 @@ struct Front {
     origins: Arc<Vec<String>>,
 }
 
-/// Serves `hub` on `serving.port`: the page, sign-in, and the socket. See the
+/// Serves `hub` on `serving.port`: the socket, sign-in, and the shell. See the
 /// module docs.
 pub async fn serve_public(
     hub: Arc<DynamicHub>,
@@ -211,6 +265,7 @@ pub async fn serve_public(
         port: inner,
         hosts: serving.hosts.clone(),
         trusted_proxies: proxies,
+        ui: None,
     };
     let validator = login.validator()?;
     let socket = tokio::spawn(serve_with(hub, validator, inside));
@@ -230,50 +285,69 @@ pub async fn serve_public(
         inner,
         origins: Arc::new(login.origins.clone()),
     };
-    let mut app = axum::Router::new().fallback(handle).with_state(front);
+    let mut app = shell(&login, serving.ui.clone(), serving.port).await;
     if let Some(routes) = login.wired.router() {
-        app = routes.merge(app);
+        app = app.merge(routes);
     }
     if let Some(meta) = login.wired.metadata_route() {
         app = app.merge(meta);
     }
+    // An upgrade is the socket's, on whatever path it names, before any route.
+    let app = app.layer(axum::middleware::from_fn_with_state(front, upgrades));
     let listener = tokio::net::TcpListener::bind((serving.bind, serving.port)).await?;
-    let served = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    );
+    let served = plexus_webapp::serve_on(listener, app, std::future::pending());
     tokio::select! {
         r = served => r.map_err(Into::into),
         r = socket => r?,
     }
 }
 
-async fn handle(
-    State(front): State<Front>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    req: Request,
-) -> Response {
-    let upgrade = req
-        .headers()
+/// The shell: `/`, `/app/` and `/app/<hash>/…` from the ui store (plexus-ui's
+/// routes, stamped with this port and service, under plexus-webapp's page
+/// policy), the session read from the login's cookie so a preview is that
+/// session's. With no store, plexus-webapp's own page saying nothing is built.
+async fn shell(
+    login: &Login,
+    ui: Option<Arc<plexus_ui_service::UiStore>>,
+    port: u16,
+) -> axum::Router {
+    let mut cfg = plexus_webapp::ShellConfig::new(TITLE, plexus_webapp::AppSource::Embedded(&[]));
+    cfg.stamps.push(("{{SERVICE}}".into(), SERVICE.into()));
+    let (stamps, csp) = (cfg.stamps_for(port), cfg.csp.clone());
+    let base = plexus_webapp::router(cfg, port).await;
+    let Some(store) = ui else {
+        return base;
+    };
+    let sessions = login.wired.sessions.clone();
+    plexus_ui_service::routes::UiRoutes::new(store, port)
+        .session(move |h: &axum::http::HeaderMap| {
+            let cookies = h.get(header::COOKIE)?.to_str().ok()?;
+            sessions.get(plexus_login::sessions::cookie(cookies, sessions.cookie_name())?)
+        })
+        .stamps(stamps)
+        .csp(csp)
+        .mount(base)
+}
+
+fn is_upgrade(req: &Request) -> bool {
+    req.headers()
         .get(header::UPGRADE)
-        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
-    if upgrade {
-        return proxy(front, peer, req).await;
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
+}
+
+async fn upgrades(
+    State(front): State<Front>,
+    req: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if !is_upgrade(&req) {
+        return next.run(req).await;
     }
-    let path = req.uri().path();
-    if req.method() == Method::GET && (path == "/" || path == "/index.html") {
-        let mut page = Html(PAGE).into_response();
-        let h = page.headers_mut();
-        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-        h.insert(
-            header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static(
-                "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' ws: wss:; frame-ancestors 'none'",
-            ),
-        );
-        return page;
-    }
-    (StatusCode::NOT_FOUND, "not here").into_response()
+    let peer = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map_or(SocketAddr::from(([127, 0, 0, 1], 0)), |c| c.0);
+    proxy(front, peer, req).await
 }
 
 /// Whether a browser page at `origin` may open the socket.
@@ -401,6 +475,56 @@ mod tests {
         assert_eq!(socket_url(&https), "wss://agents.example/ws");
         assert!(page_origin("agents.example").is_err());
         assert!(page_origin("ftp://agents.example").is_err());
+    }
+
+    #[test]
+    fn loopback_origins_are_this_machine_only() {
+        for o in ["http://127.0.0.1:4470", "http://localhost:9", "http://[::1]:4470", "http://127.0.0.1"] {
+            assert!(loopback_origin(o), "{o}");
+        }
+        for o in ["https://agents-test.menger.sh", "http://0.0.0.0:4470", "http://10.0.0.1:4470", "https://localhost.example"] {
+            assert!(!loopback_origin(o), "{o}");
+        }
+    }
+
+    fn workos_on(public_url: &str, allow: &[&str]) -> anyhow::Result<Login> {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("workos-api-key");
+        std::fs::write(&key, "sk_test_00000000000000000000000000").unwrap();
+        let config = SignInConfig {
+            public_url: Some(public_url.into()),
+            workos_client: Some("client_01TESTTESTTESTTESTTESTTEST".into()),
+            workos_key_file: Some(key),
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            ..SignInConfig::default()
+        };
+        sign_in(&config, 4470)
+    }
+
+    #[test]
+    fn workos_on_a_public_url_with_no_allow_rule_refuses_to_start() {
+        let e = workos_on("https://agents.example", &[]).err().expect("refused");
+        assert!(e.to_string().contains("--allow github:"), "{e}");
+        // A rule, and it starts, GitHub alone, admitting by the rule.
+        let login = workos_on("https://agents.example", &["github:251524973"]).unwrap();
+        assert!(login.workos);
+        assert_eq!(login.allow.to_string(), "github:251524973");
+        assert!(login.allow.wants_github());
+        // On this machine alone, no rule is needed.
+        assert!(workos_on("http://127.0.0.1:4470", &[]).unwrap().allow.is_empty());
+        // A bad rule refuses the whole list: a typo never admits everyone.
+        let e = workos_on("https://agents.example", &["github:hypermemetic"]).err().expect("refused");
+        assert!(e.to_string().contains("numeric id"), "{e}");
+    }
+
+    #[test]
+    fn the_workos_sign_in_is_github_alone() {
+        let spec = github_only("client_01X", Some(std::path::Path::new("/run/secrets/workos")));
+        assert_eq!(spec, "workos:client_01X,social=github,email=off,sso=off,key=@/run/secrets/workos");
+        let backend = plexus_login::backends::from_spec(&spec, BRANDING.app).unwrap();
+        let can = backend.capabilities();
+        assert_eq!(can.social, vec![plexus_login::identity::Social::GitHub]);
+        assert!(!can.email_code && !can.sso_by_domain && !can.password, "{can:?}");
     }
 
     #[test]

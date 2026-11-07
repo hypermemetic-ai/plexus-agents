@@ -497,18 +497,64 @@ pub fn hub_with_login(
     hosts: Option<Arc<Hosts>>,
     backend: Arc<dyn plexus_rpc::core::plexus::AuthBackend>,
 ) -> Arc<DynamicHub> {
+    hub_with_ui(runtime, harnesses, grants, peers, hosts, backend, None)
+}
+
+/// The hub's name: a page's frames are `plexus-agents.call`.
+pub const SERVICE: &str = "plexus-agents";
+
+/// [`hub_with_login`], with plexus-ui's `ui` activation registered beside
+/// `agents`, `hosts` and `auth` (SUPERCONDUCTOR-11), as menger links it: its
+/// seam attached to this hub as a system caller of its own, `admin` on `*`
+/// here and nowhere else (a key nobody holds), so a push's `uses` are looked up
+/// in the running services.
+pub fn hub_with_ui(
+    runtime: Supervisor,
+    harnesses: Vec<Arc<dyn Harness>>,
+    mut grants: Vec<Grant>,
+    peers: Vec<Arc<Peer>>,
+    hosts: Option<Arc<Hosts>>,
+    backend: Arc<dyn plexus_rpc::core::plexus::AuthBackend>,
+    ui: Option<plexus_ui_service::UiActivation>,
+) -> Arc<DynamicHub> {
+    let system = ui.as_ref().map(|_| system_principal());
+    if let Some(system) = &system {
+        grants.push(
+            format!("{system}=admin@*")
+                .parse()
+                .expect("a key principal is one"),
+        );
+    }
     let names: Vec<String> = peers.iter().map(|p| p.name().to_string()).collect();
     let store = hosts.as_ref().map(|h| h.store());
     let gate = auth::gate_with_hosts(&runtime, names.clone(), grants.clone(), store.clone());
     let setup = auth::auth_setup(&runtime, names.clone(), grants, store, backend);
     let mut agents = AgentsActivation::new(runtime.clone(), harnesses, gate, peers);
-    let mut hub = DynamicHub::new("plexus-agents");
+    let mut hub = DynamicHub::new(SERVICE);
     if let Some(hosts) = hosts {
         hosts.reserve(names.into_iter().chain(runtime.placements()));
         agents = agents.with_hosts(hosts.clone());
         hub = hub.register(HostsActivation::new(hosts));
     }
-    Arc::new(hub.register(agents).with_auth(setup))
+    let seam = ui.as_ref().map(|u| u.seam().clone());
+    if let Some(ui) = ui {
+        hub = hub.register(ui);
+    }
+    let hub = Arc::new(hub.register(agents).with_auth(setup));
+    if let (Some(seam), Some(system)) = (seam, system) {
+        let meta = serde_json::json!({ "principal": system, "name": SERVICE });
+        let ctx = plexus_rpc::core::plexus::AuthContext::new(system, "system".into(), vec![], meta);
+        seam.attach(&hub, ctx);
+    }
+    hub
+}
+
+/// A principal nobody can prove: 32 fresh bytes as a key's.
+fn system_principal() -> String {
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    plexus_rpc::auth_core::adapters::key_principal(&bytes).to_string()
 }
 
 /// Where tokens come from.
@@ -600,6 +646,9 @@ pub struct Serving {
     pub hosts: Option<Arc<Hosts>>,
     /// Proxies whose `X-Forwarded-For` is believed: CIDRs, or `none`.
     pub trusted_proxies: Vec<String>,
+    /// SUPERCONDUCTOR-11: the ui store the public front's shell serves `/` and
+    /// `/app/…` from ([`crate::front::serve_public`]); the socket alone takes none.
+    pub ui: Option<Arc<plexus_ui_service::UiStore>>,
 }
 
 impl Serving {
@@ -609,6 +658,7 @@ impl Serving {
             port,
             hosts: None,
             trusted_proxies: Vec::new(),
+            ui: None,
         }
     }
 }

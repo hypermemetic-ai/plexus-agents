@@ -53,6 +53,18 @@
 //! subscription's items, which the transport would otherwise drop (LOCAL-7), and
 //! hands them to the call's stream. Dropping the stream sends `{ns}.call_unsub`.
 //!
+//! # A host's agents by a fixed name (SUPERCONDUCTOR-11)
+//!
+//! `agents.on.<host>.<method>` names the host in the path, which a plexus-ui
+//! component can't declare: its `uses` is a list of fixed method names, checked
+//! by the bus and linted at push, and a host's name is data. So the same calls
+//! are `hosts.<method>` with the host as a parameter, `host`: `hosts.threads`,
+//! `hosts.start`, `hosts.watch`, `hosts.send`, `hosts.interrupt`,
+//! `hosts.pending` and `hosts.answer`. Each is its owner's, and only its
+//! owner's, checked here as `agents.on.<host>` checks it, then goes out on the
+//! host's socket exactly as `agents.on.<host>.<method>` does: what the host
+//! answers comes back as it said it.
+//!
 //! # What's kept
 //!
 //! `{host_id, name, owner, public_key, mode, created, last_seen}` per host, in
@@ -60,6 +72,9 @@
 //! the deploy holds, never the store.
 
 use crate::auth::{Access, AgentsRequest, Caller};
+use crate::runtime::{GlobalSeq, ThreadId};
+use crate::service::{AgentsEvent, Placement, Prompt, WorkDir};
+use plexus_harness::{InputAnswer, InputRequestId, ModelName};
 use crate::pairing::{self, ServerKey};
 use crate::peer::{meta, one, timed_out, unavailable};
 use async_trait::async_trait;
@@ -1216,6 +1231,42 @@ impl ConnectionHook for WireHook {
     }
 }
 
+/// What a host answered on [`Hosts::call`], as `agents` events: each data item
+/// read back as the host's `AgentsEvent`, and a failure, the host's or the wire's,
+/// as `failed`.
+fn as_agents(stream: PlexusStream) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+    use futures::StreamExt;
+    stream.filter_map(|item| async move {
+        match item {
+            PlexusStreamItem::Data { content, .. } => {
+                let value = content.into_value();
+                Some(serde_json::from_value(value.clone()).unwrap_or_else(|e| {
+                    AgentsEvent::Failed {
+                        message: format!("the host answered something unreadable ({e}): {value}"),
+                    }
+                }))
+            }
+            PlexusStreamItem::Error { message, error, .. } => Some(AgentsEvent::Failed {
+                message: if message.is_empty() {
+                    error.to_string()
+                } else {
+                    message
+                },
+            }),
+            _ => None,
+        }
+    })
+}
+
+/// `params` without its nulls: an optional parameter left out, as the host's
+/// `typed_params` reads it.
+fn object(params: Value) -> Value {
+    match params {
+        Value::Object(map) => Value::Object(map.into_iter().filter(|(_, v)| !v.is_null()).collect()),
+        other => other,
+    }
+}
+
 /// `hosts`: pairing, the registry, and attaching.
 #[derive(Clone)]
 pub struct HostsActivation {
@@ -1229,6 +1280,27 @@ impl HostsActivation {
             hosts,
             access: Access,
         }
+    }
+}
+
+impl HostsActivation {
+    /// `agents.<method>` on `host`, if it's the caller's: see the module docs.
+    async fn forward(
+        &self,
+        caller: &Caller,
+        host: &HostName,
+        method: &str,
+        params: Value,
+    ) -> futures::stream::BoxStream<'static, AgentsEvent> {
+        use futures::StreamExt;
+        let principal = caller.actor().id.clone();
+        if self.hosts.owner_of(&host.0).as_deref() != Some(principal.as_str()) {
+            // Worded as `agents.on.<host>` words it: not yours reads as not there.
+            let message = not_yours(&host.0).to_string();
+            return futures::stream::iter([AgentsEvent::Failed { message }]).boxed();
+        }
+        let stream = self.hosts.call(&host.0, method, object(params), principal).await;
+        as_agents(stream).boxed()
     }
 }
 
@@ -1350,5 +1422,117 @@ impl HostsActivation {
     ) -> impl Stream<Item = HostsEvent> + Send + 'static {
         let name = name.as_ref().map(|n| n.0.as_str());
         outcome(self.hosts.attach(&caller.actor().id, &nonce.0, name))
+    }
+
+    /// The threads on one of your hosts, or one of them: `agents.threads` there.
+    #[plexus_rpc::macros::method]
+    pub async fn threads(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the host */
+        host: HostName,
+        /** one thread, or all of them */
+        thread: Option<ThreadId>,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        self.forward(&caller, &host, "threads", json!({ "thread": thread }))
+            .await
+    }
+
+    /// Starts a thread on one of your hosts, in a folder there: `agents.start`.
+    #[plexus_rpc::macros::method]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the host */
+        host: HostName,
+        /** where on the host it runs; `local` if omitted */
+        placement: Option<Placement>,
+        /** the directory it works in, on the host */
+        cwd: WorkDir,
+        /** the first prompt */
+        prompt: Prompt,
+        /** the model, or the harness's default */
+        model: Option<ModelName>,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        let placement = placement.unwrap_or_else(|| Placement("local".into()));
+        let params = json!({ "placement": placement, "cwd": cwd, "prompt": prompt, "model": model });
+        self.forward(&caller, &host, "start", params).await
+    }
+
+    /// Replays a thread on one of your hosts from `since`, then follows it live:
+    /// `agents.watch` there.
+    #[plexus_rpc::macros::method]
+    pub async fn watch(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the host */
+        host: HostName,
+        /** one thread, or every thread there */
+        thread: Option<ThreadId>,
+        /** the last sequence seen; from the start if omitted */
+        since: Option<GlobalSeq>,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        let params = json!({ "thread": thread, "since": since });
+        self.forward(&caller, &host, "watch", params).await
+    }
+
+    /// Sends a prompt to a thread on one of your hosts: `agents.send` there.
+    #[plexus_rpc::macros::method]
+    pub async fn send(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the host */
+        host: HostName,
+        /** the thread */
+        thread: ThreadId,
+        /** what to say */
+        prompt: Prompt,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        let params = json!({ "thread": thread, "prompt": prompt });
+        self.forward(&caller, &host, "send", params).await
+    }
+
+    /// Stops the turn of a thread on one of your hosts: `agents.interrupt` there.
+    #[plexus_rpc::macros::method]
+    pub async fn interrupt(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the host */
+        host: HostName,
+        /** the thread */
+        thread: ThreadId,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        let params = json!({ "thread": thread });
+        self.forward(&caller, &host, "interrupt", params).await
+    }
+
+    /// Every undecided request on one of your hosts: `agents.pending` there.
+    #[plexus_rpc::macros::method]
+    pub async fn pending(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the host */
+        host: HostName,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        self.forward(&caller, &host, "pending", json!({})).await
+    }
+
+    /// Answers a request on a thread on one of your hosts: `agents.answer` there.
+    #[plexus_rpc::macros::method]
+    pub async fn answer(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the host */
+        host: HostName,
+        /** the thread the request is on */
+        thread: ThreadId,
+        /** the request */
+        request: InputRequestId,
+        /** the answer */
+        answer: InputAnswer,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        let params = json!({ "thread": thread, "request": request, "answer": answer });
+        self.forward(&caller, &host, "answer", params).await
     }
 }

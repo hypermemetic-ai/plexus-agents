@@ -424,7 +424,8 @@ async fn pair(
 fn show(config: &HostConfig, id: &str, code: &str) {
     use std::io::IsTerminal;
     let app = app_url(config);
-    let link = format!("{app}/#/pair?id={id}");
+    // SUPERCONDUCTOR-11: the bundle's pairing route, `#/pair/:id`.
+    let link = format!("{app}/#/pair/{id}");
     let paint = if std::io::stdout().is_terminal() {
         pairing::Paint::Ansi
     } else {

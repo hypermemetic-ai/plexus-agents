@@ -10,7 +10,8 @@ use plexus_agents::front::{self, SignInConfig};
 use plexus_agents::hosts::Hosts;
 use plexus_agents::pairing::ServerKey;
 use plexus_agents::runtime::{Supervisor, SupervisorConfig};
-use plexus_agents::service::{hub_with_login, Serving};
+use plexus_agents::service::{hub_with_ui, Serving};
+use plexus_ui_service::{Signers, UiActivation, UiStore, DEFAULT_CHANNEL};
 use plexus_agents::ClaudeHarness;
 use plexus_rpc::auth_core::adapters::sign_key_proof;
 use plexus_harness::{Environment, Harness};
@@ -25,6 +26,8 @@ use std::time::Duration;
 
 const ADMIN_SEED: [u8; 32] = [21; 32];
 const OTHER_SEED: [u8; 32] = [22; 32];
+/// The key the service takes a UI push signed by (`--ui-signer`).
+const UI_SEED: [u8; 32] = [23; 32];
 
 fn principal(seed: &[u8; 32]) -> String {
     let key = ed25519_dalek::SigningKey::from_bytes(seed);
@@ -67,6 +70,11 @@ struct Service {
 
 /// The service, wired as `main` wires it: no local placement, an admin key.
 async fn service(workos: Option<&str>) -> Service {
+    service_allowing(workos, &[]).await
+}
+
+/// [`service`], with `--allow` rules.
+async fn service_allowing(workos: Option<&str>, allow: &[&str]) -> Service {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("agents.db");
     let env: Arc<dyn Environment> = Arc::new(Nowhere);
@@ -93,21 +101,28 @@ async fn service(workos: Option<&str>) -> Service {
         workos_key_file: key_file,
         admins: vec![admin.clone()],
         loopback: true,
+        allow: allow.iter().map(|r| r.to_string()).collect(),
         ..SignInConfig::default()
     };
     let login = front::sign_in(&config, port).unwrap();
     let hosts = Hosts::open(&db, &url, ServerKey::from_seed([42; 32])).unwrap();
     let grants = vec![format!("{admin}=admin@*").parse().unwrap()];
-    let hub = hub_with_login(
+    // plexus-ui, linked: its store beside the agents file, a push signed by UI_SEED.
+    let store = Arc::new(UiStore::open_channel(&dir.path().join("ui.db"), DEFAULT_CHANNEL).unwrap());
+    let signer = principal(&UI_SEED).trim_start_matches("key:").to_string();
+    let ui = UiActivation::new(store.clone(), Signers::parse(&[signer]).unwrap());
+    let hub = hub_with_ui(
         runtime,
         harnesses,
         grants,
         vec![],
         Some(hosts.clone()),
         login.backend(),
+        Some(ui),
     );
     let serving = Serving {
         hosts: Some(hosts.clone()),
+        ui: Some(store),
         ..Serving::new([127, 0, 0, 1].into(), port)
     };
     tokio::spawn(front::serve_public(hub, login, serving));
@@ -207,15 +222,14 @@ async fn call(c: &WsClient, method: &str, params: Value) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn one_port_serves_the_page_the_sign_in_and_the_socket() {
+async fn one_port_serves_the_shell_the_sign_in_and_the_socket() {
     let a = service(None).await;
-    let (status, page) = get(a.port, "/");
-    assert_eq!(status, 200);
-    assert!(
-        page.contains("plexus-agents") && page.contains("#/pair"),
-        "{page}"
-    );
-    assert!(page.contains("hosts.confirm") && page.contains("/login?next=%2F"));
+    // The shell is plexus-ui's: nothing pushed yet, so its placeholder, at / and /app/.
+    for path in ["/", "/app/"] {
+        let (status, page) = get(a.port, path);
+        assert_eq!(status, 200, "{path}");
+        assert!(page.contains("No UI is live yet"), "{path}: {page}");
+    }
     let (status, _) = get(a.port, "/login");
     assert_eq!(status, 200);
     let (status, _) = get(a.port, "/login/me");
@@ -302,10 +316,12 @@ async fn with_no_workos_key_key_sign_in_works_and_there_is_no_workos_button() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn with_a_workos_key_the_sign_in_offers_the_emailed_code() {
+async fn with_a_workos_key_the_sign_in_offers_github_alone() {
     let a = service(Some("sk_test_00000000000000000000000000")).await;
     let (_, login) = get(a.port, "/login");
-    assert!(login.contains("/login/email"), "the emailed-code form");
+    // SUPERCONDUCTOR-25: GitHub alone, no emailed code.
+    assert!(!login.contains("/login/email"), "no emailed-code form: {login}");
+    assert!(login.contains("/login/social") && login.to_lowercase().contains("github"), "{login}");
     assert!(
         login.contains(r#"name="next""#),
         "it carries next, and the hash with it"
@@ -384,7 +400,7 @@ async fn a_host_pairs_through_the_page_socket_with_a_session_cookie() {
     });
     let link = printed(&mut rx, "link: ").await;
     let code = printed(&mut rx, "code: ").await;
-    let (page, id) = link.split_once("/#/pair?id=").unwrap();
+    let (page, id) = link.split_once("/#/pair/").unwrap();
     assert_eq!(page, a.origin(), "the link is this service's page");
 
     // The page's socket: same origin, the session as a cookie.
@@ -405,6 +421,11 @@ async fn a_host_pairs_through_the_page_socket_with_a_session_cookie() {
         if a.hosts.online("mac") {
             let r = call(&browser, "agents.on.mac.harnesses", json!({})).await;
             assert_eq!(r["type"], "harnesses", "{r}");
+            // SUPERCONDUCTOR-11: the same host by a fixed name, as the bundle calls it.
+            let r = call(&browser, "hosts.threads", json!({"host": "mac"})).await;
+            assert_eq!(r["type"], "threads", "{r}");
+            let r = call(&browser, "hosts.pending", json!({"host": "mac"})).await;
+            assert_eq!(r["type"], "pending", "{r}");
             assert!(a.dir.path().exists());
             return;
         }
@@ -456,4 +477,93 @@ async fn the_pairing_limit_counts_the_forwarded_client() {
     );
     let (_c, r) = ask(121, "203.0.113.2").await;
     assert_eq!(r["type"], "pairing", "another client: {r}");
+}
+
+/// A tar of `files`, in order, as plexus-ui's push reads one.
+fn tar_of(files: &[(&str, &str)]) -> Vec<u8> {
+    let mut b = tar::Builder::new(Vec::new());
+    for (name, body) in files {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(body.len() as u64);
+        h.set_mode(0o644);
+        h.set_cksum();
+        b.append_data(&mut h, name, body.as_bytes()).unwrap();
+    }
+    b.into_inner().unwrap()
+}
+
+/// `ui.push`'s params for `bundle`, signed by `seed` over its sha256.
+fn push_params(seed: &[u8; 32], bundle: &[u8], manifest: &str) -> Value {
+    use ed25519_dalek::Signer;
+    use sha2::Digest;
+    let signature = ed25519_dalek::SigningKey::from_bytes(seed).sign(&sha2::Sha256::digest(bundle));
+    let b64 = base64::engine::general_purpose::STANDARD;
+    json!({ "bundle": b64.encode(bundle), "manifest": manifest, "signature": b64.encode(signature.to_bytes()), "commit": "test@0000000" })
+}
+
+/// SUPERCONDUCTOR-11: a bundle pushed by the admin, signed by a `--ui-signer`, is
+/// what `/` serves, stamped with this port and this service; one signed by any
+/// other key, or pushed by someone who isn't a deployer, is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pushed_bundle_is_the_shell() {
+    let a = service(None).await;
+    let index = "<!doctype html><title>{{TITLE}}</title><meta name=\"plexus-service\" content=\"{{SERVICE}}\"><meta name=\"plexus-ws-port\" content=\"{{WS_PORT}}\"><p>superconductor test bundle</p>";
+    let bundle = tar_of(&[("index.html", index)]);
+    let manifest = json!({ "abi": "engine/1", "contract": "unknown", "routes": {}, "components": {}, "slots": {} }).to_string();
+
+    let bearer = format!("Bearer {}", a.proof(&ADMIN_SEED, "synapse"));
+    let admin = connect(a.port, "/ws", &[("authorization", bearer)]).await.unwrap();
+    let wrong = call(&admin, "ui.push", push_params(&OTHER_SEED, &bundle, &manifest)).await;
+    assert_eq!(wrong["type"], "refused", "{wrong}");
+    let bearer = format!("Bearer {}", a.proof(&OTHER_SEED, "synapse"));
+    let other = connect(a.port, "/ws", &[("authorization", bearer)]).await.unwrap();
+    let r = call(&other, "ui.push", push_params(&UI_SEED, &bundle, &manifest)).await;
+    assert_eq!(r["error_kind"], "forbidden", "not a deployer: {r}");
+
+    let pushed = call(&admin, "ui.push", push_params(&UI_SEED, &bundle, &manifest)).await;
+    assert_eq!(pushed["type"], "pushed", "{pushed}");
+    assert_eq!(pushed["live"], true, "{pushed}");
+    let (status, page) = get(a.port, "/");
+    assert_eq!(status, 200);
+    assert!(page.contains("superconductor test bundle"), "{page}");
+    assert!(page.contains(&format!("content=\"{}\"", a.port)), "the socket is this port: {page}");
+    assert!(page.contains("content=\"plexus-agents\""), "frames are plexus-agents.call: {page}");
+    let versions = items(&admin, "ui.versions", json!({})).await.unwrap();
+    assert!(versions.iter().any(|v| v["live"] == true), "{versions:?}");
+}
+
+/// SUPERCONDUCTOR-25: with an allow rule (github, so only a WorkOS sign-in with
+/// that GitHub id could get a session), key sign-in, sessions minted on it and
+/// a host's pairing go on as before, and the sign-in offers GitHub alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn with_an_allow_rule_keys_and_their_sessions_still_sign_in() {
+    let a = service_allowing(Some("sk_test_00000000000000000000000000"), &["github:251524973"]).await;
+    let (_, login) = get(a.port, "/login");
+    assert!(!login.contains("/login/email"), "{login}");
+    let bearer = format!("Bearer {}", a.proof(&ADMIN_SEED, "synapse"));
+    let admin = connect(a.port, "/ws", &[("authorization", bearer)]).await.unwrap();
+    let r = call(&admin, "hosts.list", json!({})).await;
+    assert_eq!(r["type"], "hosts", "{r}");
+    let s = call(&admin, "auth.login", json!({"flow": {"session": {"ttl_secs": 600}}})).await;
+    let token = s["token"].as_str().unwrap_or_else(|| panic!("{s}")).to_string();
+    let by_token = connect(a.port, "/ws", &[("authorization", format!("Bearer {token}"))]).await.unwrap();
+    let me = call(&by_token, "auth.whoami", json!({})).await;
+    assert!(me.to_string().contains(&principal(&ADMIN_SEED)), "{me}");
+}
+
+/// SUPERCONDUCTOR-11: a host's agents by a fixed name, the host a parameter
+/// (`hosts.threads {host}`): its owner's alone, refused to anyone else as a host
+/// that isn't there.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_by_a_fixed_name_is_its_owner_alone() {
+    let a = service(None).await;
+    let bearer = format!("Bearer {}", a.proof(&ADMIN_SEED, "synapse"));
+    let admin = connect(a.port, "/ws", &[("authorization", bearer)]).await.unwrap();
+    let r = call(&admin, "hosts.threads", json!({"host": "nobody"})).await;
+    assert_eq!(r["type"], "failed", "{r}");
+    let r = call(&admin, "hosts.watch", json!({"host": "nobody", "thread": "t"})).await;
+    assert_eq!(r["type"], "failed", "{r}");
+    let anon = connect(a.port, "/ws", &[]).await.unwrap();
+    let r = call(&anon, "hosts.threads", json!({"host": "nobody"})).await;
+    assert_eq!(r["error_kind"], "unauthenticated", "{r}");
 }

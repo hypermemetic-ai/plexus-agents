@@ -1,7 +1,9 @@
-//! `plexus-agents`: the `agents` service.
+//! `plexus-agents`: the `agents` service, and the superconductor (SUPERCONDUCTOR-11):
+//! plexus-ui linked in the same process, its shell and bundle on the same port.
 //!
 //! ```text
 //! plexus-agents --db FILE [--port 4470] [--bind 127.0.0.1] [--public-url URL]
+//!               [--ui-db FILE] [--ui-signer HEX]... [--allow RULE]...
 //!               [--placement NAME]... [--no-local] [--grant PRINCIPAL=ROLE@SCOPE]...
 //!               [--admin PRINCIPAL]... [--record DIR]
 //!               [--workos-client CLIENT [--workos-api-key-file FILE]] [--identity SPEC]
@@ -10,17 +12,30 @@
 //!               [--sessions-file FILE] [--service-key FILE] [--peer NAME=URL]...
 //! ```
 //!
-//! One port serves everything (SUPERCONDUCTOR-19): `GET /` is the page (your
-//! hosts, `/#/pair`), `/login*` is plexus-login's sign-in, and an upgrade on any
-//! path (`/`, `/ws`) is the Plexus socket. A browser's upgrade must come from this
-//! service's own origin; a client sending no `Origin` may connect.
+//! One port serves everything (SUPERCONDUCTOR-19, -11): an upgrade on any path (`/`,
+//! `/ws`) is the Plexus socket, carrying `agents`, `hosts`, `ui` and `auth`;
+//! `/login*` is plexus-login's sign-in; and `GET /`, `/app/…` is plexus-ui's shell,
+//! serving the live bundle (the repository's `ui/`, pushed with `plexus-ui push`;
+//! deploy/push-ui.sh). A browser's upgrade must come from this service's own origin;
+//! a client sending no `Origin` may connect.
+//!
+//! **The UI.** `--ui-db` is plexus-ui's store (default `ui.db` beside `--db`): the
+//! pushed versions and the live pointer. `--ui-signer` (64 hex, repeatable) names a
+//! key whose signed bundles a push takes; with none, every push is refused. A push
+//! is `admin`'s, or `deployer`'s (`--grant key:<hex>=deployer@*`); every signed-in
+//! person reads the UI.
 //!
 //! **Signing in.** Key sign-in (`key:<hex>`) is always on: key proofs naming this
 //! service's sockets (`ws://127.0.0.1:<port>`, `ws://localhost:<port>`, and the
-//! public URL's `wss://host` and `wss://host/ws`) or a `--key-audience`. WorkOS by
-//! emailed code is on given `--workos-client` and its API key, from
-//! `--workos-api-key-file` or `AGENTS_WORKOS_API_KEY`; without a key there's no
-//! WorkOS button. `--identity` takes a whole plexus-login identity spec instead.
+//! public URL's `wss://host` and `wss://host/ws`) or a `--key-audience`. WorkOS,
+//! GitHub only (SUPERCONDUCTOR-25: no emailed code, no SSO), is on given
+//! `--workos-client` and its API key, from `--workos-api-key-file` or
+//! `AGENTS_WORKOS_API_KEY`; without a key there's no WorkOS button. `--identity`
+//! takes a whole plexus-login identity spec instead. `--allow` names who gets a
+//! session: `github:<numeric id>` (a WorkOS sign-in's linked GitHub account) or
+//! `principal:<principal>`, repeatable; with any rule, WorkOS bearer tokens are
+//! refused at the socket (key proofs and sessions are not). WorkOS on a public
+//! (non-loopback) URL with no rule refuses to start.
 //! `--issuer`/`--audience` admit plexus-idp tokens as before. `--admin` makes a
 //! principal `admin` everywhere (`key:<hex>` where there's no WorkOS).
 //! `auth.*` (`login`, `whoami`, `providers`, …) is mounted, so `synapse _login`
@@ -54,8 +69,9 @@
 //! Every flag can come from the environment instead: `AGENTS_DB`, `AGENTS_PORT`,
 //! `AGENTS_BIND`, `AGENTS_PUBLIC_URL`, `AGENTS_SERVER_KEY`, `AGENTS_NO_LOCAL=1`,
 //! `AGENTS_WORKOS_CLIENT`, `AGENTS_WORKOS_API_KEY_FILE`, `AGENTS_IDENTITY`,
-//! `AGENTS_SESSIONS_FILE`, and the lists `AGENTS_ADMINS`, `AGENTS_TRUSTED_PROXIES`,
-//! `AGENTS_PLACEMENTS`, `AGENTS_KEY_AUDIENCES` (comma-separated). A flag wins.
+//! `AGENTS_SESSIONS_FILE`, `AGENTS_UI_DB`, and the lists `AGENTS_ADMINS`,
+//! `AGENTS_TRUSTED_PROXIES`, `AGENTS_PLACEMENTS`, `AGENTS_KEY_AUDIENCES`,
+//! `AGENTS_ALLOW`, `AGENTS_UI_SIGNERS` (comma-separated). A flag wins.
 //!
 //! ```text
 //! plexus-agents host --server URL --name NAME --db FILE
@@ -81,6 +97,7 @@ use plexus_agents::runtime::{Supervisor, SupervisorConfig};
 use plexus_agents::service::{self, TokenIssuer};
 use plexus_agents::{ClaudeHarness, LocalEnvironment, RecordingEnvironment};
 use plexus_harness::{Environment, Harness};
+use plexus_ui_service::{Signers, UiActivation, UiStore, DEFAULT_CHANNEL, UI_DB_FILE};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -120,6 +137,9 @@ async fn main() -> anyhow::Result<()> {
     let mut workos_key_file = env("AGENTS_WORKOS_API_KEY_FILE").map(std::path::PathBuf::from);
     let mut identity = env("AGENTS_IDENTITY");
     let mut sessions_file = env("AGENTS_SESSIONS_FILE").map(std::path::PathBuf::from);
+    let mut ui_db = env("AGENTS_UI_DB").map(std::path::PathBuf::from);
+    let mut ui_signers = env_list("AGENTS_UI_SIGNERS");
+    let mut allow = env_list("AGENTS_ALLOW");
     // A list flag given replaces the environment's list.
     let mut replaced = std::collections::HashSet::new();
     let mut it = std::env::args().skip(1);
@@ -153,6 +173,9 @@ async fn main() -> anyhow::Result<()> {
             "--workos-api-key-file" => workos_key_file = Some(value()?.into()),
             "--identity" => identity = Some(value()?),
             "--sessions-file" => sessions_file = Some(value()?.into()),
+            "--ui-db" => ui_db = Some(value()?.into()),
+            "--ui-signer" => list(&mut ui_signers, value()?, "ui-signer"),
+            "--allow" => list(&mut allow, value()?, "allow"),
             "--print-key" => {
                 println!(
                     "{}",
@@ -195,15 +218,32 @@ async fn main() -> anyhow::Result<()> {
         trusted_proxies: trusted_proxies.clone(),
         sessions_file: Some(sessions_file.unwrap_or_else(|| db.with_extension("sessions"))),
         loopback: bind.is_loopback(),
+        allow,
     };
     let login = front::sign_in(&sign_in, port)?;
     eprintln!(
-        "plexus-agents: sign-in by key{}",
+        "plexus-agents: sign-in by key{}{}",
         if login.workos {
-            " and WorkOS"
+            " and WorkOS (GitHub)"
         } else {
             " (no WorkOS)"
+        },
+        if login.allow.is_empty() {
+            String::new()
+        } else {
+            format!(", allowing {}", login.allow)
         }
+    );
+    // SUPERCONDUCTOR-11: plexus-ui's store and the keys whose pushes it takes.
+    let ui_db = ui_db.unwrap_or_else(|| default_ui_db(&db));
+    let signers = Signers::parse(&ui_signers).map_err(|e| anyhow!("--ui-signer: {e}"))?;
+    let store = UiStore::open_channel(&ui_db, DEFAULT_CHANNEL)
+        .map_err(|e| anyhow!("the ui store {} (--ui-db): {e}", ui_db.display()))?;
+    let store = Arc::new(store);
+    eprintln!(
+        "plexus-agents: ui store {}, {} signer(s)",
+        ui_db.display(),
+        ui_signers.len()
     );
     let peers = peers
         .iter()
@@ -243,13 +283,32 @@ async fn main() -> anyhow::Result<()> {
     .map_err(|e| anyhow!("{e}"))?;
     eprintln!("plexus-agents: on {bind}:{port}, recovered {recovery:?}");
     let backend = login.backend();
-    let hub = service::hub_with_login(runtime, harnesses, grants, peers, hosts.clone(), backend);
+    let ui = UiActivation::new(store.clone(), signers);
+    let hub = service::hub_with_ui(
+        runtime,
+        harnesses,
+        grants,
+        peers,
+        hosts.clone(),
+        backend,
+        Some(ui),
+    );
     let serving = service::Serving {
         hosts,
         trusted_proxies,
+        ui: Some(store),
         ..service::Serving::new(bind, port)
     };
     front::serve_public(hub, login, serving).await
+}
+
+/// plexus-ui's store beside `db`: `ui.db` in its directory (`agents-ui.db` when the
+/// agents file is itself named `ui.db`).
+fn default_ui_db(db: &std::path::Path) -> std::path::PathBuf {
+    match db.with_file_name(UI_DB_FILE) {
+        same if same == db => db.with_file_name(format!("agents-{UI_DB_FILE}")),
+        ui => ui,
+    }
 }
 
 /// `plexus-agents host`: see the module docs.

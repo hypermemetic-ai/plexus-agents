@@ -16,6 +16,12 @@ plexus-rpc = { version = "0.8.0", features = ["auth-adapters"] }
 # SUPERCONDUCTOR-19: sign-in (WorkOS, key), sessions and the auth activation, as
 # menger links it. 0.3 is the Plexus 0.8 line.
 plexus-login = "0.3.1"
+# SUPERCONDUCTOR-11: plexus-ui linked in-process, as menger links it (FRAME-7):
+# the `ui` activation over its own `ui.db`, its seam, and the routes that serve
+# the shell (`/`, `/app/...`) from the live bundle. The shell's base router and
+# page policy are plexus-webapp's.
+plexus-ui-service = "0.2.1"
+plexus-webapp = "0.3.1"
 anyhow = "1"
 async-stream = "0.3"
 # The one public port: the page, the sign-in routes, and the socket in front.
@@ -28,7 +34,8 @@ jsonrpsee = { version = "0.26", features = ["server", "macros", "ws-client"] }
 libc = "0.2"
 # The pairing link as a QR code (TETHER-12's, lifted).
 qrcode = { version = "0.14", default-features = false }
-rusqlite = { version = "0.31", features = ["bundled"] }
+# 0.37: plexus-ui-service's, so one SQLite is linked.
+rusqlite = { version = "0.37", features = ["bundled"] }
 schemars = "1.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -41,8 +48,16 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
+# SUPERCONDUCTOR-11: a bundle's tar, pushed in the shell's test.
+tar = "0.4"
 jsonwebtoken = "9"
 rsa = "0.9"
 rand = "0.8"
 url = "2"
 plexus-harness = { path = "../plexus-harness", features = ["conformance"] }
+
+# SUPERCONDUCTOR-25: plexus-login with the allow list (`Allow`, `LoginOptions::allowing`),
+# 0.3.1 plus that commit, unpublished: by path beside this checkout, as
+# plexus-harness is (deploy/Dockerfile pins the commit).
+[patch.crates-io]
+plexus-login = { path = "../plexus-login" }

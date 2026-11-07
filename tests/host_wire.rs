@@ -380,7 +380,7 @@ async fn pair(a: &Service, user: &WsClient, name: &str, key: &Path) -> (Host, St
     let mut b = Host::start(a, name, &["--key", key.to_str().unwrap()]);
     let link = b.printed("link: ").await;
     let code = b.printed("code: ").await;
-    let (page, id) = link.split_once("/#/pair?id=").expect("a pairing link");
+    let (page, id) = link.split_once("/#/pair/").expect("a pairing link");
     assert_eq!(page, a.url.replace("ws://", "http://"), "{link}");
     let pending = call(user, "hosts.pairing", json!({"pairing_id": id})).await;
     assert_eq!(pending["type"], "pending", "{pending}");

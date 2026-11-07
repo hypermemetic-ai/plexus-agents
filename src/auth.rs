@@ -53,20 +53,57 @@ pub const OWNER_GRANTS: [&str; 8] = [
 /// through [`OWNER`], so a `key:` principal, which holds no [`OWNER`], has none of
 /// them: a key can't confirm a pairing. `agents.on.placements` lists only what the
 /// caller reaches: its own hosts, for a user with no other grant.
-pub const HOST_USER_GRANTS: [&str; 6] = [
+/// SUPERCONDUCTOR-11: and a host's `agents` by a fixed name (`hosts.watch` with the
+/// host as a parameter, see [`crate::hosts`]), each checked for its owner inside.
+pub const HOST_USER_GRANTS: [&str; 13] = [
     "hosts.pairing",
     "hosts.confirm",
     "hosts.unpair",
     "hosts.list",
     "hosts.attach",
+    "hosts.threads",
+    "hosts.start",
+    "hosts.watch",
+    "hosts.send",
+    "hosts.interrupt",
+    "hosts.pending",
+    "hosts.answer",
     "agents.on.placements",
 ];
+
+/// SUPERCONDUCTOR-11: what a page of the UI reads of the `ui` service, as its
+/// `viewer` role lists it: the versions, `ui.watch` (the engine's hot-swap), the
+/// contract, its sections and routes. Held through [`OWNER`], so every signed-in
+/// person draws the UI; a write (a push) is `admin`'s or [`DEPLOYER`]'s.
+pub const UI_VIEWER_GRANTS: [&str; 9] = [
+    "ui.versions",
+    "ui.watch",
+    "ui.contract",
+    "ui.here",
+    "ui.follow",
+    "ui.history",
+    "ui.components",
+    "ui.slots.list",
+    "ui.routes.list",
+];
+
+/// SUPERCONDUCTOR-11: may push the UI's bundle and promote it, held on `*`
+/// (`--grant key:<hex>=deployer@*`): a deploy's key, never admin.
+pub const DEPLOYER: &str = "deployer";
 
 /// What each role lists. `admin` is built in and holds everything.
 pub fn roles() -> RoleTable {
     let mut t = RoleTable::new();
     t.set(USER, GrantSet::listed(["agents.start"]));
-    let owner = OWNER_GRANTS.iter().chain(HOST_USER_GRANTS.iter()).copied();
+    let owner = OWNER_GRANTS
+        .iter()
+        .chain(HOST_USER_GRANTS.iter())
+        .chain(UI_VIEWER_GRANTS.iter())
+        .copied();
+    t.set(
+        DEPLOYER,
+        GrantSet::listed(UI_VIEWER_GRANTS.iter().copied().chain(["ui.push", "ui.promote"])),
+    );
     t.set(OWNER, GrantSet::listed(owner));
     t.set(plexus_rpc::auth_core::grants::ADMIN, GrantSet::All);
     t
