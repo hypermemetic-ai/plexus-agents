@@ -1,133 +1,186 @@
-<!-- SUPERCONDUCTOR-11: `#/h/:host` — a host's page (SUPERCONDUCTOR-27's 8, after
-     Happy's machine screen): online or last seen, how it signs in, its threads with
-     one status each, a new thread in a folder there (the folder remembered per host
-     in this browser), and unpair behind a confirm. -->
+<!-- SUPERCONDUCTOR-34: `#/h/:host`, the machine screen (after Happy's): its name,
+     online or when last seen in words, what it is in plain words, its threads
+     grouped by folder (most recent first), New thread as the one primary action,
+     and unpair as a quiet separate danger action with an inline confirm that says
+     what it does. Main content only: sc-frame draws the top bar and the nav. -->
 <script module>
-  export const uses = ["hosts.list", "hosts.threads", "hosts.pending", "hosts.start", "hosts.unpair"];
+  export const uses = ["hosts.list", "hosts.threads", "hosts.unpair"];
 </script>
 
 <script>
   import { bus } from "plexus-ui/host";
-  import Top from "./sc-top.svelte";
-  import Nav from "./sc-nav.svelte";
+  import Button from "./sc-button.svelte";
+  import Empty from "./sc-empty.svelte";
   import Pill from "./sc-pill.svelte";
 
   let { host } = $props();
   const b = bus();
-  let info = $state(null);
+  let info = $state(undefined);
   let threads = $state([]);
-  let pending = $state([]);
   let said = $state("");
-  let starting = $state(false);
-  const key = $derived("superconductor.cwd." + host);
-  const remembered = (k) => { try { return localStorage.getItem(k) || ""; } catch { return ""; } };
-  let cwd = $state("");
-  let prompt = $state("");
+  let confirming = $state(false);
+  let unpairing = $state(false);
 
   const event = (r, type) => (r.events ?? []).find((e) => e.type === type);
   const failure = (r) => event(r, "failed")?.message ?? (r.ok ? "" : (r.message ?? ""));
+  const lower = (s) => (typeof s === "string" ? s : Object.keys(s ?? {})[0] ?? "").toLowerCase();
+  function statusOf(t) {
+    const s = lower(t.status);
+    if ((t.pending ?? []).length || s === "parked") return "needs";
+    return s === "running" ? "working" : s === "broken" ? "failed" : "idle";
+  }
+  const NOTE = { needs: "Waiting for your answer", working: "Claude is working", failed: "Stopped and can't continue", idle: "" };
+  const base = (p) => (p ?? "").replace(/\/+$/, "").split("/").pop() || p || "No folder";
+  const ago = (secs) => {
+    if (!secs) return "never";
+    const d = Date.now() / 1000 - secs;
+    const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
+    if (d < 60) return "just now";
+    if (d < 3600) return rtf.format(-Math.round(d / 60), "minute");
+    if (d < 86400) return rtf.format(-Math.round(d / 3600), "hour");
+    return rtf.format(-Math.round(d / 86400), "day");
+  };
+  const turns = (n) => `${n} ${n === 1 ? "turn" : "turns"}`;
+
   async function load() {
     const r = await b.call("hosts.list", {});
     info = (event(r, "hosts")?.hosts ?? []).find((h) => h.name === host) ?? null;
-    if (!info?.online) { threads = []; pending = []; return; }
-    const [t, p] = await Promise.all([b.call("hosts.threads", { host }), b.call("hosts.pending", { host })]);
-    threads = (event(t, "threads")?.threads ?? []).slice().reverse();
-    pending = event(p, "pending")?.requests ?? [];
+    if (!info?.online) { threads = []; return; }
+    const t = await b.call("hosts.threads", { host });
+    threads = (event(t, "threads")?.threads ?? []).slice().sort((x, y) => (y.last_seq ?? 0) - (x.last_seq ?? 0));
     said = failure(t);
   }
   $effect(() => {
-    cwd = remembered(key);
+    host;
+    info = undefined; confirming = false; said = "";
     load();
-    const timer = setInterval(load, 4000);
+    const timer = setInterval(load, 5000);
     return () => clearInterval(timer);
   });
 
-  const lower = (s) => (typeof s === "string" ? s : Object.keys(s ?? {})[0] ?? "").toLowerCase();
-  function statusOf(t) {
-    if (pending.some((r) => r.thread === t.id) || (t.pending ?? []).length) return "needs";
-    const s = lower(t.status);
-    return s === "running" ? "working" : s === "broken" ? "failed" : "idle";
-  }
-  async function start(ev) {
-    ev.preventDefault();
-    if (!cwd.trim() || !prompt.trim()) return;
-    starting = true;
-    try { localStorage.setItem(key, cwd.trim()); } catch { /* a private window */ }
-    const r = await b.call("hosts.start", { host, cwd: cwd.trim(), prompt });
-    starting = false;
-    const started = event(r, "started");
-    if (started) {
-      prompt = "";
-      b.navigate(`#/h/${encodeURIComponent(host)}/t/${encodeURIComponent(started.thread)}`);
-    } else said = failure(r) || "the host answered nothing";
-  }
+  // Folders in the order of their most recent thread.
+  const folders = $derived.by(() => {
+    const by = new Map();
+    for (const t of threads) {
+      const k = t.cwd ?? "";
+      if (!by.has(k)) by.set(k, []);
+      by.get(k).push(t);
+    }
+    return [...by.entries()];
+  });
+
   async function unpair() {
-    if (!confirm(`Unpair ${host}? Its key is refused from now on, and its socket closed.`)) return;
+    unpairing = true;
     const r = await b.call("hosts.unpair", { name: host });
-    if (event(r, "unpaired")) b.navigate("#/"); else said = failure(r);
+    unpairing = false;
+    if (event(r, "unpaired")) b.navigate("#/"); else said = failure(r) || "The server didn't confirm the unpairing.";
   }
-  function enter(ev) {
-    if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) { ev.preventDefault(); ev.currentTarget.form.requestSubmit(); }
-  }
-  const when = (secs) => (secs ? new Date(secs * 1000).toLocaleString() : "never");
+  const threadHref = (t) => `#/h/${encodeURIComponent(host)}/t/${encodeURIComponent(t.id)}`;
 </script>
 
-<div class="page">
-  <Top/>
-  <div class="body">
-    <Nav/>
-    <main>
-      <div class="head">
-        <h1><span class="dot" data-online={info?.online ?? false}></span>{host}</h1>
-        <span class="muted">{info ? (info.online ? "online" : "offline, last seen " + when(info.last_seen)) : "not one of your hosts"}{info ? " · signs in as " + info.mode : ""}</span>
-        {#if info}<button class="quiet" type="button" onclick={unpair}>Unpair</button>{/if}
+<div class="sc-page">
+  {#if info === undefined}
+    <p class="quiet">Loading {host}…</p>
+  {:else if info === null}
+    <Empty title={`${host} isn't one of your machines`} body="It may have been unpaired, or the link is mistyped. Your machines are listed on the home page.">
+      <p><a href="#/">Go to your machines</a></p>
+    </Empty>
+  {:else}
+    <header class="head">
+      <div class="id">
+        <h1>{host}</h1>
+        <p class="state" data-online={info.online}>
+          <span class="dot" aria-hidden="true"></span>
+          {info.online ? "Online now" : `Offline, last seen ${ago(info.last_seen)}`}
+        </p>
       </div>
-      {#if said}<p class="error">{said}</p>{/if}
-      {#if info?.online}
-        <form class="new" onsubmit={start}>
-          <label>Folder on {host}<input value={cwd} oninput={(e) => (cwd = e.currentTarget.value)} required placeholder="/Users/you/project" spellcheck="false"/></label>
-          <label>Message<textarea rows="3" value={prompt} oninput={(e) => (prompt = e.currentTarget.value)} onkeydown={enter} required placeholder="What should Claude do? (⌘/Ctrl+Enter starts)"></textarea></label>
-          <p><button class="primary" type="submit" disabled={starting}>Start a thread</button> <span class="muted">Claude runs on {host}, in that folder, with Bash.</span></p>
-        </form>
-        <h2>Threads</h2>
-        {#each threads as t (t.id)}
-          <a class="row" href={`#/h/${encodeURIComponent(host)}/t/${encodeURIComponent(t.id)}`}>
-            <Pill status={statusOf(t)}/><code>{String(t.id).slice(0, 8)}</code><span class="cwd">{t.cwd ?? ""}</span>
-            <span class="muted">{t.last_turn} turn{t.last_turn === 1 ? "" : "s"}</span>
-          </a>
-        {:else}
-          <p class="muted">No threads yet.</p>
-        {/each}
-      {:else if info}
-        <p class="muted">Start <code>plexus-agents host</code> on {host} and it comes back here.</p>
+      <Button kind="primary" disabled={!info.online} onclick={() => b.navigate(`#/h/${encodeURIComponent(host)}/new`)}>New thread</Button>
+    </header>
+    <p class="about">
+      {lower(info.mode) === "machine"
+        ? `A computer you paired. It connects by itself with its own key, and Claude runs there, in folders on ${host}.`
+        : `A computer signed in with your own account. Claude runs there, in folders on ${host}.`}
+    </p>
+
+    {#if said}<p class="error" role="alert">{said}</p>{/if}
+
+    {#if !info.online}
+      <Empty title={`${host} is offline`} body={`Run plexus-agents host on ${host} and it reconnects. Its threads show up here when it does.`}/>
+    {:else if threads.length === 0}
+      <Empty title="No threads yet" body={`Start one and Claude works in a folder on ${host}.`}>
+        <p><Button kind="primary" onclick={() => b.navigate(`#/h/${encodeURIComponent(host)}/new`)}>Start a thread</Button></p>
+      </Empty>
+    {:else}
+      {#each folders as [cwd, ts] (cwd)}
+        <section class="folder">
+          <h2><span class="name">{base(cwd)}</span><span class="path">{cwd}</span></h2>
+          {#each ts as t (t.id)}
+            {@const st = statusOf(t)}
+            <a class="row" href={threadHref(t)} data-status={st}>
+              <Pill status={st}/>
+              <span class="note">{NOTE[st] || turns(t.last_turn ?? 0)}</span>
+              <span class="turns">{NOTE[st] ? turns(t.last_turn ?? 0) : ""}</span>
+            </a>
+          {/each}
+        </section>
+      {/each}
+    {/if}
+
+    <section class="danger" aria-labelledby="unpair-h">
+      <h2 id="unpair-h">Unpair {host}</h2>
+      {#if !confirming}
+        <p class="quiet">Stop this machine connecting here. You can pair it again later.</p>
+        <Button onclick={() => (confirming = true)}>Unpair…</Button>
+      {:else}
+        <div class="confirm" role="group" aria-label="Confirm unpairing">
+          <p>Unpairing makes the server refuse {host}'s key and closes its connection now. Threads already on {host} stay there, but you can't open them here until you pair it again.</p>
+          <div class="actions">
+            <Button kind="danger" disabled={unpairing} onclick={unpair}>{unpairing ? "Unpairing…" : `Unpair ${host}`}</Button>
+            <Button onclick={() => (confirming = false)}>Keep it</Button>
+          </div>
+        </div>
       {/if}
-    </main>
-  </div>
+    </section>
+  {/if}
 </div>
 
 <style>
-  .page { display: grid; grid-template-rows: auto 1fr; height: 100vh; }
-  .body { display: flex; min-height: 0; }
-  main { flex: 1; overflow-y: auto; padding: 24px 32px; max-width: 900px; }
-  .head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
-  h1 { font-size: 20px; margin: 0 0 16px; display: flex; align-items: center; gap: 8px; }
-  h2 { font-size: 14px; margin: 24px 0 8px; color: var(--muted); }
-  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--disabled); }
-  .dot[data-online=true] { background: var(--live); }
-  .new { display: grid; gap: 10px; padding: 14px; background: var(--card); border: var(--border) solid var(--line); border-radius: var(--radius-lg); }
-  label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
-  input, textarea { padding: 6px 10px; color: var(--ink); font-size: 14px; background: var(--bg); border: var(--border) solid var(--line); border-radius: var(--radius); }
-  input { font-family: var(--font-text); }
-  input:focus-visible, textarea:focus-visible { outline: none; border-color: var(--focus); }
-  .row { display: flex; align-items: center; gap: 10px; min-height: var(--pitch); padding: 4px 8px; color: var(--ink); border-bottom: var(--border) solid var(--line); }
+  .sc-page { max-width: 760px; padding: var(--s6) var(--s5); }
+  h1 { margin: 0; font-size: 26px; font-weight: 600; letter-spacing: -0.015em; overflow-wrap: anywhere; }
+  h2 { margin: 0; font-size: 15px; font-weight: 600; }
+  p { margin: var(--s3) 0; }
+  .quiet { color: var(--muted); }
+  .error { color: var(--st-failed-fg); }
+
+  .head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--s4); }
+  .id { min-width: 0; }
+  .state { display: flex; align-items: center; gap: var(--s2); margin: var(--s1) 0 0; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: var(--radius-pill); background: var(--disabled); }
+  .state[data-online=true] { color: var(--live); }
+  .state[data-online=true] .dot { background: var(--live); }
+  .about { max-width: 62ch; margin: var(--s4) 0 var(--s6); color: var(--muted); }
+
+  .folder { margin-bottom: var(--s5); }
+  .folder h2 { display: flex; align-items: baseline; gap: var(--s3); padding-bottom: var(--s2); }
+  .folder .name { white-space: nowrap; }
+  .folder .path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 400 12px var(--font-mono); color: var(--muted); }
+  .row { display: flex; align-items: center; gap: var(--s3); min-height: 48px; padding: var(--s2) var(--s3); color: var(--ink); border-top: 1px solid var(--line); }
+  .row:last-child { border-bottom: 1px solid var(--line); }
   .row:hover { background: var(--hover); }
-  .cwd { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-family: var(--font-text); font-size: 12px; }
-  code { font-family: var(--font-text); font-size: 12px; }
-  .muted { color: var(--muted); }
-  .error { color: var(--warn); }
-  .primary { padding: 6px 16px; color: var(--on-accent); background: var(--accent); border: none; border-radius: var(--radius); cursor: pointer; }
-  .primary:disabled { background: var(--disabled); }
-  .quiet { margin-left: auto; padding: 3px 10px; background: var(--card); border: var(--border) solid var(--line); border-radius: var(--radius); cursor: pointer; }
-  .quiet:hover { color: var(--warn); border-color: var(--warn); }
-  @media (max-width: 700px) { .body :global(.sc-nav) { display: none; } main { padding: 16px; } }
+  .row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+  .row[data-status=needs] .note { color: var(--st-needs-fg); font-weight: 500; }
+  .note { flex: 1; min-width: 0; }
+  .turns { color: var(--muted); font-size: 13px; white-space: nowrap; }
+
+  .danger { margin-top: var(--s6); padding-top: var(--s5); border-top: 1px solid var(--line); }
+  .confirm { padding: var(--s4); border: 1px solid var(--st-failed-bg); background: var(--panel); border-radius: var(--radius-md); }
+  .confirm p { margin-top: 0; max-width: 62ch; }
+  .actions { display: flex; flex-wrap: wrap; gap: var(--s3); }
+
+  @media (max-width: 719px) {
+    .sc-page { padding: var(--s4); }
+    .head { flex-direction: column; align-items: stretch; }
+    .folder h2 { flex-direction: column; gap: 0; }
+    .actions { flex-direction: column; }
+  }
 </style>
