@@ -1184,3 +1184,93 @@ async fn a_service_with_no_local_placement_runs_nothing_itself() {
     let r = call(&ada, "agents.on.mac.harnesses", json!({})).await;
     assert_eq!(r["type"], "harnesses", "{r}");
 }
+
+/// A host's owner may put a thread there in `bypassPermissions`, change its mode,
+/// and list the folders it may start in; nobody else can reach any of it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hosts_owner_picks_its_threads_modes_and_sees_its_folders() {
+    let a = service().await;
+    let roots = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(roots.path().join("repo/.git")).unwrap();
+    std::fs::create_dir_all(roots.path().join(".secret/.git")).unwrap();
+    let root = roots.path().to_str().unwrap();
+    let (file, ada_token) = a.token_file(ADA);
+    let _b = Host::start(
+        &a,
+        "nat",
+        &["--token-file", file.to_str().unwrap(), "--root", root],
+    );
+    let ada = connect(a.port, Some(&ada_token)).await.unwrap();
+    online(&ada, "nat", "user").await;
+
+    let run = json!({"host": "nat", "cwd": "/recorded/cwd", "prompt": "p",
+                     "mode": "bypassPermissions"});
+    let started = call(&ada, "hosts.start", run).await;
+    assert_eq!(started["type"], "started", "{started}");
+    let thread = started["thread"].as_str().unwrap().to_string();
+    let listed = call(
+        &ada,
+        "hosts.threads",
+        json!({"host": "nat", "thread": thread}),
+    )
+    .await;
+    assert_eq!(
+        listed["threads"][0]["mode"], "bypassPermissions",
+        "{listed}"
+    );
+    let set = call(
+        &ada,
+        "hosts.set_mode",
+        json!({"host": "nat", "thread": thread, "mode": "plan"}),
+    )
+    .await;
+    assert_eq!(set["type"], "mode_set", "{set}");
+    assert_eq!(set["mode"], "plan", "{set}");
+    let set = call(
+        &ada,
+        "agents.on.nat.set_mode",
+        json!({"thread": thread, "mode": "default"}),
+    )
+    .await;
+    assert_eq!(set["mode"], "default", "{set}");
+
+    let canon = roots.path().canonicalize().unwrap();
+    for (method, params) in [
+        ("hosts.folders", json!({"host": "nat"})),
+        ("agents.on.nat.folders", json!({})),
+    ] {
+        let got = call(&ada, method, params).await;
+        assert_eq!(got["type"], "folders", "{method}: {got}");
+        assert_eq!(got["roots"], json!([canon.to_string_lossy()]), "{got}");
+        let names: Vec<_> = got["folders"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(names.contains(&"repo".to_string()), "{got}");
+        assert!(!names.contains(&".secret".to_string()), "{got}");
+    }
+    let outside = call(&ada, "hosts.folders", json!({"host": "nat", "under": "/"})).await;
+    assert_eq!(outside["type"], "failed", "{outside}");
+
+    let ben = connect(a.port, Some(&token(BEN))).await.unwrap();
+    for (method, params) in [
+        ("hosts.folders", json!({"host": "nat"})),
+        (
+            "hosts.set_mode",
+            json!({"host": "nat", "thread": thread, "mode": "plan"}),
+        ),
+        (
+            "hosts.start",
+            json!({"host": "nat", "cwd": "/x", "prompt": "p", "mode": "bypassPermissions"}),
+        ),
+    ] {
+        let r = call(&ben, method, params).await;
+        assert_eq!(r["type"], "failed", "{method}: {r}");
+    }
+    for method in ["agents.on.nat.folders", "agents.on.nat.set_mode"] {
+        let r = call(&ben, method, json!({"thread": thread, "mode": "plan"})).await;
+        assert_eq!(r["error_kind"], "forbidden", "{method}: {r}");
+    }
+}
