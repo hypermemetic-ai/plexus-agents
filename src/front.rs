@@ -496,6 +496,7 @@ mod tests {
             workos_client: Some("client_01TESTTESTTESTTESTTESTTEST".into()),
             workos_key_file: Some(key),
             allow: allow.iter().map(|s| s.to_string()).collect(),
+            trusted_proxies: vec!["none".into()],
             ..SignInConfig::default()
         };
         sign_in(&config, 4470)
@@ -521,6 +522,10 @@ mod tests {
     fn the_workos_sign_in_is_github_alone() {
         let spec = github_only("client_01X", Some(std::path::Path::new("/run/secrets/workos")));
         assert_eq!(spec, "workos:client_01X,social=github,email=off,sso=off,key=@/run/secrets/workos");
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("workos-api-key");
+        std::fs::write(&key, "sk_test_00000000000000000000000000").unwrap();
+        let spec = github_only("client_01X", Some(&key));
         let backend = plexus_login::backends::from_spec(&spec, BRANDING.app).unwrap();
         let can = backend.capabilities();
         assert_eq!(can.social, vec![plexus_login::identity::Social::GitHub]);

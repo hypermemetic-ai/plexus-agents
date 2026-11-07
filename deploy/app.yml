@@ -41,8 +41,8 @@ secrets:
     - name: workos-api-key
       env: AGENTS_WORKOS_API_KEY_FILE
 
-# Inside the container, published on no host port. One port serves the page,
-# the sign-in routes and the socket: `shell` names the same port.
+# Inside the container, published on no host port. One port serves plexus-ui's
+# shell, the sign-in routes and the socket: `shell` names the same port.
 ports:
   websocket: 4470
   shell: 4470
@@ -58,7 +58,8 @@ routes:
     to: shell
     encode: [zstd, gzip]
 
-# One volume per environment: the SQLite file (/data/agents.db).
+# One volume per environment: the SQLite files (/data/agents.db, its sessions,
+# and the pushed UI's /data/ui.db).
 data:
   mount: /data
   per_environment: true
@@ -73,9 +74,11 @@ resources:
 # Healthy means all of these, over https through the edge: the page, an
 # upgrade from its own origin, and one from a foreign origin refused.
 health:
+  # The page is plexus-ui's shell: "No UI yet" until deploy/push-ui.sh has pushed
+  # the bundle once (it is kept in /data/ui.db), "superconductor" after. Either
+  # is healthy, so no title is asserted.
   - get: https://{host}/
     status: 200
-    title_contains: plexus-agents
   - websocket_upgrade: wss://{host}/ws
     origin: https://{host}
     status: 101

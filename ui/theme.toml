@@ -1,0 +1,61 @@
+# SUPERCONDUCTOR-11: the superconductor's tokens, menger's (menger/ui/theme.toml)
+# trimmed to what these pages paint, with one pair per thread status. Compiled by
+# plexus-ui build to theme.css, which index.html loads first; every component's
+# <style> paints with these, never a literal. [light, dark, what it paints].
+
+[colour.paper]
+"--bg"       = ['#fbfaf7', '#141412', 'the page']
+"--panel"    = ['#ffffff', '#1c1b19', 'the sidebar, the top bar']
+"--card"     = ['#ffffff', '#22211e', 'a control face, a card']
+"--hover"    = ['#f1efe9', '#26251f', 'a row or control under the pointer']
+"--sel"      = ['#eef1fc', '#1d2235', 'the selected row, a user message']
+"--skeleton" = ['#ebe8e1', '#2a2925', 'something still loading']
+
+[colour.ink]
+"--ink"      = ['#1d1c1a', '#ecebe6', 'text']
+"--muted"    = ['#6b6860', '#9b988f', 'labels, counts, hints']
+"--disabled" = ['#a19e96', '#6b6860', 'a control that will not act']
+
+[colour.line]
+"--line" = ['#e4e1d9', '#2e2d29', 'hairlines']
+
+[colour.accent]
+"--accent" = ['#3b5bdb', '#8ea6ff', 'links, the primary button']
+"--on-accent" = ['#ffffff', '#141412', "the primary button's text"]
+"--focus"  = ['#3b5bdb', '#8ea6ff', 'the keyboard ring']
+
+[colour.signal]
+"--warn" = ['#b3261e', '#ff8a80', 'offline, a refusal, a failure']
+"--live" = ['#2f7a2a', '#6cc66a', 'online, done']
+
+[colour.status]   # one pill per thread, in priority order
+"--st-needs-bg"   = ['#f3e8c8', '#3a3115', 'needs you: an approval or a question']
+"--st-needs-fg"   = ['#7a5d00', '#e8cf7a', 'needs you']
+"--st-working-bg" = ['#e3ecf7', '#1b2e46', 'working']
+"--st-working-fg" = ['#2b5b8c', '#a3c6ee', 'working']
+"--st-failed-bg"  = ['#fdecec', '#3d1a1c', 'failed']
+"--st-failed-fg"  = ['#aa2233', '#f09a9a', 'failed']
+"--st-idle-bg"    = ['#ecebe7', '#2c2b28', 'idle']
+"--st-idle-fg"    = ['#5f5d57', '#b9b6ae', 'idle']
+
+[type]
+"--font-text"     = ['"Geist Mono", ui-monospace, monospace', '"Geist Mono", ui-monospace, monospace', 'code, tool rows, the pairing code']
+"--sans"          = ['"Geist", system-ui, sans-serif', '"Geist", system-ui, sans-serif', 'the app']
+"--text-size"     = ['14px', '14px', 'the body size']
+"--weight-medium" = ['500', '500', 'a head']
+"--weight-bold"   = ['700', '700', 'a title, a count']
+
+[space]
+"--pitch"  = ['30px', '30px', 'a row']
+"--border" = ['1px', '1px', 'every hairline']
+"--side"   = ['280px', '280px', 'the sidebar']
+
+[shape]
+"--radius"      = ['4px', '4px', 'a control']
+"--radius-lg"   = ['8px', '8px', 'a card']
+"--radius-pill" = ['999px', '999px', 'a status pill']
+
+[motion]
+"--motion-fast"  = ['.12s', '.12s', 'a hover']
+"--motion-pulse" = ['1.2s', '1.2s', 'working, pulsing']
+"--ease"         = ['ease-out', 'ease-out', 'all of them']

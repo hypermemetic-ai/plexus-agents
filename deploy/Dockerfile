@@ -9,6 +9,10 @@
 # (`git archive`, nothing of a working tree):
 #
 # pin plexus-harness 7f42216f8aa1868fc2969563d72b9fe9e36855a4
+# pin plexus-login b48bdac663d5928d9891bd3bdc287cc07a8222ae
+#
+# (plexus-login by path too, for SUPERCONDUCTOR-25's allow list, until it is
+# published: Cargo.toml's [patch.crates-io].)
 #
 #   deploy/build-image.sh [COMMIT]   → ghcr.io/hypermemetic-ai/agents:<commit>
 #
@@ -17,7 +21,10 @@
 # that dial in (agents.on.<host>).
 #
 # One port, 4470, plain, bound to 0.0.0.0 inside the container and published
-# nowhere: the page, the sign-in routes and the socket (/ or /ws) all on it.
+# nowhere: plexus-ui's shell (/, /app/…), the sign-in routes (/login…) and the
+# socket (/ws, or an upgrade anywhere) all on it (SUPERCONDUCTOR-11). The page is
+# not in this image: it is a plexus-ui bundle, pushed (deploy/push-ui.sh) into
+# /data/ui.db and kept there across deploys.
 # The edge terminates TLS and reaches it over its `edge` network.
 # plexus-agents reads every flag from AGENTS_* (deploy/env/<env>.env, the box's
 # secret files, the box's AGENTS_TRUSTED_PROXIES).
@@ -44,10 +51,11 @@ COPY --from=build /usr/local/bin/plexus-agents /usr/local/bin/plexus-agents
 USER app
 WORKDIR /data
 # Everything the service keeps: threads, runs and paired hosts (agents.db),
-# and sign-in sessions (agents.db.sessions).
+# sign-in sessions (agents.db.sessions) and the pushed UI's versions (ui.db).
 VOLUME /data
 ENV HOME=/data \
     AGENTS_DB=/data/agents.db \
+    AGENTS_UI_DB=/data/ui.db \
     AGENTS_BIND=0.0.0.0 \
     AGENTS_PORT=4470 \
     PLEXUS_NO_REGISTRY=1 \

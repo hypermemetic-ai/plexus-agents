@@ -1,0 +1,7 @@
+{
+  "#/": "sc-home",
+  "#/pair": "sc-pair",
+  "#/pair/:id": "sc-pair",
+  "#/h/:host": "sc-host",
+  "#/h/:host/t/:thread": "sc-thread"
+}

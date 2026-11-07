@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>{{TITLE}}</title>
+<!-- SUPERCONDUCTOR-11: the superconductor's page. The shell (plexus-agents, plexus-ui's
+     routes) stamps the service's name, the socket's port and the version this page is
+     served for; the engine's files are that version's, immutable. Frames go out as
+     plexus-agents.call on the one socket (the origin's /ws over https). -->
+<meta name="plexus-service" content="{{SERVICE}}">
+<meta name="plexus-ws-port" content="{{WS_PORT}}">
+<meta name="plexus-ui-version" content="{{UI_VERSION}}">
+<link rel="stylesheet" href="/app/{{UI_VERSION}}/theme.css">
+<link rel="modulepreload" href="/app/{{UI_VERSION}}/host.js">
+<link rel="modulepreload" href="/app/{{UI_VERSION}}/engine.js">
+<link rel="preload" as="fetch" crossorigin href="/app/{{UI_VERSION}}/engine.wasm">
+<link rel="preload" as="fetch" crossorigin href="/app/{{UI_VERSION}}/manifest.json">
+<link rel="preload" as="fetch" crossorigin href="/app/{{UI_VERSION}}/components.json">
+<link rel="modulepreload" href="/app/{{UI_VERSION}}/components/svelte-runtime.js">
+<script type="module">
+const version = document.querySelector('meta[name="plexus-ui-version"]').content;
+const { start } = await import(`/app/${version}/host.js`);
+start(version);
+</script>
+<style>
+/* The page's frame alone: the tokens are theme.css (ui/theme.toml); every component
+   carries its own sheet. */
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink); font: var(--text-size)/1.5 var(--sans); }
+a { color: var(--accent); text-decoration: none; }
+button, input, select, textarea { font: inherit; color: inherit; }
+</style>
+</head>
+<body></body>
+</html>
