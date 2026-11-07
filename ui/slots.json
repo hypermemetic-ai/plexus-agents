@@ -1,1 +1,7 @@
-{}
+{
+  "sc-frame": {
+    "top": "sc-top",
+    "nav": "sc-nav",
+    "palette": "sc-palette"
+  }
+}
