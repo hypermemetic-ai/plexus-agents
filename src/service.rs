@@ -13,6 +13,7 @@
 //! It describes a harness and starts nothing: runs start through `agents.start`.
 
 use crate::auth::{self, Access, AgentsRequest, Caller, Grant};
+use crate::hosts::{Hosts, HostsActivation};
 use crate::on::OnRouter;
 use crate::peer::Peer;
 use crate::runtime::{
@@ -190,6 +191,7 @@ pub struct AgentsActivation {
     access: Access,
     pub(crate) gate: Gate,
     pub(crate) peers: Vec<Arc<Peer>>,
+    pub(crate) hosts: Option<Arc<Hosts>>,
 }
 
 impl AgentsActivation {
@@ -205,7 +207,14 @@ impl AgentsActivation {
             access: Access,
             gate,
             peers,
+            hosts: None,
         }
+    }
+
+    /// With the hosts that dial in, reachable at `on.<host>`.
+    pub fn with_hosts(mut self, hosts: Arc<Hosts>) -> Self {
+        self.hosts = Some(hosts);
+        self
     }
 }
 
@@ -444,13 +453,29 @@ pub fn hub_with_peers(
     grants: Vec<Grant>,
     peers: Vec<Arc<Peer>>,
 ) -> Arc<DynamicHub> {
-    let names = peers.iter().map(|p| p.name().to_string()).collect();
-    let gate = auth::gate(&runtime, names, grants);
-    Arc::new(
-        DynamicHub::new("plexus-agents")
-            .with_gate(Arc::new(gate.clone()))
-            .register(AgentsActivation::new(runtime, harnesses, gate, peers)),
-    )
+    hub_with_hosts(runtime, harnesses, grants, peers, None)
+}
+
+/// [`hub_with_peers`], with hosts that dial in (SUPERCONDUCTOR-15): `hosts.*`, and
+/// `agents.on.<host>` over each host's own socket. Serve it with [`serve_with_hosts`].
+pub fn hub_with_hosts(
+    runtime: Supervisor,
+    harnesses: Vec<Arc<dyn Harness>>,
+    grants: Vec<Grant>,
+    peers: Vec<Arc<Peer>>,
+    hosts: Option<Arc<Hosts>>,
+) -> Arc<DynamicHub> {
+    let names: Vec<String> = peers.iter().map(|p| p.name().to_string()).collect();
+    let store = hosts.as_ref().map(|h| h.store());
+    let gate = auth::gate_with_hosts(&runtime, names.clone(), grants, store);
+    let mut agents = AgentsActivation::new(runtime.clone(), harnesses, gate.clone(), peers);
+    let mut hub = DynamicHub::new("plexus-agents").with_gate(Arc::new(gate));
+    if let Some(hosts) = hosts {
+        hosts.reserve(names.into_iter().chain(runtime.placements()));
+        agents = agents.with_hosts(hosts.clone());
+        hub = hub.register(HostsActivation::new(hosts));
+    }
+    Arc::new(hub.register(agents))
 }
 
 /// Where tokens come from.
@@ -515,9 +540,27 @@ pub async fn serve(
     bind: IpAddr,
     port: u16,
 ) -> anyhow::Result<()> {
+    serve_with_hosts(hub, validator, bind, port, None).await
+}
+
+/// [`serve`], with `hosts`' hook on every signed-in socket and its admission in
+/// front of `validator`: a host's key proof is refused unless its key is paired.
+pub async fn serve_with_hosts(
+    hub: Arc<DynamicHub>,
+    validator: Arc<dyn SessionValidator>,
+    bind: IpAddr,
+    port: u16,
+    hosts: Option<Arc<Hosts>>,
+) -> anyhow::Result<()> {
     let module =
         |h: Arc<DynamicHub>| DynamicHub::arc_into_rpc_module(h).map_err(|e| anyhow::anyhow!("{e}"));
-    TransportServer::builder(hub, module)
+    let mut builder = TransportServer::builder(hub, module);
+    let mut validator = validator;
+    if let Some(hosts) = hosts {
+        validator = hosts.admission(validator);
+        builder = builder.with_hooks(hosts.hooks());
+    }
+    builder
         .without_registry()
         .with_websocket(port)
         .bind(bind)

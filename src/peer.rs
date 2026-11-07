@@ -111,7 +111,7 @@ pub fn principal_of_file(path: &Path) -> Result<String, String> {
     read_seed(path).map(|seed| principal_of(&seed))
 }
 
-fn meta(name: &str) -> StreamMetadata {
+pub(crate) fn meta(name: &str) -> StreamMetadata {
     StreamMetadata::new(vec![name.to_string()], PlexusContext::hash())
 }
 
@@ -122,7 +122,7 @@ fn fields(name: &str) -> Map<String, Value> {
 }
 
 /// `child_unavailable`: one error, and the end.
-fn unavailable(name: &str, why: &str) -> PlexusStreamItem {
+pub(crate) fn unavailable(name: &str, why: &str) -> PlexusStreamItem {
     let mut f = fields(name);
     f.insert("reason".into(), why.into());
     let message = format!("child {name} is unavailable: {why}");
@@ -130,7 +130,7 @@ fn unavailable(name: &str, why: &str) -> PlexusStreamItem {
 }
 
 /// `child_timeout`: the peer didn't open the call in time.
-fn timed_out(name: &str, timeout: Duration) -> PlexusStreamItem {
+pub(crate) fn timed_out(name: &str, timeout: Duration) -> PlexusStreamItem {
     let mut f = fields(name);
     f.insert("timeout_ms".into(), (timeout.as_millis() as u64).into());
     let message = format!("child {name} did not open the call in {timeout:?}");
@@ -144,7 +144,7 @@ fn too_many(name: &str, max: usize) -> PlexusStreamItem {
     PlexusStreamItem::typed_error(meta(name), message, "too_many_calls", true, f)
 }
 
-fn one(item: PlexusStreamItem) -> PlexusStream {
+pub(crate) fn one(item: PlexusStreamItem) -> PlexusStream {
     Box::pin(futures::stream::iter([item]))
 }
 

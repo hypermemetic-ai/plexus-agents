@@ -4,6 +4,7 @@
 
 pub mod auth;
 pub mod claude;
+pub mod hosts;
 mod local;
 pub mod on;
 pub mod peer;

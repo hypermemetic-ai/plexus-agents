@@ -84,6 +84,11 @@ impl OnActivation {
                 placements.push(PlacementInfo { name, peer: true });
             }
         }
+        if let Some(hosts) = &self.agents.hosts {
+            for name in hosts.online_owned(&caller.actor().id) {
+                placements.push(PlacementInfo { name, peer: true });
+            }
+        }
         futures::stream::iter([AgentsEvent::Placements { placements }])
     }
 
@@ -130,6 +135,12 @@ impl OnRouter {
                 if let Some(hash) = peer.schema_hash().await {
                     children.push(summary(peer.name(), "Another agents service.", &hash));
                 }
+            }
+        }
+        let caller = auth.and_then(AuthContext::principal).map(|p| p.to_string());
+        if let (Some(hosts), Some(caller)) = (&agents.hosts, caller) {
+            for name in hosts.online_owned(&caller) {
+                children.push(summary(&name, "A host that dialed in.", &own));
             }
         }
         children
@@ -302,8 +313,23 @@ impl ChildRouter for OnTarget {
         auth: Option<&AuthContext>,
         raw: Option<&RawRequestContext>,
     ) -> Result<PlexusStream, PlexusError> {
-        let grant = Grant::new(format!("agents.on.{}", self.name));
         let agents = &self.agents;
+        // A host that dialed in (SUPERCONDUCTOR-15): its owner's, and only its
+        // owner's, checked here first, on every path, `.schema` too (AGENTS-40).
+        if let Some(hosts) = agents.hosts.as_ref().filter(|h| h.knows(&self.name)) {
+            let principal = auth.and_then(AuthContext::principal).map(|p| p.to_string());
+            let Some(principal) = principal else {
+                return Err(PlexusError::Unauthenticated("sign in first".into()));
+            };
+            if hosts.owner_of(&self.name).as_deref() != Some(principal.as_str()) {
+                return Err(crate::hosts::not_yours(&self.name));
+            }
+            if is_service(&principal) {
+                return Ok(depth_refused(&self.name));
+            }
+            return Ok(hosts.call(&self.name, method, params, principal).await);
+        }
+        let grant = Grant::new(format!("agents.on.{}", self.name));
         let reach = agents.gate.check(auth, &grant, Some(&self.name))?;
         if let Some(peer) = agents.peers.iter().find(|p| p.name() == self.name) {
             let principal = auth.and_then(AuthContext::principal);

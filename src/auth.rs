@@ -24,7 +24,7 @@
 
 use crate::runtime::{Supervisor, ThreadId};
 use plexus_auth_core::grants::{
-    Gate, GrantSet, Membership, Memberships, Reach, Resolve, RoleTable, ScopeRef,
+    Gate, GrantSet, Membership, Memberships, Reach, Resolve, RoleTable, Roles, ScopeRef,
 };
 use plexus_auth_core::identity::Principal;
 use plexus_auth_core::RoleName;
@@ -49,13 +49,58 @@ pub const OWNER_GRANTS: [&str; 8] = [
     "agents.resume",
 ];
 
+/// What every signed-in user may do with hosts (SUPERCONDUCTOR-15). Held through
+/// [`OWNER`], so a `key:` principal, which holds no [`OWNER`], has none of them.
+/// `agents.on.placements` lists only what the caller reaches: its own hosts, for a
+/// user with no other grant.
+pub const HOST_USER_GRANTS: [&str; 5] = [
+    "hosts.pair",
+    "hosts.unpair",
+    "hosts.list",
+    "hosts.attach",
+    "agents.on.placements",
+];
+
 /// What each role lists. `admin` is built in and holds everything.
 pub fn roles() -> RoleTable {
     let mut t = RoleTable::new();
     t.set(USER, GrantSet::listed(["agents.start"]));
-    t.set(OWNER, GrantSet::listed(OWNER_GRANTS));
+    let owner = OWNER_GRANTS.iter().chain(HOST_USER_GRANTS.iter()).copied();
+    t.set(OWNER, GrantSet::listed(owner));
     t.set(plexus_auth_core::grants::ADMIN, GrantSet::All);
     t
+}
+
+/// [`roles`], and each host's own role, from the host store as it stands now:
+/// `host:<name>` lists `agents.on.<name>.<method>` for every method a host serves,
+/// and [`crate::hosts::MACHINE`] lists `hosts.attach`. The hub's gate sees a path
+/// under a dynamic child as a grant of that exact string (AGENTS-20), so this is
+/// what lets a host's owner, and only its owner, past it.
+pub struct AgentsRoles {
+    table: RoleTable,
+    hosts: Option<Arc<crate::hosts::HostStore>>,
+}
+
+impl Roles for AgentsRoles {
+    fn grants(&self, role: &RoleName) -> Option<GrantSet> {
+        if let Some(store) = &self.hosts {
+            if role.as_str() == crate::hosts::MACHINE {
+                return Some(GrantSet::listed(["hosts.attach"]));
+            }
+            if let Some(name) = role.as_str().strip_prefix(crate::hosts::HOST_ROLE) {
+                store.get(name)?;
+                let grants = crate::hosts::HOST_METHODS
+                    .iter()
+                    .map(|m| format!("agents.on.{name}.{m}"));
+                return Some(GrantSet::listed(grants));
+            }
+        }
+        self.table.grants(role)
+    }
+
+    fn names(&self) -> Vec<RoleName> {
+        self.table.names()
+    }
 }
 
 /// The scope a principal holds [`OWNER`] on.
@@ -91,7 +136,7 @@ impl std::str::FromStr for Grant {
 /// Configured memberships, and the [`OWNER`] scope of every caller who isn't a key.
 /// A key is a service, and has nothing here until a peer grants it: a valid proof
 /// shows who's calling and admits it to nothing.
-pub struct Members(Vec<Membership>);
+pub struct Members(Vec<Membership>, Option<Arc<crate::hosts::HostStore>>);
 
 impl Members {
     pub fn new(grants: impl IntoIterator<Item = Grant>) -> Self {
@@ -100,7 +145,7 @@ impl Members {
             role: RoleName::new(&g.role),
             scope: g.scope,
         });
-        Self(held.collect())
+        Self(held.collect(), None)
     }
 }
 
@@ -119,6 +164,24 @@ impl Memberships for Members {
                 role: RoleName::new(OWNER),
                 scope: owner_scope(&id),
             });
+        }
+        // A host's owner holds its role on it, and a paired key the one that lets
+        // it attach. Added last, so a paired key still holds no [`OWNER`].
+        if let Some(store) = &self.1 {
+            for host in store.held_by(&id) {
+                let key = id.strip_prefix("key:");
+                let role = if key.is_some() && host.public_key.as_deref() == key {
+                    RoleName::new(crate::hosts::MACHINE)
+                } else {
+                    RoleName::new(format!("{}{}", crate::hosts::HOST_ROLE, host.name))
+                };
+                let scope = ScopeRef::named(&host.name);
+                held.push(Membership {
+                    principal: who.clone(),
+                    role,
+                    scope,
+                });
+            }
         }
         held
     }
@@ -156,9 +219,25 @@ pub fn gate(
     peers: Vec<String>,
     grants: impl IntoIterator<Item = Grant>,
 ) -> Gate {
+    gate_with_hosts(runtime, peers, grants, None)
+}
+
+/// [`gate`], with the hosts that dialed in (SUPERCONDUCTOR-15) in its memberships
+/// and roles, read from the store at every call.
+pub fn gate_with_hosts(
+    runtime: &Supervisor,
+    peers: Vec<String>,
+    grants: impl IntoIterator<Item = Grant>,
+    hosts: Option<Arc<crate::hosts::HostStore>>,
+) -> Gate {
+    let mut members = Members::new(grants);
+    members.1 = hosts.clone();
     Gate::new(
-        Arc::new(Members::new(grants)),
-        Arc::new(roles()),
+        Arc::new(members),
+        Arc::new(AgentsRoles {
+            table: roles(),
+            hosts,
+        }),
         Arc::new(Homes {
             runtime: runtime.clone(),
             peers,
