@@ -331,6 +331,14 @@ async fn dial(
 async fn attach(session: &Session, config: &HostConfig, machine: bool) -> anyhow::Result<Value> {
     let name = (!machine).then(|| config.name.clone());
     let nonce = uuid::Uuid::new_v4().to_string();
+    // The service marks this host online, and may call it, before its answer to
+    // `hosts.attach` arrives here. A key this host already holds (its pin, or the
+    // one it just paired with) is trusted from the start, so that first call isn't
+    // refused; the answer must still prove the same key, or the socket is dropped.
+    // With no key held yet (a user-mode host's first dial), calls are refused until it does.
+    if let Some(pin) = read_pin(config) {
+        session.trust(&pin);
+    }
     let attached = match session
         .request("hosts.attach", json!({"name": name, "nonce": nonce}))
         .await
@@ -402,6 +410,9 @@ async fn pair(
         return Err(anyhow!("waiting to be paired: {}", waited["message"]));
     }
     write_pin(config, &server)?;
+    // Proven above against this pairing's nonce: calls signed by it are this
+    // service's, before and after the attach that follows on this socket.
+    session.trust(&server);
     eprintln!(
         "plexus-agents host: paired as {}, owned by {}",
         waited["name"], waited["owner"]
@@ -448,10 +459,14 @@ struct Inner {
     subs: Mutex<HashMap<String, mpsc::Sender<Value>>>,
     served: Mutex<HashMap<String, AbortHandle>>,
     /// The server key this socket's attach proved: what `hop.sig` is checked with.
-    trusted: Mutex<Option<String>>,
+    /// A watch, so a call that arrives before the attach's answer waits for it.
+    trusted: watch::Sender<Option<String>>,
     /// Call ids already served on this socket: each is used once.
     seen: Mutex<HashSet<String>>,
 }
+
+/// How long a call that arrives before the attach's answer waits for it.
+const TRUST_WAIT: Duration = Duration::from_secs(5);
 
 /// One socket to the service.
 pub struct Session {
@@ -500,7 +515,7 @@ impl Session {
             pending: Mutex::default(),
             subs: Mutex::default(),
             served: Mutex::default(),
-            trusted: Mutex::default(),
+            trusted: watch::channel(None).0,
             seen: Mutex::default(),
         });
         let (closed_tx, closed) = watch::channel(false);
@@ -544,7 +559,7 @@ impl Session {
 
     /// Calls from the service are checked against `key` from now on.
     fn trust(&self, key: &str) {
-        *self.inner.trusted.lock().expect("host") = Some(key.to_string());
+        self.inner.trusted.send_replace(Some(key.to_string()));
     }
 
     /// Calls `method` on the service and returns its first item's content, or its
@@ -664,7 +679,7 @@ impl Inner {
         let (Some(call), Some(nonce), Some(sig)) = (call, nonce, hop["sig"].as_str()) else {
             return Err("the call carries no server signature".into());
         };
-        let trusted = self.trusted.lock().expect("host").clone();
+        let trusted = self.trusted.borrow().clone();
         let Some(key) = trusted else {
             return Err("this host trusts no server key on this socket yet".into());
         };
@@ -709,22 +724,29 @@ impl Inner {
             json!({"jsonrpc": "2.0", "method": CALL,
                    "params": {"subscription": sub, "result": item}})
         };
-        let (method, args) = match self.admit(&params) {
-            Ok(call) => call,
-            Err(why) => {
-                let mut f = Map::new();
-                f.insert("reason".into(), why.clone().into());
-                let refused =
-                    crate::peer::typed_error(meta("host"), why, "forbidden", false, f);
-                let refused = serde_json::to_value(refused).unwrap_or_default();
-                self.send(item(&sub, refused));
-                return;
-            }
-        };
         let me = self.clone();
         let mut served = self.served.lock().expect("host");
         let key = sub.clone();
         let task = tokio::spawn(async move {
+            // The service marks a host online before its answer to `hosts.attach`
+            // reaches the host, so its first call can arrive before this socket
+            // trusts a key. It waits, briefly, for the attach to prove one; then
+            // `admit` checks the call against that key as always.
+            let mut trust = me.trusted.subscribe();
+            let _ = tokio::time::timeout(TRUST_WAIT, trust.wait_for(Option::is_some)).await;
+            let (method, args) = match me.admit(&params) {
+                Ok(call) => call,
+                Err(why) => {
+                    let mut f = Map::new();
+                    f.insert("reason".into(), why.clone().into());
+                    let refused =
+                        crate::peer::typed_error(meta("host"), why, "forbidden", false, f);
+                    let refused = serde_json::to_value(refused).unwrap_or_default();
+                    me.send(item(&sub, refused));
+                    me.served.lock().expect("host").remove(&sub);
+                    return;
+                }
+            };
             let routed = me
                 .hub
                 .route_with_ctx(&method, args, Some(&me.ctx), None)

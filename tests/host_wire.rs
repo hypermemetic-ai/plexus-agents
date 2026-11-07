@@ -558,7 +558,9 @@ async fn pairing_a_fresh_key_shows_one_code_on_both_screens_and_goes_on_as_the_m
         principal(&seed)
     );
     assert_eq!(record.owner, format!("idp:{ADA}"));
-    assert_eq!(b.pin(&a), Some(server.public()), "the host pinned key_s");
+    // The service counts the host online once the confirm lands; the host writes
+    // its pin when its wait answers, which may be a moment later.
+    eventually("the host pinned key_s", || b.pin(&a) == Some(server.public())).await;
     let r = call(&ada, "agents.on.rig.harnesses", json!({})).await;
     assert_eq!(r["type"], "harnesses", "{r}");
 
