@@ -8,6 +8,7 @@ pub mod host;
 pub mod hosts;
 mod local;
 pub mod on;
+pub mod pairing;
 pub mod peer;
 pub mod record;
 pub mod runner;

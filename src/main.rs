@@ -20,23 +20,35 @@
 //! and exits, so a script can write the peer's `--grant`.
 //!
 //! Hosts behind NAT dial in (SUPERCONDUCTOR-15) and are reached at
-//! `agents.on.<host>`; `hosts.pair`, `hosts.unpair` and `hosts.list` manage them, in
-//! the same `--db`. `--public-url` is the URL they dial: a host's key proof must
-//! name it, and each call out is stamped with it.
+//! `agents.on.<host>`, given `--server-key FILE`: this service's Ed25519 identity
+//! (`key_s`, a 32-byte seed, mode 0600), which hosts pin and every call to a host is
+//! signed with (SUPERCONDUCTOR-18). `--generate-server-key` makes that file if it's
+//! missing: for development. Without `--server-key` there are no hosts. A host
+//! pairs by a code both sides show; `hosts.pairing`, `hosts.confirm`,
+//! `hosts.unpair` and `hosts.list` are a signed-in user's, in the same `--db`.
+//! `--public-url` is the URL hosts dial: a host's key proof must name it.
+//! `--no-local` serves no `local` placement when none is named: a hosted service
+//! runs nothing itself. `--trusted-proxy CIDR` names a proxy whose
+//! `X-Forwarded-For` is believed, for the per-address limit on pairing requests.
 //!
 //! ```text
 //! plexus-agents host --server URL --name NAME --db FILE
-//!                    [--token-file FILE] [--key FILE [--pair]] [--placement NAME]...
+//!                    [--token-file FILE] [--key FILE] [--pins DIR] [--app URL]
+//!                    [--placement NAME]...
 //! ```
 //!
 //! runs a host: dials the service, attaches as `NAME`, and serves this machine's own
-//! `agents` to the calls that come back on that socket. It opens no port. See
-//! `plexus_agents::host`.
+//! `agents` to the calls that come back on that socket. It opens no port. With
+//! `--token-file` it signs in as that token's user. Otherwise it signs in with its
+//! key (`--key`, by default `~/.plexus/keys/NAME.key`, made if missing), and an
+//! unpaired key prints a code and a link to confirm in the browser. Server keys are
+//! pinned in `--pins` (default `~/.plexus/hosts`). See `plexus_agents::host`.
 
 use anyhow::{anyhow, Context};
 use plexus_agents::auth::Grant;
 use plexus_agents::host::{self, HostConfig};
 use plexus_agents::hosts::Hosts;
+use plexus_agents::pairing::{self, ServerKey};
 use plexus_agents::peer::{self, Peer, PeerConfig};
 use plexus_agents::runtime::{Supervisor, SupervisorConfig};
 use plexus_agents::service::{self, SignIn, TokenIssuer};
@@ -52,6 +64,8 @@ async fn main() -> anyhow::Result<()> {
         return host().await;
     }
     let mut public_url = None;
+    let (mut server_key, mut generate_server_key, mut no_local) = (None, false, false);
+    let mut trusted_proxies = Vec::new();
     let (mut db, mut issuer, mut audience, mut record) = (None, None, None, None);
     let (mut port, mut bind) = (4470u16, IpAddr::from([127, 0, 0, 1]));
     let (mut placements, mut grants) = (Vec::new(), Vec::<Grant>::new());
@@ -72,6 +86,10 @@ async fn main() -> anyhow::Result<()> {
             "--service-key" => service_key = Some(value()?),
             "--peer" => peers.push(value()?),
             "--public-url" => public_url = Some(value()?),
+            "--server-key" => server_key = Some(value()?),
+            "--generate-server-key" => generate_server_key = true,
+            "--no-local" => no_local = true,
+            "--trusted-proxy" => trusted_proxies.push(value()?),
             "--print-key" => {
                 println!(
                     "{}",
@@ -82,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
             other => return Err(anyhow!("no flag {other}")),
         }
     }
-    if placements.is_empty() {
+    if placements.is_empty() && !no_local {
         placements.push("local".to_string());
     }
     let tokens = match (issuer, audience) {
@@ -125,7 +143,17 @@ async fn main() -> anyhow::Result<()> {
         .collect();
     let harnesses: Vec<Arc<dyn Harness>> = vec![Arc::new(ClaudeHarness::default())];
     let db: std::path::PathBuf = db.context("--db is required")?.into();
-    let hosts = Hosts::open(&db, public_url)?;
+    let hosts = match &server_key {
+        Some(file) => {
+            let key = ServerKey::load(file.as_ref(), generate_server_key)?;
+            eprintln!("plexus-agents: hosts pin this service as {}", key.public());
+            Some(Hosts::open(&db, public_url, key)?)
+        }
+        None => {
+            eprintln!("plexus-agents: no --server-key, so no hosts dial in");
+            None
+        }
+    };
     let (runtime, recovery) = Supervisor::open(SupervisorConfig {
         db,
         environment,
@@ -135,14 +163,19 @@ async fn main() -> anyhow::Result<()> {
     .await
     .map_err(|e| anyhow!("{e}"))?;
     eprintln!("plexus-agents: on {bind}:{port}, recovered {recovery:?}");
-    let hub = service::hub_with_hosts(runtime, harnesses, grants, peers, Some(hosts.clone()));
-    service::serve_with_hosts(hub, validator, bind, port, Some(hosts)).await
+    let hub = service::hub_with_hosts(runtime, harnesses, grants, peers, hosts.clone());
+    let serving = service::Serving {
+        hosts,
+        trusted_proxies,
+        ..service::Serving::new(bind, port)
+    };
+    service::serve_with(hub, validator, serving).await
 }
 
 /// `plexus-agents host`: see the module docs.
 async fn host() -> anyhow::Result<()> {
     let (mut server, mut name, mut db, mut record) = (None, None, None, None);
-    let (mut token_file, mut key, mut pair) = (None, None, false);
+    let (mut token_file, mut key, mut pins, mut app) = (None, None, None, None);
     let mut placements = Vec::new();
     let mut it = std::env::args().skip(2);
     while let Some(flag) = it.next() {
@@ -154,7 +187,8 @@ async fn host() -> anyhow::Result<()> {
             "--record" => record = Some(value()?),
             "--token-file" => token_file = Some(value()?.into()),
             "--key" => key = Some(value()?.into()),
-            "--pair" => pair = true,
+            "--pins" => pins = Some(value()?.into()),
+            "--app" => app = Some(value()?),
             "--placement" => placements.push(value()?),
             other => return Err(anyhow!("no flag {other}")),
         }
@@ -162,13 +196,26 @@ async fn host() -> anyhow::Result<()> {
     if placements.is_empty() {
         placements.push("local".to_string());
     }
-    let mut config = HostConfig::new(
-        &server.context("--server is required")?,
-        &name.context("--name is required")?,
-    );
+    let name = name.context("--name is required")?;
+    let mut config = HostConfig::new(&server.context("--server is required")?, &name);
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let plexus = || home.clone().map(|h| h.join(".plexus"));
+    if token_file.is_none() {
+        let key = match key {
+            Some(k) => k,
+            None => plexus()
+                .context("no HOME: give --key")?
+                .join(format!("keys/{name}.key")),
+        };
+        if !key.exists() {
+            pairing::write_new_seed(&key)?;
+            eprintln!("plexus-agents host: made a key at {}", key.display());
+        }
+        config.key = Some(key);
+    }
     config.token_file = token_file;
-    config.key = key;
-    config.pair = pair;
+    config.pins = pins.or_else(|| plexus().map(|p| p.join("hosts")));
+    config.app = app;
     let environment: Arc<dyn Environment> = match record {
         Some(dir) => Arc::new(RecordingEnvironment::new(LocalEnvironment::new(), dir)?),
         None => Arc::new(LocalEnvironment::new()),

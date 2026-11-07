@@ -49,12 +49,13 @@ pub const OWNER_GRANTS: [&str; 8] = [
     "agents.resume",
 ];
 
-/// What every signed-in user may do with hosts (SUPERCONDUCTOR-15). Held through
-/// [`OWNER`], so a `key:` principal, which holds no [`OWNER`], has none of them.
-/// `agents.on.placements` lists only what the caller reaches: its own hosts, for a
-/// user with no other grant.
-pub const HOST_USER_GRANTS: [&str; 5] = [
-    "hosts.pair",
+/// What every signed-in user may do with hosts (SUPERCONDUCTOR-15, -18). Held
+/// through [`OWNER`], so a `key:` principal, which holds no [`OWNER`], has none of
+/// them: a key can't confirm a pairing. `agents.on.placements` lists only what the
+/// caller reaches: its own hosts, for a user with no other grant.
+pub const HOST_USER_GRANTS: [&str; 6] = [
+    "hosts.pairing",
+    "hosts.confirm",
     "hosts.unpair",
     "hosts.list",
     "hosts.attach",
@@ -85,7 +86,11 @@ impl Roles for AgentsRoles {
     fn grants(&self, role: &RoleName) -> Option<GrantSet> {
         if let Some(store) = &self.hosts {
             if role.as_str() == crate::hosts::MACHINE {
-                return Some(GrantSet::listed(["hosts.attach"]));
+                // `hosts.wait` too: a host that waited answers paired once it is.
+                return Some(GrantSet::listed(["hosts.attach", "hosts.wait"]));
+            }
+            if role.as_str() == crate::hosts::WAITING {
+                return Some(GrantSet::listed(["hosts.request", "hosts.wait"]));
             }
             if let Some(name) = role.as_str().strip_prefix(crate::hosts::HOST_ROLE) {
                 store.get(name)?;
@@ -180,6 +185,15 @@ impl Memberships for Members {
                     principal: who.clone(),
                     role,
                     scope,
+                });
+            }
+            // An unpaired host key in the waiting room: it may ask, and wait.
+            let waiting = id.strip_prefix("key:").filter(|k| store.waiting(k));
+            if waiting.is_some_and(|k| store.by_key(k).is_none()) {
+                held.push(Membership {
+                    principal: who.clone(),
+                    role: RoleName::new(crate::hosts::WAITING),
+                    scope: ScopeRef::named("waiting"),
                 });
             }
         }

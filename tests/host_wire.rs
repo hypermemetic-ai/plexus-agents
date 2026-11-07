@@ -3,18 +3,23 @@
 //! on a real socket, with real RS256 tokens against a JWKS and the real key-proof
 //! adapter. The host is `examples/host_stub`, a separate process that opens no
 //! port, replaying a real run.
+//!
+//! SUPERCONDUCTOR-18: a host's key pairs by a code both sides show. The test reads
+//! the code and link the host prints, and a signed-in user's `hosts.pairing` and
+//! `hosts.confirm` stand in for the browser.
 
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
-use jsonrpsee::core::client::{Subscription, SubscriptionClientT};
+use jsonrpsee::core::client::{ClientT, Subscription, SubscriptionClientT};
 use jsonrpsee::core::params::ObjectParams;
 use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClient, WsClientBuilder};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use plexus_agents::auth::Grant;
 use plexus_agents::host::{self, HostConfig};
-use plexus_agents::hosts::{Hosts, HOST_AGENT};
+use plexus_agents::hosts::{Hosts, HOST_AGENT, MAX_PER_IP};
+use plexus_agents::pairing::{self, ServerKey};
 use plexus_agents::runtime::{Supervisor, SupervisorConfig};
 use plexus_agents::service::{hub, hub_with_hosts, serve_with_hosts};
 use plexus_agents::ClaudeHarness;
@@ -42,6 +47,8 @@ const ISSUER: &str = "http://127.0.0.1:1";
 const AUDIENCE: &str = "plexus:agents";
 const ADA: &str = "00000000-0000-4000-8000-00000000000a";
 const BEN: &str = "00000000-0000-4000-8000-00000000000b";
+/// The service's identity key, `key_s`.
+const SERVER_SEED: [u8; 32] = [42; 32];
 
 struct Signer {
     pem: EncodingKey,
@@ -146,6 +153,11 @@ impl Environment for Nowhere {
 }
 
 async fn service() -> Service {
+    service_placed(true).await
+}
+
+/// A service with a `local` placement, or, as `--no-local` runs it, none.
+async fn service_placed(local: bool) -> Service {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("agents.db");
     let env: Arc<dyn Environment> = Arc::new(Nowhere);
@@ -153,7 +165,11 @@ async fn service() -> Service {
     let (runtime, _) = Supervisor::open(SupervisorConfig {
         db: db.clone(),
         environment: env.clone(),
-        placements: HashMap::from([("local".to_string(), env)]),
+        placements: if local {
+            HashMap::from([("local".to_string(), env)])
+        } else {
+            HashMap::new()
+        },
         harnesses: harnesses.clone(),
     })
     .await
@@ -167,7 +183,7 @@ async fn service() -> Service {
         .with(Arc::new(oidc))
         .with(Arc::new(KeyProofAdapter::new([&url]).unwrap()));
     let validator: Arc<dyn SessionValidator> = Arc::new(Carriers::cookie_and_bearer(chain));
-    let hosts = Hosts::open(&db, &url).unwrap();
+    let hosts = Hosts::open(&db, &url, ServerKey::from_seed(SERVER_SEED)).unwrap();
     let grants: Vec<Grant> = vec![];
     let h = hub_with_hosts(runtime, harnesses, grants, vec![], Some(hosts.clone()));
     let bind = [127, 0, 0, 1].into();
@@ -229,8 +245,17 @@ fn principal(seed: &[u8; 32]) -> String {
     format!("key:{hex}")
 }
 
-/// Service B: `examples/host_stub`, a process of its own.
-struct Host(Child, #[allow(dead_code)] tempfile::TempDir);
+fn public(seed: &[u8; 32]) -> [u8; 32] {
+    pairing::key_bytes(&principal(seed)).unwrap()
+}
+
+/// Service B: `examples/host_stub`, a process of its own. What it prints comes
+/// back line by line.
+struct Host(
+    Child,
+    tempfile::TempDir,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+);
 
 impl Host {
     fn start(a: &Service, name: &str, args: &[&str]) -> Self {
@@ -240,8 +265,38 @@ impl Host {
         let mut c = Command::new(bin.join("examples/host_stub"));
         c.args(["--server", &a.url, "--name", name])
             .args(["--db", dir.path().join("host.db").to_str().unwrap()])
-            .args(args);
-        Self(c.spawn().expect("cargo test builds examples"), dir)
+            .args(["--pins", dir.path().join("pins").to_str().unwrap()])
+            .args(args)
+            .stdout(std::process::Stdio::piped());
+        let mut child = c.spawn().expect("cargo test builds examples");
+        let out = child.stdout.take().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        });
+        Self(child, dir, rx)
+    }
+
+    /// The rest of the next printed line starting with `prefix`.
+    async fn printed(&mut self, prefix: &str) -> String {
+        loop {
+            let line = tokio::time::timeout(Duration::from_secs(10), self.2.recv()).await;
+            let line = line.expect("printed in time").expect("still running");
+            if let Some(rest) = line.strip_prefix(prefix) {
+                return rest.to_string();
+            }
+        }
+    }
+
+    /// The server key this host pinned for `a`.
+    fn pin(&self, a: &Service) -> Option<String> {
+        let path = host::pin_path(&self.1.path().join("pins"), &a.url);
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|t| t.trim().to_string())
     }
 
     fn kill(&mut self) {
@@ -282,12 +337,20 @@ async fn connect_bearer(port: u16, bearer: &str) -> Result<WsClient, String> {
 }
 
 async fn open(c: &WsClient, method: &str, params: Value) -> Subscription<Value> {
+    try_open(c, method, params).await.unwrap()
+}
+
+async fn try_open(
+    c: &WsClient,
+    method: &str,
+    params: Value,
+) -> Result<Subscription<Value>, String> {
     let mut p = ObjectParams::new();
     p.insert("method", method).unwrap();
     p.insert("params", params).unwrap();
     c.subscribe("plexus-agents.call", p, "plexus-agents.call_unsub")
         .await
-        .unwrap()
+        .map_err(|e| e.to_string())
 }
 
 async fn next(s: &mut Subscription<Value>) -> Value {
@@ -308,6 +371,27 @@ async fn call(c: &WsClient, method: &str, params: Value) -> Value {
             _ => continue,
         }
     }
+}
+
+/// Starts host `name` on an unpaired key, reads the code and link it prints, and
+/// confirms it as `user`, as the page would: checks the page's code is the host's
+/// first. Returns the host and the code.
+async fn pair(a: &Service, user: &WsClient, name: &str, key: &Path) -> (Host, String) {
+    let mut b = Host::start(a, name, &["--key", key.to_str().unwrap()]);
+    let link = b.printed("link: ").await;
+    let code = b.printed("code: ").await;
+    let (page, id) = link.split_once("/#/pair?id=").expect("a pairing link");
+    assert_eq!(page, a.url.replace("ws://", "http://"), "{link}");
+    let pending = call(user, "hosts.pairing", json!({"pairing_id": id})).await;
+    assert_eq!(pending["type"], "pending", "{pending}");
+    assert_eq!(
+        pending["code"], code,
+        "the browser shows the code the host shows"
+    );
+    assert_eq!(pending["name"], name, "{pending}");
+    let done = call(user, "hosts.confirm", json!({"pairing_id": id})).await;
+    assert_eq!(done["type"], "paired", "{done}");
+    (b, code)
 }
 
 async fn hosts_of(c: &WsClient) -> Vec<Value> {
@@ -455,19 +539,18 @@ async fn a_user_mode_host_is_listed_to_its_owner_only() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_key_paired_at_runtime_signs_in_as_the_machine_with_no_restart() {
+async fn pairing_a_fresh_key_shows_one_code_on_both_screens_and_goes_on_as_the_machine() {
     let a = service().await;
-    let (file, ada_token) = a.token_file(ADA);
+    let ada = connect(a.port, Some(&token(ADA))).await.unwrap();
     let (key, seed) = a.key(7);
-    let args = [
-        "--token-file",
-        file.to_str().unwrap(),
-        "--key",
-        key.to_str().unwrap(),
-        "--pair",
-    ];
-    let _b = Host::start(&a, "rig", &args);
-    let ada = connect(a.port, Some(&ada_token)).await.unwrap();
+    let (b, code) = pair(&a, &ada, "rig", &key).await;
+    // The host computed it from the key the server proved, and that is key_s.
+    let server = ServerKey::from_seed(SERVER_SEED);
+    assert_eq!(code, pairing::code(&public(&seed), &server.public_bytes()));
+    // Someone in the middle substitutes a key, and the screens differ.
+    let mitm = ServerKey::from_seed([66; 32]);
+    assert_ne!(code, pairing::code(&public(&seed), &mitm.public_bytes()));
+
     online(&ada, "rig", "machine").await;
     let record = a.hosts.store().get("rig").unwrap();
     assert_eq!(
@@ -475,41 +558,153 @@ async fn a_key_paired_at_runtime_signs_in_as_the_machine_with_no_restart() {
         principal(&seed)
     );
     assert_eq!(record.owner, format!("idp:{ADA}"));
+    assert_eq!(b.pin(&a), Some(server.public()), "the host pinned key_s");
     let r = call(&ada, "agents.on.rig.harnesses", json!({})).await;
     assert_eq!(r["type"], "harnesses", "{r}");
 
-    // The key holds nothing but its attach: not pairing, not another's host.
+    // The key holds nothing but its attach: not confirming, not another's host.
     let machine = connect_bearer(a.port, &a.proof(&seed)).await.unwrap();
-    let r = call(
-        &machine,
+    let r = call(&machine, "hosts.confirm", json!({"pairing_id": "x"})).await;
+    assert_eq!(r["error_kind"], "forbidden", "{r}");
+    let r = call(&machine, "agents.on.rig.threads", json!({})).await;
+    assert_eq!(r["error_kind"], "forbidden", "{r}");
+    // And there's no way for a user's token to pair a key any more.
+    let r = try_open(
+        &ada,
         "hosts.pair",
         json!({"name": "x", "public_key": principal(&[9; 32])}),
     )
     .await;
-    assert_eq!(r["error_kind"], "forbidden", "{r}");
-    let r = call(&machine, "agents.on.rig.threads", json!({})).await;
-    assert_eq!(r["error_kind"], "forbidden", "{r}");
+    let refused = match r {
+        Err(e) => e,
+        Ok(mut s) => next(&mut s).await.to_string(),
+    };
+    assert!(
+        refused.contains("not found") || refused.contains("error"),
+        "{refused}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unpaired_key_is_refused_and_unpair_closes_the_socket() {
+async fn an_unpaired_key_can_call_nothing_but_request_and_wait() {
     let a = service().await;
-    let (_, stranger) = a.key(3);
-    let refused = connect_bearer(a.port, &a.proof(&stranger)).await;
-    let e = refused.expect_err("an unpaired host key is refused");
-    assert!(e.contains("401"), "{e}");
+    let (_, seed) = a.key(3);
+    let waiting = connect_bearer(a.port, &a.proof(&seed))
+        .await
+        .expect("the waiting room");
+    for (method, params) in [
+        ("hosts.list", json!({})),
+        ("hosts.attach", json!({"nonce": "n-123456789abcdef"})),
+        ("hosts.pairing", json!({"pairing_id": "x"})),
+        ("hosts.confirm", json!({"pairing_id": "x"})),
+        ("agents.harnesses", json!({})),
+        ("agents.threads", json!({})),
+        ("agents.on.placements", json!({})),
+        ("agents.claudecode.describe", json!({})),
+        ("agents.schema", json!({})),
+    ] {
+        let r = try_open(&waiting, method, params).await;
+        assert!(r.is_err(), "{method} answered an unpaired key");
+    }
+    let direct: Result<Value, _> = waiting
+        .request("plexus-agents.schema", jsonrpsee::rpc_params![])
+        .await;
+    assert!(direct.is_err(), "{direct:?}");
 
-    let (file, ada_token) = a.token_file(ADA);
+    let nonce = "a-nonce-of-the-macs-own-0001";
+    let asked = call(
+        &waiting,
+        "hosts.request",
+        json!({"name": "box", "nonce": nonce}),
+    )
+    .await;
+    assert_eq!(asked["type"], "pairing", "{asked}");
+    let hex = principal(&seed).strip_prefix("key:").unwrap().to_string();
+    let server = asked["server_key"].as_str().unwrap();
+    assert_eq!(server, ServerKey::from_seed(SERVER_SEED).public());
+    let sig = asked["signature"].as_str().unwrap();
+    assert!(pairing::verify(
+        server,
+        &pairing::pair_message(nonce, &hex),
+        sig
+    ));
+    assert!(!pairing::verify(
+        server,
+        &pairing::pair_message("another", &hex),
+        sig
+    ));
+    let id = asked["pairing_id"].as_str().unwrap().to_string();
+
+    // At most MAX_PER_IP pending from one address.
+    let mut others = Vec::new();
+    for byte in 0..MAX_PER_IP as u8 {
+        let (_, seed) = a.key(100 + byte);
+        let c = connect_bearer(a.port, &a.proof(&seed)).await.unwrap();
+        let nonce = format!("nonce-of-another-mac-{byte:04}");
+        let r = call(
+            &c,
+            "hosts.request",
+            json!({"name": format!("o{byte}"), "nonce": nonce}),
+        )
+        .await;
+        others.push((c, r));
+    }
+    let (last, r) = others.pop().unwrap();
+    assert!(
+        r["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("too many"),
+        "{r}"
+    );
+    drop(last);
+    assert!(
+        others.iter().all(|(_, r)| r["type"] == "pairing"),
+        "{others:?}"
+    );
+
+    // Ada types the code (in any case) and confirms; the wait answers paired.
+    let mut wait = open(&waiting, "hosts.wait", json!({"pairing_id": id})).await;
+    let code = pairing::code(
+        &public(&seed),
+        &ServerKey::from_seed(SERVER_SEED).public_bytes(),
+    );
+    let ada = connect(a.port, Some(&token(ADA))).await.unwrap();
+    let typed = code.to_lowercase().replace('-', " ");
+    let pending = call(&ada, "hosts.pairing", json!({"code": typed})).await;
+    assert_eq!(pending["pairing_id"], json!(id), "{pending}");
+    let anon = connect(a.port, None).await.unwrap();
+    let r = call(&anon, "hosts.confirm", json!({"pairing_id": id})).await;
+    assert_eq!(
+        r["error_kind"], "unauthenticated",
+        "only a signed-in user confirms: {r}"
+    );
+    let done = call(&ada, "hosts.confirm", json!({"pairing_id": id})).await;
+    assert_eq!(done["type"], "paired", "{done}");
+    let paired = next(&mut wait).await;
+    assert_eq!(paired["content"]["type"], "paired", "{paired}");
+    assert_eq!(paired["content"]["owner"], format!("idp:{ADA}"), "{paired}");
+
+    // The same socket goes on as the machine.
+    let nonce = "attach-nonce-000000001";
+    let r = call(&waiting, "hosts.attach", json!({"nonce": nonce})).await;
+    assert_eq!(r["type"], "attached", "{r}");
+    assert_eq!(r["mode"], "machine", "{r}");
+    let sig = r["signature"].as_str().unwrap();
+    assert!(pairing::verify(
+        server,
+        &pairing::attach_message(nonce),
+        sig
+    ));
+    assert!(a.hosts.online("box"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unpair_closes_the_socket_and_the_key_goes_back_to_waiting() {
+    let a = service().await;
+    let ada = connect(a.port, Some(&token(ADA))).await.unwrap();
     let (key, seed) = a.key(5);
-    let args = [
-        "--token-file",
-        file.to_str().unwrap(),
-        "--key",
-        key.to_str().unwrap(),
-        "--pair",
-    ];
-    let _b = Host::start(&a, "gone", &args);
-    let ada = connect(a.port, Some(&ada_token)).await.unwrap();
+    let (_b, _) = pair(&a, &ada, "gone", &key).await;
     online(&ada, "gone", "machine").await;
     // A second socket on the paired key, which the test can watch close.
     let held = connect_bearer(a.port, &a.proof(&seed)).await.unwrap();
@@ -522,13 +717,19 @@ async fn an_unpaired_key_is_refused_and_unpair_closes_the_socket() {
     assert!(hosts_of(&ada).await.is_empty());
     let r = call(&ada, "agents.on.gone.threads", json!({})).await;
     assert_eq!(r["error_kind"], "forbidden", "{r}");
-    let again = connect_bearer(a.port, &a.proof(&seed)).await;
-    let e = again.expect_err("redial with the unpaired key is refused");
-    assert!(e.contains("401"), "{e}");
+    // A redial is back in the waiting room: it can't attach.
+    let again = connect_bearer(a.port, &a.proof(&seed)).await.unwrap();
+    let r = try_open(
+        &again,
+        "hosts.attach",
+        json!({"nonce": "n-after-unpair-0001"}),
+    )
+    .await;
+    assert!(r.is_err(), "an unpaired key attached");
     tokio::time::sleep(Duration::from_millis(700)).await;
     assert!(
         !a.hosts.online("gone"),
-        "the host's own redials are refused"
+        "the host's own redials don't attach"
     );
 }
 
@@ -568,10 +769,31 @@ async fn killing_the_host_is_child_unavailable_and_its_redial_restores_the_name(
     );
 }
 
-/// A server of the test's own, which the host dials, and which sends what the
-/// agents service never would.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_host_refuses_calls_outside_agents_and_from_a_server_it_didnt_dial() {
+type Ws = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+async fn read_ws(ws: &mut Ws) -> Value {
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(10), ws.next()).await;
+        if let Message::Text(t) = m.unwrap().unwrap().unwrap() {
+            return serde_json::from_str(&t).unwrap();
+        }
+    }
+}
+
+async fn send_ws(ws: &mut Ws, v: Value) {
+    ws.send(Message::Text(v.to_string().into())).await.unwrap();
+}
+
+/// A server of the test's own, holding `key`, which a user-mode host dials: it
+/// takes the host's attach and answers with `key`'s proof.
+async fn fake_server(
+    key: &ServerKey,
+    pins: Option<PathBuf>,
+) -> (
+    Ws,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    tempfile::TempDir,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://127.0.0.1:{}", listener.local_addr().unwrap().port());
     let dir = tempfile::tempdir().unwrap();
@@ -589,86 +811,131 @@ async fn the_host_refuses_calls_outside_agents_and_from_a_server_it_didnt_dial()
     .unwrap();
     let mut config = HostConfig::new(&url, "h");
     config.token_file = Some(token);
+    config.pins = pins;
     let b = hub(runtime, harnesses, vec![host::server_grant()]);
     let running = tokio::spawn(host::run(b, config));
 
     let (tcp, _) = listener.accept().await.unwrap();
     let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-    let mut read = async || -> Value {
-        loop {
-            let m = tokio::time::timeout(Duration::from_secs(10), ws.next()).await;
-            if let Message::Text(t) = m.unwrap().unwrap().unwrap() {
-                return serde_json::from_str(&t).unwrap();
-            }
-        }
-    };
-    let attach = read().await;
+    let attach = read_ws(&mut ws).await;
     assert_eq!(attach["params"]["method"], "hosts.attach", "{attach}");
-    let id = attach["id"].clone();
-    let attached =
-        json!({"type": "data", "content": {"type": "attached", "name": "h", "mode": "user"}});
-    for frame in [
-        json!({"jsonrpc": "2.0", "id": id, "result": "s1"}),
+    let nonce = attach["params"]["params"]["nonce"].as_str().unwrap();
+    let attached = json!({"type": "data", "content": {
+        "type": "attached", "name": "h", "mode": "user",
+        "server_key": key.public(), "signature": key.sign(&pairing::attach_message(nonce)),
+    }});
+    send_ws(
+        &mut ws,
+        json!({"jsonrpc": "2.0", "id": attach["id"], "result": "s1"}),
+    )
+    .await;
+    send_ws(
+        &mut ws,
         json!({"jsonrpc": "2.0", "method": "plexus-agents.call",
                "params": {"subscription": "s1", "result": attached}}),
-    ] {
-        ws.send(Message::Text(frame.to_string().into()))
-            .await
-            .unwrap();
-    }
+    )
+    .await;
+    (ws, running, dir)
+}
 
-    let mut n = 0;
-    let mut ask = async |ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
-                         method: &str,
-                         server: &str|
-           -> Value {
-        n += 1;
-        let id = format!("a-{n}");
-        let frame = json!({"jsonrpc": "2.0", "id": id, "method": "plexus-agents.call",
-                           "params": {"method": method, "params": {}, "hop": {"server": server}}});
-        ws.send(Message::Text(frame.to_string().into()))
-            .await
-            .unwrap();
-        let mut sub = None;
-        loop {
-            let m = tokio::time::timeout(Duration::from_secs(10), ws.next()).await;
-            let Message::Text(t) = m.unwrap().unwrap().unwrap() else {
-                continue;
-            };
-            let v: Value = serde_json::from_str(&t).unwrap();
-            if v["id"] == json!(id) {
-                sub = Some(v["result"].clone());
-                continue;
-            }
-            if sub.is_some() && v["params"]["subscription"] == sub.clone().unwrap() {
-                return v["params"]["result"].clone();
-            }
+/// Sends `method` to the host with `hop`, and returns the first item it answers.
+async fn ask(ws: &mut Ws, id: &str, method: &str, hop: Value) -> Value {
+    let frame = json!({"jsonrpc": "2.0", "id": id, "method": "plexus-agents.call",
+                       "params": {"method": method, "params": {}, "hop": hop}});
+    send_ws(ws, frame).await;
+    let mut sub = None;
+    loop {
+        let v = read_ws(ws).await;
+        if v["id"] == json!(id) {
+            sub = Some(v["result"].clone());
+            continue;
         }
-    };
-    let r = ask(&mut ws, "plexus-agents.hash", &url).await;
-    assert_eq!(r["error_kind"], "forbidden", "outside agents.*: {r}");
-    let r = ask(&mut ws, "agents.on.local.harnesses", &url).await;
-    assert_eq!(r["error_kind"], "forbidden", "on, past the host: {r}");
-    let r = ask(&mut ws, "agents.harnesses", "ws://another.example:4470").await;
-    assert_eq!(r["error_kind"], "forbidden", "a server it didn't dial: {r}");
-    let r = ask(&mut ws, "agents.harnesses", &url).await;
+        if sub.is_some() && v["params"]["subscription"] == sub.clone().unwrap() {
+            return v["params"]["result"].clone();
+        }
+    }
+}
+
+fn signed(key: &ServerKey, call: &str, method: &str) -> Value {
+    let nonce = format!("nonce-{call}");
+    let sig = key.sign(&pairing::call_message(call, method, &nonce));
+    json!({"call": call, "nonce": nonce, "sig": sig})
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_host_refuses_calls_the_server_key_didnt_sign_and_outside_agents() {
+    let key = ServerKey::from_seed(SERVER_SEED);
+    let (mut ws, running, _dir) = fake_server(&key, None).await;
+    let other = ServerKey::from_seed([66; 32]);
+
+    let r = ask(
+        &mut ws,
+        "a-1",
+        "agents.harnesses",
+        json!({"server": "ws://x"}),
+    )
+    .await;
+    assert_eq!(r["error_kind"], "forbidden", "no signature: {r}");
+    let r = ask(
+        &mut ws,
+        "a-2",
+        "agents.harnesses",
+        signed(&other, "c2", "agents.harnesses"),
+    )
+    .await;
+    assert_eq!(r["error_kind"], "forbidden", "another key's signature: {r}");
+    let r = ask(
+        &mut ws,
+        "a-3",
+        "agents.harnesses",
+        signed(&key, "c3", "agents.threads"),
+    )
+    .await;
     assert_eq!(
-        r["type"], "data",
-        "the server it dialed, under agents.*: {r}"
+        r["error_kind"], "forbidden",
+        "signed for another method: {r}"
     );
+    let mut bent = signed(&key, "c4", "agents.harnesses");
+    bent["nonce"] = json!("another-nonce");
+    let r = ask(&mut ws, "a-4", "agents.harnesses", bent).await;
+    assert_eq!(
+        r["error_kind"], "forbidden",
+        "signed over another nonce: {r}"
+    );
+    let r = ask(
+        &mut ws,
+        "a-5",
+        "plexus-agents.hash",
+        signed(&key, "c5", "plexus-agents.hash"),
+    )
+    .await;
+    assert_eq!(r["error_kind"], "forbidden", "outside agents.*: {r}");
+    let on = "agents.on.local.harnesses";
+    let r = ask(&mut ws, "a-6", on, signed(&key, "c6", on)).await;
+    assert_eq!(r["error_kind"], "forbidden", "on, past the host: {r}");
+    let r = ask(
+        &mut ws,
+        "a-7",
+        "agents.harnesses",
+        signed(&key, "c7", "agents.harnesses"),
+    )
+    .await;
+    assert_eq!(r["type"], "data", "signed by the key, under agents.*: {r}");
     assert_eq!(r["content"]["type"], "harnesses", "{r}");
+    let r = ask(
+        &mut ws,
+        "a-8",
+        "agents.harnesses",
+        signed(&key, "c7", "agents.harnesses"),
+    )
+    .await;
+    assert_eq!(r["error_kind"], "forbidden", "a call id used again: {r}");
 
     let schema =
         json!({"jsonrpc": "2.0", "id": "x", "method": "plexus-agents.schema", "params": {}});
-    ws.send(Message::Text(schema.to_string().into()))
-        .await
-        .unwrap();
+    send_ws(&mut ws, schema).await;
     loop {
-        let m = tokio::time::timeout(Duration::from_secs(10), ws.next()).await;
-        let Message::Text(t) = m.unwrap().unwrap().unwrap() else {
-            continue;
-        };
-        let v: Value = serde_json::from_str(&t).unwrap();
+        let v = read_ws(&mut ws).await;
         if v["id"] == "x" {
             assert_eq!(v["error"]["code"], -32601, "{v}");
             break;
@@ -678,19 +945,90 @@ async fn the_host_refuses_calls_outside_agents_and_from_a_server_it_didnt_dial()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn the_store_holds_no_token_or_private_key() {
+async fn a_host_refuses_a_server_that_cant_prove_the_pinned_key() {
+    let pins = tempfile::tempdir().unwrap();
+    let pinned = ServerKey::from_seed(SERVER_SEED);
+    let impostor = ServerKey::from_seed([66; 32]);
+    // A free port, its URL pinned to key_s before the host dials it.
+    let dir = pins.path().to_path_buf();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    drop(listener);
+    std::fs::write(host::pin_path(&dir, &url), pinned.public()).unwrap();
+    let token = dir.join("t");
+    std::fs::write(&token, "a token").unwrap();
+    let env: Arc<dyn Environment> = Arc::new(Nowhere);
+    let harnesses: Vec<Arc<dyn Harness>> = vec![Arc::new(ClaudeHarness::default())];
+    let (runtime, _) = Supervisor::open(SupervisorConfig {
+        db: dir.join("host.db"),
+        environment: env.clone(),
+        placements: HashMap::from([("local".to_string(), env)]),
+        harnesses: harnesses.clone(),
+    })
+    .await
+    .unwrap();
+    let mut config = HostConfig::new(&url, "h");
+    config.token_file = Some(token);
+    config.pins = Some(dir.clone());
+    let listener = tokio::net::TcpListener::bind(url.trim_start_matches("ws://"))
+        .await
+        .unwrap();
+    let b = hub(runtime, harnesses, vec![host::server_grant()]);
+    let running = tokio::spawn(host::run(b, config));
+    let (tcp, _) = listener.accept().await.unwrap();
+    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let attach = read_ws(&mut ws).await;
+    let nonce = attach["params"]["params"]["nonce"].as_str().unwrap();
+    // The impostor's own key, properly signed: still not the pinned one.
+    let attached = json!({"type": "data", "content": {
+        "type": "attached", "name": "h", "mode": "user",
+        "server_key": impostor.public(), "signature": impostor.sign(&pairing::attach_message(nonce)),
+    }});
+    send_ws(
+        &mut ws,
+        json!({"jsonrpc": "2.0", "id": attach["id"], "result": "s1"}),
+    )
+    .await;
+    send_ws(
+        &mut ws,
+        json!({"jsonrpc": "2.0", "method": "plexus-agents.call",
+               "params": {"subscription": "s1", "result": attached}}),
+    )
+    .await;
+    let ended = tokio::time::timeout(Duration::from_secs(10), running).await;
+    let e = ended
+        .expect("the host stops")
+        .unwrap()
+        .expect_err("refused");
+    assert!(e.to_string().contains("pinned"), "{e}");
+    assert!(e.is::<host::Untrusted>(), "{e}");
+    assert_eq!(
+        std::fs::read_to_string(host::pin_path(&dir, &url))
+            .unwrap()
+            .trim(),
+        pinned.public(),
+        "the pin stands"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_mode_host_pins_the_key_its_first_attach_proves() {
     let a = service().await;
     let (file, ada_token) = a.token_file(ADA);
-    let (key, seed) = a.key(11);
-    let args = [
-        "--token-file",
-        file.to_str().unwrap(),
-        "--key",
-        key.to_str().unwrap(),
-        "--pair",
-    ];
-    let _b = Host::start(&a, "vault", &args);
+    let b = Host::start(&a, "tofu", &["--token-file", file.to_str().unwrap()]);
     let ada = connect(a.port, Some(&ada_token)).await.unwrap();
+    online(&ada, "tofu", "user").await;
+    eventually("the pin is written", || b.pin(&a).is_some()).await;
+    assert_eq!(b.pin(&a), Some(a.hosts.server_key()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_store_holds_no_token_or_private_key() {
+    let a = service().await;
+    let ada_token = token(ADA);
+    let (key, seed) = a.key(11);
+    let ada = connect(a.port, Some(&ada_token)).await.unwrap();
+    let (_b, _) = pair(&a, &ada, "vault", &key).await;
     online(&ada, "vault", "machine").await;
     let r = call(&ada, "agents.on.vault.harnesses", json!({})).await;
     assert_eq!(r["type"], "harnesses", "{r}");
@@ -698,12 +1036,16 @@ async fn the_store_holds_no_token_or_private_key() {
     let dump = dump(&a.db);
     let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
     let b64 = base64::engine::general_purpose::STANDARD.encode(seed);
+    let server_hex: String = SERVER_SEED.iter().map(|b| format!("{b:02x}")).collect();
+    let server_b64 = base64::engine::general_purpose::STANDARD.encode(SERVER_SEED);
     let payload = ada_token.split('.').nth(1).unwrap();
     for secret in [
         ada_token.as_str(),
         payload,
         hex.as_str(),
         b64.as_str(),
+        server_hex.as_str(),
+        server_b64.as_str(),
         "plexus-key.",
     ] {
         assert!(
@@ -717,6 +1059,27 @@ async fn the_store_holds_no_token_or_private_key() {
         "{dump}"
     );
     assert!(dump.contains("vault"), "{dump}");
+    // Only public keys, names, owners, modes and timestamps: one row, these columns.
+    let hosts = dump.lines().filter(|l| l.starts_with("hosts: ")).count();
+    assert_eq!(hosts, 1, "{dump}");
+    let conn = rusqlite::Connection::open(&a.db).unwrap();
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('hosts')")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let expected = [
+        "host_id",
+        "name",
+        "owner",
+        "public_key",
+        "mode",
+        "created",
+        "last_seen",
+    ];
+    assert_eq!(columns, expected);
     // Nor do the files under it, WAL included.
     for entry in std::fs::read_dir(a.dir.path()).unwrap() {
         let path = entry.unwrap().path();
@@ -798,4 +1161,24 @@ async fn a_user_mode_host_redials_with_the_rotated_token_before_its_expiry() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("the host never attached again");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_service_with_no_local_placement_runs_nothing_itself() {
+    let a = service_placed(false).await;
+    let (file, ada_token) = a.token_file(ADA);
+    let _b = Host::start(&a, "mac", &["--token-file", file.to_str().unwrap()]);
+    let ada = connect(a.port, Some(&ada_token)).await.unwrap();
+    online(&ada, "mac", "user").await;
+    let run = json!({"placement": "local", "cwd": "/tmp", "prompt": "p"});
+    let r = call(&ada, "agents.start", run).await;
+    assert_eq!(r["error_kind"], "forbidden", "no local placement: {r}");
+    let on = call(&ada, "agents.on.placements", json!({})).await;
+    assert_eq!(
+        on["placements"],
+        json!([{"name": "mac", "peer": true}]),
+        "{on}"
+    );
+    let r = call(&ada, "agents.on.mac.harnesses", json!({})).await;
+    assert_eq!(r["type"], "harnesses", "{r}");
 }

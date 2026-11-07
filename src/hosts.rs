@@ -13,12 +13,29 @@
 //! | mode | credential | principal | owner |
 //! |---|---|---|---|
 //! | `user` | a plexus-idp access token, validated like any user's | the user | the user |
-//! | `machine` | an Ed25519 key proof naming agent [`HOST_AGENT`] | `key:<hex>` | whoever paired the key |
+//! | `machine` | an Ed25519 key proof naming agent [`HOST_AGENT`] | `key:<hex>` | whoever confirmed its pairing |
 //!
-//! A key proof naming [`HOST_AGENT`] is refused at the upgrade unless its key is
-//! paired now ([`Hosts::admission`]), and its socket is closed within a second of
-//! `hosts.unpair` (the transport's liveness watch asks [`SessionValidator::alive`]).
-//! Other key proofs (peer services, AGENTS-18) are unchanged.
+//! # Pairing (SUPERCONDUCTOR-18)
+//!
+//! The Mac never holds its user's credential. A key proof naming [`HOST_AGENT`] whose
+//! key isn't paired is admitted to a waiting room ([`Hosts::admission`]): it holds
+//! [`WAITING`], which lists `hosts.request` and `hosts.wait` and nothing else, for
+//! [`PENDING_TTL`]. `hosts.request` answers with this service's key (`key_s`) and its
+//! signature over the Mac's nonce, so the Mac knows whom it's talking to before it
+//! shows a code. Both sides compute [`crate::pairing::code`] from the two keys. A
+//! signed-in user reads the pending host and the code (`hosts.pairing`), and confirms
+//! it (`hosts.confirm`): the user becomes the owner, `hosts.wait` answers `paired`,
+//! and the same socket goes on to `hosts.attach` as the machine. Pending requests
+//! live in memory only, at most [`MAX_PER_IP`] per client address.
+//!
+//! A paired key's socket is closed within a second of `hosts.unpair` (the transport's
+//! liveness watch asks [`SessionValidator::alive`]). Other key proofs (peer services,
+//! AGENTS-18) are unchanged.
+//!
+//! Each call out carries `hop.sig`: `key_s`'s signature over (call id, method,
+//! nonce), which the host checks against the key it pinned. `hosts.attach` answers
+//! with `key_s`'s signature over the attach nonce, so a host checks the pin on every
+//! dial.
 //!
 //! # Which socket is a host's
 //!
@@ -39,9 +56,11 @@
 //! # What's kept
 //!
 //! `{host_id, name, owner, public_key, mode, created, last_seen}` per host, in
-//! SQLite. A public key, never a private one, and no token.
+//! SQLite. A public key, never a private one, and no token. `key_s`'s seed is a file
+//! the deploy holds, never the store.
 
 use crate::auth::{is_service, Access, AgentsRequest, Caller};
+use crate::pairing::{self, ServerKey};
 use crate::peer::{meta, one, timed_out, unavailable};
 use async_trait::async_trait;
 use futures::Stream;
@@ -57,11 +76,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// The agent id a host's key proof names. A proof naming it must be for a paired key.
 pub const HOST_AGENT: &str = "plexus-agents-host";
@@ -69,6 +89,16 @@ pub const HOST_AGENT: &str = "plexus-agents-host";
 pub const HOST_ROLE: &str = "host:";
 /// The role a paired key holds on its host: it may attach, and nothing else.
 pub const MACHINE: &str = "host-machine";
+/// The role an unpaired host key holds while it waits: `hosts.request`, `hosts.wait`.
+pub const WAITING: &str = "host-waiting";
+/// How long an unpaired key may wait, and a pairing request stands.
+pub const PENDING_TTL: Duration = Duration::from_secs(600);
+/// Pairing requests pending at once from one client address.
+pub const MAX_PER_IP: usize = 4;
+/// The metadata a socket admitted to the waiting room carries: when it came.
+const WAITING_SINCE: &str = "host_waiting_since";
+/// Unpaired keys waiting at once, from anywhere.
+const MAX_WAITING: usize = 1024;
 /// What `agents.on.<host>.` reaches: a host's own `agents` surface.
 pub const HOST_METHODS: [&str; 11] = [
     "start",
@@ -111,12 +141,16 @@ text_param!(
     HostName
 );
 text_param!(
-    /// An Ed25519 public key: `key:<64 hex>`, or the 64 hex alone.
-    PublicKey
-);
-text_param!(
     /// A one-time value the attaching connection names its `hosts.attach` with.
     Nonce
+);
+text_param!(
+    /// A pending pairing's id.
+    PairingId
+);
+text_param!(
+    /// A pairing code, `XXXX-XXXX`; case, spaces and dashes don't matter.
+    PairingCode
 );
 
 /// How a host signed in.
@@ -178,6 +212,25 @@ pub enum HostsEvent {
         host_id: String,
         name: String,
         public_key: String,
+        owner: String,
+    },
+    /// `hosts.request`'s answer: this service's key, proven over the Mac's nonce.
+    Pairing {
+        pairing_id: String,
+        /// `key_s`, `key:<hex>`.
+        server_key: String,
+        /// `key_s`'s signature over [`pairing::pair_message`], base64.
+        signature: String,
+    },
+    /// A pending pairing, as a signed-in user reads it before confirming.
+    Pending {
+        pairing_id: String,
+        name: String,
+        /// What the Mac's screen shows, if no one is in the middle.
+        code: String,
+        public_key: String,
+        created: i64,
+        expires: i64,
     },
     Unpaired {
         name: String,
@@ -188,6 +241,9 @@ pub enum HostsEvent {
     Attached {
         name: String,
         mode: Mode,
+        /// `key_s`, and its signature over [`pairing::attach_message`] of the nonce.
+        server_key: String,
+        signature: String,
     },
     Failed {
         message: String,
@@ -198,6 +254,8 @@ pub enum HostsEvent {
 pub struct HostStore {
     db: Mutex<rusqlite::Connection>,
     rows: RwLock<HashMap<String, HostRecord>>,
+    /// Unpaired host keys in the waiting room, and when each came. Memory only.
+    waiting: Mutex<HashMap<String, Instant>>,
 }
 
 impl HostStore {
@@ -240,7 +298,34 @@ impl HostStore {
         Ok(Arc::new(Self {
             db: Mutex::new(db),
             rows: RwLock::new(rows),
+            waiting: Mutex::default(),
         }))
+    }
+
+    /// Whether `hex` is an unpaired key waiting, its time not up.
+    pub fn waiting(&self, hex: &str) -> bool {
+        let waiting = self.waiting.lock().expect("hosts");
+        waiting
+            .get(hex)
+            .is_some_and(|at| at.elapsed() < PENDING_TTL)
+    }
+
+    /// Lets `hex` wait, if there's room. A key already waiting keeps its first time.
+    fn wait(&self, hex: &str) -> Result<(), String> {
+        let mut waiting = self.waiting.lock().expect("hosts");
+        waiting.retain(|_, at| at.elapsed() < PENDING_TTL);
+        if waiting.contains_key(hex) {
+            return Ok(());
+        }
+        if waiting.len() >= MAX_WAITING {
+            return Err("too many hosts are waiting to pair".into());
+        }
+        waiting.insert(hex.to_string(), Instant::now());
+        Ok(())
+    }
+
+    fn unwait(&self, hex: &str) {
+        self.waiting.lock().expect("hosts").remove(hex);
     }
 
     pub fn get(&self, name: &str) -> Option<HostRecord> {
@@ -341,29 +426,62 @@ fn key_hex(key: &str) -> Result<String, String> {
         .ok_or_else(|| "a public key is `key:` and 64 lowercase hex".to_string())
 }
 
+/// A pairing a Mac asked for and no one has confirmed yet. Memory only.
+struct PendingPair {
+    id: String,
+    name: String,
+    /// The Mac's key, 64 hex.
+    key: String,
+    ip: Option<IpAddr>,
+    created: Instant,
+    created_unix: i64,
+    done: watch::Sender<Option<HostsEvent>>,
+}
+
+impl PendingPair {
+    fn standing(&self) -> bool {
+        self.created.elapsed() < PENDING_TTL
+    }
+
+    fn code(&self, server: &ServerKey) -> String {
+        let key = pairing::key_bytes(&self.key).unwrap_or_default();
+        pairing::code(&key, &server.public_bytes())
+    }
+}
+
 /// The hosts this service knows, and the sockets they're attached on.
 pub struct Hosts {
     store: Arc<HostStore>,
     live: Mutex<HashMap<String, Arc<Wire>>>,
     claims: Mutex<HashMap<String, Arc<Wire>>>,
     /// What this service stamps on each call out as `hop.server`: the URL hosts
-    /// dial it at. A host refuses a call whose stamp isn't the URL it dialed.
+    /// dial it at. Informational; what a host checks is `hop.sig`.
     server: String,
+    /// `key_s`: this service's identity, which hosts pin.
+    key: ServerKey,
+    pending: Mutex<HashMap<String, PendingPair>>,
     /// Placements and peers: names a host can't take.
     reserved: RwLock<Vec<String>>,
 }
 
 impl Hosts {
-    /// The store at `db`, and calls out stamped with `server`.
-    pub fn open(db: &Path, server: impl Into<String>) -> anyhow::Result<Arc<Self>> {
+    /// The store at `db`, calls out stamped with `server` and signed by `key`.
+    pub fn open(db: &Path, server: impl Into<String>, key: ServerKey) -> anyhow::Result<Arc<Self>> {
         let store = HostStore::open(db)?;
         Ok(Arc::new(Self {
             store,
             live: Mutex::default(),
             claims: Mutex::default(),
             server: server.into().trim_end_matches('/').to_string(),
+            key,
+            pending: Mutex::default(),
             reserved: RwLock::default(),
         }))
+    }
+
+    /// `key_s`'s public half, `key:<hex>`.
+    pub fn server_key(&self) -> String {
+        self.key.public()
     }
 
     pub fn store(&self) -> Arc<HostStore> {
@@ -419,7 +537,10 @@ impl Hosts {
         Hooks::new(move |conn, ext| {
             let ctx = ext.get::<Arc<AuthContext>>()?;
             let principal = ctx.principal()?.to_string();
+            let forwarded = ext.get::<plexus_transport::proxy::ForwardedClient>();
+            let ip = forwarded.map_or(conn.peer().ip(), |f| f.ip);
             let wire = Arc::new(Wire {
+                ip: Some(ip),
                 conn: conn.clone(),
                 writer: conn.writer()?,
                 principal,
@@ -441,12 +562,19 @@ impl Hosts {
         })
     }
 
-    fn attach(&self, caller: &str, nonce: &str, name: Option<&str>) -> Result<HostsEvent, String> {
+    /// The socket a `hosts.attach` or `hosts.request` naming `nonce` came in on, if
+    /// it's the caller's.
+    fn claimed(&self, caller: &str, nonce: &str) -> Result<Arc<Wire>, String> {
         let wire = self.claims.lock().expect("hosts").remove(nonce);
-        let wire = wire.ok_or("no attach with that nonce came in on a signed-in socket")?;
+        let wire = wire.ok_or("no call with that nonce came in on a signed-in socket")?;
         if wire.principal != caller {
-            return Err("that attach came in on another caller's socket".into());
+            return Err("that call came in on another caller's socket".into());
         }
+        Ok(wire)
+    }
+
+    fn attach(&self, caller: &str, nonce: &str, name: Option<&str>) -> Result<HostsEvent, String> {
+        let wire = self.claimed(caller, nonce)?;
         let at = now();
         let (mut record, mode) = if let Some(key) = caller.strip_prefix("key:") {
             let record = self.store.by_key(key).ok_or("this key is not paired")?;
@@ -481,13 +609,127 @@ impl Hosts {
         self.store.put(record)?;
         *wire.attached.lock().expect("wire") = Some(name.clone());
         self.live.lock().expect("hosts").insert(name.clone(), wire);
-        Ok(HostsEvent::Attached { name, mode })
+        Ok(HostsEvent::Attached {
+            name,
+            mode,
+            server_key: self.key.public(),
+            signature: self.key.sign(&pairing::attach_message(nonce)),
+        })
+    }
+
+    /// An unpaired key asks to be paired as `name`: see the module docs.
+    fn request(&self, caller: &str, name: &str, nonce: &str) -> Result<HostsEvent, String> {
+        let key = caller
+            .strip_prefix("key:")
+            .ok_or("only a host's key asks to pair")?;
+        if self.store.by_key(key).is_some() {
+            return Err("this key is paired already: attach".into());
+        }
+        valid_name(name)?;
+        if self.reserved(name) {
+            return Err(format!("`{name}` is taken"));
+        }
+        if !(16..=256).contains(&nonce.len()) {
+            return Err("a nonce is 16 to 256 characters".into());
+        }
+        let wire = self.claimed(caller, nonce)?;
+        let mut pending = self.pending.lock().expect("hosts");
+        pending.retain(|_, p| p.standing());
+        let id = match pending.values_mut().find(|p| p.key == key) {
+            Some(p) => {
+                p.name = name.to_string();
+                p.id.clone()
+            }
+            None => {
+                let from_ip = pending.values().filter(|p| p.ip == wire.ip).count();
+                if from_ip >= MAX_PER_IP {
+                    return Err("too many pairing requests from this address".into());
+                }
+                let id = uuid::Uuid::new_v4().to_string();
+                let request = PendingPair {
+                    id: id.clone(),
+                    name: name.to_string(),
+                    key: key.to_string(),
+                    ip: wire.ip,
+                    created: Instant::now(),
+                    created_unix: now(),
+                    done: watch::channel(None).0,
+                };
+                pending.insert(id.clone(), request);
+                id
+            }
+        };
+        Ok(HostsEvent::Pairing {
+            pairing_id: id,
+            server_key: self.key.public(),
+            signature: self.key.sign(&pairing::pair_message(nonce, key)),
+        })
+    }
+
+    /// What `hosts.wait` waits on: the pairing's outcome, and when it lapses. A key
+    /// paired already has its answer now.
+    fn waiter(
+        &self,
+        caller: &str,
+        id: &str,
+    ) -> Result<(watch::Receiver<Option<HostsEvent>>, Instant), String> {
+        let key = caller
+            .strip_prefix("key:")
+            .ok_or("only a host's key waits")?;
+        if let Some(r) = self.store.by_key(key) {
+            let done = HostsEvent::Paired {
+                host_id: r.host_id,
+                name: r.name,
+                public_key: caller.to_string(),
+                owner: r.owner,
+            };
+            return Ok((watch::channel(Some(done)).1, Instant::now() + PENDING_TTL));
+        }
+        let pending = self.pending.lock().expect("hosts");
+        let p = pending.get(id).filter(|p| p.key == key && p.standing());
+        let p = p.ok_or("no such pairing is pending for this key")?;
+        Ok((p.done.subscribe(), p.created + PENDING_TTL))
+    }
+
+    fn find_pending(&self, id: Option<&str>, code: Option<&str>) -> Result<HostsEvent, String> {
+        let pending = self.pending.lock().expect("hosts");
+        let wanted = code.map(pairing::normalize);
+        let found = pending
+            .values()
+            .filter(|p| p.standing())
+            .find(|p| match (id, &wanted) {
+                (Some(id), _) => p.id == id,
+                (None, Some(code)) => pairing::normalize(&p.code(&self.key)) == *code,
+                (None, None) => false,
+            });
+        let p = found.ok_or("no pairing like that is pending")?;
+        Ok(HostsEvent::Pending {
+            pairing_id: p.id.clone(),
+            name: p.name.clone(),
+            code: p.code(&self.key),
+            public_key: format!("key:{}", p.key),
+            created: p.created_unix,
+            expires: p.created_unix + PENDING_TTL.as_secs() as i64,
+        })
+    }
+
+    /// A signed-in user confirms a pending pairing: it becomes theirs.
+    fn confirm(&self, caller: &str, id: &str) -> Result<HostsEvent, String> {
+        if is_service(caller) {
+            return Err("confirm as a signed-in user, not as a key".into());
+        }
+        let mut pending = self.pending.lock().expect("hosts");
+        let p = pending.get(id).filter(|p| p.standing());
+        let p = p.ok_or("no such pairing is pending")?;
+        let event = self.pair(caller, &p.name, &p.key)?;
+        let p = pending.remove(id).expect("found above");
+        drop(pending);
+        self.store.unwait(&p.key);
+        p.done.send_replace(Some(event.clone()));
+        Ok(event)
     }
 
     fn pair(&self, caller: &str, name: &str, key: &str) -> Result<HostsEvent, String> {
-        if is_service(caller) {
-            return Err("pair as a signed-in user, not as a key".into());
-        }
         valid_name(name)?;
         let key = key_hex(key)?;
         if self.reserved(name) {
@@ -516,6 +758,7 @@ impl Hosts {
             host_id: record.host_id.clone(),
             name: record.name.clone(),
             public_key: format!("key:{key}"),
+            owner: record.owner.clone(),
         };
         self.store.put(record)?;
         Ok(event)
@@ -557,7 +800,16 @@ impl Hosts {
         let Some(wire) = self.wire(name) else {
             return one(unavailable(name, "the host is not connected"));
         };
-        let hop = json!({"server": self.server, "call": uuid::Uuid::new_v4().to_string()});
+        let (call, nonce) = (
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let sig = self.key.sign(&pairing::call_message(
+            &call,
+            &format!("agents.{method}"),
+            &nonce,
+        ));
+        let hop = json!({"server": self.server, "call": call, "nonce": nonce, "sig": sig});
         let store = self.store.clone();
         let host = name.to_string();
         let still = move || store.get(&host).is_some_and(|r| r.owner == caller);
@@ -599,23 +851,45 @@ struct Admission {
 }
 
 impl Admission {
-    fn paired(&self, ctx: &AuthContext) -> Result<(), String> {
+    /// A host's key, if `ctx` is a host's key proof.
+    fn host_key(ctx: &AuthContext) -> Option<String> {
         if ctx.get_metadata_string("agent").as_deref() != Some(HOST_AGENT) {
+            return None;
+        }
+        let principal = ctx.principal()?.to_string();
+        Some(principal.strip_prefix("key:")?.to_string())
+    }
+
+    /// Paired, or a socket admitted to the waiting room with time left. A socket
+    /// admitted as paired doesn't become a waiting one when its key is unpaired:
+    /// it closes.
+    fn paired(&self, ctx: &AuthContext) -> Result<(), String> {
+        let Some(key) = Self::host_key(ctx) else {
+            return Ok(());
+        };
+        if self.store.by_key(&key).is_some() {
             return Ok(());
         }
-        let principal = ctx.principal().map(|p| p.to_string()).unwrap_or_default();
-        let key = principal.strip_prefix("key:").unwrap_or_default();
-        match self.store.by_key(key) {
-            Some(_) => Ok(()),
-            None => Err("this host's key is not paired".into()),
+        let since = ctx.metadata.get(WAITING_SINCE).and_then(Value::as_i64);
+        if since.is_some_and(|t| now() - t < PENDING_TTL.as_secs() as i64) {
+            return Ok(());
         }
+        Err("this host's key is not paired, and its time to pair is up".into())
     }
 }
 
 #[async_trait]
 impl SessionValidator for Admission {
     async fn validate(&self, value: &str) -> Option<AuthContext> {
-        let ctx = self.inner.validate(value).await?;
+        let mut ctx = self.inner.validate(value).await?;
+        if let Some(key) = Self::host_key(&ctx) {
+            if self.store.by_key(&key).is_none() {
+                self.store.wait(&key).ok()?;
+                if let Some(m) = ctx.metadata.as_object_mut() {
+                    m.insert(WAITING_SINCE.into(), now().into());
+                }
+            }
+        }
         self.paired(&ctx).ok()?;
         Some(ctx)
     }
@@ -644,6 +918,8 @@ struct WireState {
 
 /// One signed-in socket, as this side calls out on it.
 pub struct Wire {
+    /// The client's address, as the transport (and a trusted proxy) says.
+    ip: Option<IpAddr>,
     conn: Arc<Connection>,
     writer: ConnectionWriter,
     principal: String,
@@ -793,15 +1069,68 @@ fn key_of(v: &Value) -> Option<String> {
 
 struct WireHook(Arc<Wire>);
 
+impl WireHook {
+    /// Whether this socket is an unpaired host key's, in the waiting room.
+    fn waiting(&self) -> bool {
+        let Some(key) = self.0.principal.strip_prefix("key:") else {
+            return false;
+        };
+        let Some(hosts) = self.0.hosts.upgrade() else {
+            return false;
+        };
+        hosts.store.by_key(key).is_none() && hosts.store.waiting(key)
+    }
+
+    /// In the waiting room only `hosts.request` and `hosts.wait` answer, and the
+    /// closes of their own calls: the gate would let a `public` method or a
+    /// `.schema` through to anyone, so this refuses them first.
+    fn refuse_waiting(&self, v: &Value, id: &Value) -> bool {
+        let method = v["method"].as_str().unwrap_or_default();
+        let allowed = if method == CALL {
+            matches!(
+                v["params"]["method"].as_str(),
+                Some("hosts.request" | "hosts.wait")
+            )
+        } else {
+            method == CALL_UNSUB
+        };
+        if allowed {
+            return false;
+        }
+        let error = json!({"code": -32001,
+            "message": "an unpaired host may call hosts.request and hosts.wait, and nothing else"});
+        if !id.is_null() {
+            let refusal = json!({"jsonrpc": "2.0", "id": id, "error": error});
+            let _ = self.0.writer.try_send(Outbound::Text(refusal.to_string()));
+        }
+        true
+    }
+}
+
 impl ConnectionHook for WireHook {
     fn on_frame(&self, frame: &[u8]) -> bool {
         let wire = &self.0;
+        if self.waiting() {
+            // Batches and frames that don't parse go nowhere from the waiting room.
+            let Ok(v) = serde_json::from_slice::<Value>(frame) else {
+                return true;
+            };
+            if !v.is_object() {
+                return true;
+            }
+            if v.get("method").is_some() {
+                let id = v.get("id").cloned().unwrap_or(Value::Null);
+                if self.refuse_waiting(&v, &id) {
+                    return true;
+                }
+            }
+        }
         let quiet = {
             let st = wire.state.lock().expect("wire");
             st.pending.is_empty() && st.subs.is_empty()
         };
-        let attach = b"hosts.attach";
-        if quiet && !frame.windows(attach.len()).any(|w| w == attach) {
+        let names = |m: &[u8]| frame.windows(m.len()).any(|w| w == m);
+        if quiet && !names(b"hosts.attach") && !names(b"hosts.request") {
             return false;
         }
         let Ok(mut v) = serde_json::from_slice::<Value>(frame) else {
@@ -812,7 +1141,7 @@ impl ConnectionHook for WireHook {
             // A call to this side: let it go on, noting an attach's connection.
             (true, Some(_)) => {
                 let params = &v["params"];
-                if params["method"] == "hosts.attach" {
+                if params["method"] == "hosts.attach" || params["method"] == "hosts.request" {
                     if let (Some(nonce), Some(hosts)) =
                         (params["params"]["nonce"].as_str(), wire.hosts.upgrade())
                     {
@@ -889,12 +1218,23 @@ impl HostsActivation {
     }
 }
 
+async fn waited(mut rx: watch::Receiver<Option<HostsEvent>>, until: Instant) -> HostsEvent {
+    let lapsed = || HostsEvent::Failed {
+        message: "the pairing lapsed".into(),
+    };
+    let got = tokio::time::timeout_at(until.into(), rx.wait_for(Option::is_some)).await;
+    match got {
+        Ok(Ok(done)) => done.clone().unwrap_or_else(lapsed),
+        _ => lapsed(),
+    }
+}
+
 fn outcome(r: Result<HostsEvent, String>) -> futures::stream::Iter<std::vec::IntoIter<HostsEvent>> {
     let event = r.unwrap_or_else(|message| HostsEvent::Failed { message });
     futures::stream::iter(vec![event])
 }
 
-/// Hosts that dial in: pair a key, list yours, attach a socket.
+/// Hosts that dial in: pair a key by a code both sides show, list yours, attach a socket.
 #[plexus_macros::activation(
     trait = "HostsRpc",
     namespace = "hosts",
@@ -904,17 +1244,63 @@ fn outcome(r: Result<HostsEvent, String>) -> futures::stream::Iter<std::vec::Int
     typed_params
 )]
 impl HostsActivation {
-    /// Pairs a key with a host of yours, so it can sign in as a machine. No restart.
+    /// An unpaired host's key asks to pair as `name`. Answers with this service's
+    /// key and its signature over `nonce`, so the host can check whom it's talking to.
     #[plexus_macros::method(streaming)]
-    pub async fn pair(
+    pub async fn request(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,
-        /** the host's name */
+        /** the name the host asks for */
         name: HostName,
-        /** its Ed25519 public key, `key:<hex>` */
-        public_key: PublicKey,
+        /** a one-time value the service signs: 16 to 256 characters */
+        nonce: Nonce,
     ) -> impl Stream<Item = HostsEvent> + Send + 'static {
-        outcome(self.hosts.pair(&caller.actor().id, &name.0, &public_key.0))
+        outcome(self.hosts.request(&caller.actor().id, &name.0, &nonce.0))
+    }
+
+    /// Waits until a signed-in user confirms this key's pairing, or it lapses.
+    #[plexus_macros::method(streaming)]
+    pub async fn wait(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** what `hosts.request` answered */
+        pairing_id: PairingId,
+    ) -> impl Stream<Item = HostsEvent> + Send + 'static {
+        let waiter = self.hosts.waiter(&caller.actor().id, &pairing_id.0);
+        async_stream::stream! {
+            yield match waiter {
+                Err(message) => HostsEvent::Failed { message },
+                Ok((rx, until)) => waited(rx, until).await,
+            };
+        }
+    }
+
+    /// A pending pairing, by its id (the link) or the code its host shows.
+    #[plexus_macros::method(streaming)]
+    pub async fn pairing(
+        &self,
+        #[from_auth(self.access.verify)] _caller: Caller,
+        /** the id in the host's link */
+        pairing_id: Option<PairingId>,
+        /** or the code the host shows, `XXXX-XXXX` */
+        code: Option<PairingCode>,
+    ) -> impl Stream<Item = HostsEvent> + Send + 'static {
+        let id = pairing_id.as_ref().map(|p| p.0.as_str());
+        outcome(
+            self.hosts
+                .find_pending(id, code.as_ref().map(|c| c.0.as_str())),
+        )
+    }
+
+    /// Confirms a pending pairing: the host becomes yours, and goes on as a machine.
+    #[plexus_macros::method(streaming)]
+    pub async fn confirm(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the pending pairing */
+        pairing_id: PairingId,
+    ) -> impl Stream<Item = HostsEvent> + Send + 'static {
+        outcome(self.hosts.confirm(&caller.actor().id, &pairing_id.0))
     }
 
     /// Forgets a host of yours: its key is refused, and its socket is closed.

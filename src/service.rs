@@ -544,7 +544,7 @@ pub async fn serve(
 }
 
 /// [`serve`], with `hosts`' hook on every signed-in socket and its admission in
-/// front of `validator`: a host's key proof is refused unless its key is paired.
+/// front of `validator`: an unpaired host's key proof waits, and only waits.
 pub async fn serve_with_hosts(
     hub: Arc<DynamicHub>,
     validator: Arc<dyn SessionValidator>,
@@ -552,18 +552,57 @@ pub async fn serve_with_hosts(
     port: u16,
     hosts: Option<Arc<Hosts>>,
 ) -> anyhow::Result<()> {
+    let serving = Serving {
+        hosts,
+        ..Serving::new(bind, port)
+    };
+    serve_with(hub, validator, serving).await
+}
+
+/// How [`serve_with`] serves.
+#[derive(Clone)]
+pub struct Serving {
+    pub bind: IpAddr,
+    pub port: u16,
+    pub hosts: Option<Arc<Hosts>>,
+    /// Proxies whose `X-Forwarded-For` is believed: CIDRs, or `none`.
+    pub trusted_proxies: Vec<String>,
+}
+
+impl Serving {
+    pub fn new(bind: IpAddr, port: u16) -> Self {
+        Self {
+            bind,
+            port,
+            hosts: None,
+            trusted_proxies: Vec::new(),
+        }
+    }
+}
+
+/// [`serve_with_hosts`], as `serving` says.
+pub async fn serve_with(
+    hub: Arc<DynamicHub>,
+    validator: Arc<dyn SessionValidator>,
+    serving: Serving,
+) -> anyhow::Result<()> {
     let module =
         |h: Arc<DynamicHub>| DynamicHub::arc_into_rpc_module(h).map_err(|e| anyhow::anyhow!("{e}"));
     let mut builder = TransportServer::builder(hub, module);
     let mut validator = validator;
-    if let Some(hosts) = hosts {
+    if let Some(hosts) = serving.hosts {
         validator = hosts.admission(validator);
         builder = builder.with_hooks(hosts.hooks());
     }
+    if !serving.trusted_proxies.is_empty() {
+        let proxies = plexus_transport::proxy::TrustedProxies::parse(&serving.trusted_proxies)
+            .map_err(|e| anyhow::anyhow!("--trusted-proxy: {e}"))?;
+        builder = builder.with_trusted_proxies(proxies);
+    }
     builder
         .without_registry()
-        .with_websocket(port)
-        .bind(bind)
+        .with_websocket(serving.port)
+        .bind(serving.bind)
         .with_session_validator(validator)
         .anonymous_view()
         .credential_cookies(["access_token"])

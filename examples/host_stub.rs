@@ -2,8 +2,10 @@
 //! can kill, with its runs replayed from a real one rather than real Claude. It
 //! opens no port: it dials the service and serves its `agents` on that socket.
 //!
-//!     host_stub --server URL --name NAME --db FILE [--token-file F] [--key F [--pair]]
-//!               [--margin-secs N]
+//!     host_stub --server URL --name NAME --db FILE [--token-file F] [--key F]
+//!               [--pins DIR] [--margin-secs N]
+//!
+//! The pairing code and link go to stdout, as `plexus-agents host` prints them.
 
 use futures::future::BoxFuture;
 use plexus_agents::host::{self, HostConfig};
@@ -64,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
     let mut config = HostConfig::new(&need("--server")?, &need("--name")?);
     config.token_file = value("--token-file").map(Into::into);
     config.key = value("--key").map(Into::into);
-    config.pair = args.iter().any(|a| a == "--pair");
+    config.pins = value("--pins").map(Into::into);
     config.backoff_max = Duration::from_millis(500);
     if let Some(m) = value("--margin-secs") {
         config.margin = Duration::from_secs(m.parse()?);
