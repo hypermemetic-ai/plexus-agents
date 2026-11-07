@@ -475,7 +475,7 @@ pub fn hub_with_hosts(
 ) -> Arc<DynamicHub> {
     let names: Vec<String> = peers.iter().map(|p| p.name().to_string()).collect();
     let store = hosts.as_ref().map(|h| h.store());
-    let gate = auth::gate_with_hosts(&runtime, names.clone(), grants, store);
+    let gate = auth::gate_with_hosts(&runtime, names.clone(), grants, store, None);
     let mut agents = AgentsActivation::new(runtime.clone(), harnesses, gate.clone(), peers);
     let mut hub = DynamicHub::new("plexus-agents").with_gate(Arc::new(gate));
     if let Some(hosts) = hosts {
@@ -511,11 +511,30 @@ pub const SERVICE: &str = "plexus-agents";
 pub fn hub_with_ui(
     runtime: Supervisor,
     harnesses: Vec<Arc<dyn Harness>>,
+    grants: Vec<Grant>,
+    peers: Vec<Arc<Peer>>,
+    hosts: Option<Arc<Hosts>>,
+    backend: Arc<dyn plexus_rpc::core::plexus::AuthBackend>,
+    ui: Option<plexus_ui_service::UiActivation>,
+) -> Arc<DynamicHub> {
+    hub_with_people(runtime, harnesses, grants, peers, hosts, backend, ui, None, None)
+}
+
+/// [`hub_with_ui`], with the people page's half (test only, [`crate::people`]):
+/// `people` — plexus-login's `people.*`, when [`crate::front::sign_in`] made it
+/// (`--env test`, not a production host) — registered, and `grants`, the store a
+/// created user's roles are kept in, read by the gate.
+#[allow(clippy::too_many_arguments)]
+pub fn hub_with_people(
+    runtime: Supervisor,
+    harnesses: Vec<Arc<dyn Harness>>,
     mut grants: Vec<Grant>,
     peers: Vec<Arc<Peer>>,
     hosts: Option<Arc<Hosts>>,
     backend: Arc<dyn plexus_rpc::core::plexus::AuthBackend>,
     ui: Option<plexus_ui_service::UiActivation>,
+    people: Option<plexus_login::acting::PeopleActivation>,
+    people_grants: Option<Arc<crate::people::GrantStore>>,
 ) -> Arc<DynamicHub> {
     let system = ui.as_ref().map(|_| system_principal());
     if let Some(system) = &system {
@@ -527,8 +546,8 @@ pub fn hub_with_ui(
     }
     let names: Vec<String> = peers.iter().map(|p| p.name().to_string()).collect();
     let store = hosts.as_ref().map(|h| h.store());
-    let gate = auth::gate_with_hosts(&runtime, names.clone(), grants.clone(), store.clone());
-    let setup = auth::auth_setup(&runtime, names.clone(), grants, store, backend);
+    let gate = auth::gate_with_hosts(&runtime, names.clone(), grants.clone(), store.clone(), people_grants.clone());
+    let setup = auth::auth_setup(&runtime, names.clone(), grants, store, people_grants, backend);
     let mut agents = AgentsActivation::new(runtime.clone(), harnesses, gate, peers);
     let mut hub = DynamicHub::new(SERVICE);
     if let Some(hosts) = hosts {
@@ -539,6 +558,9 @@ pub fn hub_with_ui(
     let seam = ui.as_ref().map(|u| u.seam().clone());
     if let Some(ui) = ui {
         hub = hub.register(ui);
+    }
+    if let Some(people) = people {
+        hub = hub.register(people);
     }
     let hub = Arc::new(hub.register(agents).with_auth(setup));
     if let (Some(seam), Some(system)) = (seam, system) {

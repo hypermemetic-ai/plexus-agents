@@ -10,6 +10,7 @@ pub mod hosts;
 mod local;
 pub mod on;
 pub mod pairing;
+pub mod people;
 pub mod peer;
 pub mod record;
 pub mod runner;
