@@ -39,7 +39,9 @@
 "--st-idle-fg"    = ['#5f5d57', '#b9b6ae', 'idle']
 
 [type]
-"--font-text"     = ['"Geist Mono", ui-monospace, monospace', '"Geist Mono", ui-monospace, monospace', 'code, tool rows, the pairing code']
+"--font-text"     = ['"IBM Plex Sans", system-ui, sans-serif', '"IBM Plex Sans", system-ui, sans-serif', 'stub: UI and prose']
+"--font-mono"     = ['"IBM Plex Mono", ui-monospace, monospace', '"IBM Plex Mono", ui-monospace, monospace', 'stub: code, commands, paths']
+"--leading"       = ['1.5', '1.5', 'stub: body leading']
 "--sans"          = ['"Geist", system-ui, sans-serif', '"Geist", system-ui, sans-serif', 'the app']
 "--text-size"     = ['14px', '14px', 'the body size']
 "--weight-medium" = ['500', '500', 'a head']
@@ -59,3 +61,25 @@
 "--motion-fast"  = ['.12s', '.12s', 'a hover']
 "--motion-pulse" = ['1.2s', '1.2s', 'working, pulsing']
 "--ease"         = ['ease-out', 'ease-out', 'all of them']
+
+# stub (SC-34 builder): the contract tokens SC-30 has not landed here yet.
+[colour.stub-status]
+"--st-waiting-bg" = ['#ecebf6', '#26253a', 'stub: waiting']
+"--st-waiting-fg" = ['#4b4a7a', '#c0bff0', 'stub: waiting']
+"--st-done-bg"    = ['#e4f1e2', '#1c3019', 'stub: done']
+"--st-done-fg"    = ['#2f6a2a', '#9fd69a', 'stub: done']
+"--st-offline-bg" = ['#efefef', '#262626', 'stub: offline']
+"--st-offline-fg" = ['#6f6f6f', '#9a9a9a', 'stub: offline']
+
+[stub-shape]
+"--radius-xs" = ['2px', '2px', 'stub']
+"--radius-sm" = ['4px', '4px', 'stub']
+"--radius-md" = ['8px', '8px', 'stub']
+
+[stub-space]
+"--s1" = ['4px', '4px', 'stub']
+"--s2" = ['8px', '8px', 'stub']
+"--s3" = ['12px', '12px', 'stub']
+"--s4" = ['16px', '16px', 'stub']
+"--s5" = ['24px', '24px', 'stub']
+"--s6" = ['32px', '32px', 'stub']
