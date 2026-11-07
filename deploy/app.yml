@@ -70,10 +70,13 @@ resources:
   memory: 256m
   cpus: 0.5
 
-# Healthy means all of these, over https through the edge.
+# Healthy means all of these, over https through the edge. plexus-agents
+# serves no page yet: a plain GET is answered 426 Upgrade Required (by the
+# service, through the edge), and it checks no Origin, so a foreign one is
+# not a 403 here (as menger's and voice's are) until it does.
 health:
   - get: https://{host}/
-    status: 405
+    status: 426
   - websocket_upgrade: wss://{host}/ws
     origin: https://{host}
     status: 101
