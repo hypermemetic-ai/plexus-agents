@@ -5,13 +5,13 @@
      order, one per turn, when the turn ends — kept in this page only. While
      Claude works, a strip says for how long and offers Stop (Esc, by
      bus.keys). While an approval waits (`sc.pending`, said by sc-approval),
-     typing offers "Deny and send this": hosts.answer's Deny carries a message
-     Claude reads. On a phone it sticks to the bottom, above the safe area.
+     (status `needs`; the request read with hosts.pending), typing offers "Deny
+     and send this": hosts.answer's Deny carries a message Claude reads. On a phone it sticks to the bottom, above the safe area.
 
      Props: `status` is the thread's one status (sc-pill's: needs, working,
      waiting, failed, done, idle, offline); needs and working mean a turn is on. -->
 <script module>
-  export const uses = ["hosts.send", "hosts.interrupt", "hosts.answer"];
+  export const uses = ["hosts.send", "hosts.interrupt", "hosts.answer", "hosts.pending"];
   const clock = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
 </script>
 
@@ -30,11 +30,19 @@
   let field = $state(null);
   let seq = 0;
 
-  // The pending approval on this thread, if any.
+  // The request waiting on this thread, if any (the oldest), while it needs you.
   let pending = $state(null);
-  $effect(() => b.on("sc.pending", (ev) => {
-    pending = ev && ev.host === host && ev.thread === thread ? ev : null;
-  }, { last: true }));
+  $effect(() => {
+    if (status !== "needs") { pending = null; return; }
+    let gone = false;
+    b.call("hosts.pending", { host }).then((r) => {
+      if (gone) return;
+      const recs = (r.events ?? []).find((e) => e.type === "pending")?.requests ?? [];
+      const rec = recs.find((x) => x.thread === thread && x.request?.kind?.kind !== "other");
+      pending = rec ? { request: rec.request.id } : null;
+    });
+    return () => { gone = true; };
+  });
 
   // How long this turn has run (counted from when this page saw it start).
   let since = $state(0);
@@ -129,7 +137,7 @@
     const r = await b.call("hosts.answer", { host, thread, request, answer: { answer: "deny", message, stop_turn: false } });
     sending = false;
     error = failure(r, "deny with your note");
-    if (!error) { text = ""; b.emit("sc.answered", { request, outcome: "denied", note: message }); }
+    if (!error) { text = ""; pending = null; }
   }
 </script>
 
@@ -170,7 +178,7 @@
 
   {#if pending && text.trim()}
     <div class="deny">
-      <span>Claude is waiting on “{pending.what}”.</span>
+      <span>Or send this as your reason for denying Claude's request.</span>
       <Button kind="quiet" disabled={sending} onclick={denyWith}>Deny and send this</Button>
     </div>
   {/if}
@@ -178,7 +186,7 @@
   <form onsubmit={submit}>
     <textarea bind:this={field} rows="1" bind:value={text} onkeydown={keydown} oninput={grow}
       aria-label={busy ? "Queue a follow-up" : "Message Claude"}
-      placeholder={busy ? "Queue a follow-up for when Claude finishes" : "Reply to Claude"}></textarea>
+      placeholder={busy ? "Queue a follow-up" : "Reply to Claude"}></textarea>
     <span class="go"><Button kind="primary" type="submit" disabled={!text.trim() || sending}>{busy ? "Queue" : "Send"}</Button></span>
   </form>
   <p class="keys">Enter {busy ? "queues" : "sends"}, Shift+Enter for a new line</p>
@@ -195,9 +203,9 @@
     padding: var(--s3) var(--s5) max(var(--s3), env(safe-area-inset-bottom));
     background: var(--panel); border-top: 1px solid var(--line);
   }
-  .composer > * { max-width: 80ch; width: 100%; margin: 0 auto; }
+  .composer > * { max-width: 80ch; width: 100%; min-width: 0; }
 
-  .queue { list-style: none; margin: 0 auto; padding: 0; display: grid; gap: var(--s2); }
+  .queue { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--s2); }
   .queued { display: grid; gap: var(--s1); padding: var(--s2) var(--s3); background: var(--card); border: 1px dashed var(--line); border-radius: var(--radius-md); min-width: 0; }
   .when { font-size: 12px; color: var(--muted); }
   .qt { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 6lh; overflow: auto; }
@@ -226,8 +234,8 @@
   }
   textarea:focus-visible { outline: 2px solid var(--focus); outline-offset: -1px; border-color: var(--focus); }
   .go :global(button) { min-height: 44px; min-width: 76px; }
-  .keys { margin: 0 auto; font-size: 12px; color: var(--muted); }
-  .err { margin: 0 auto; color: var(--st-failed-fg); font-size: 13px; }
+  .keys { margin: 0; font-size: 12px; color: var(--muted); }
+  .err { margin: 0; color: var(--st-failed-fg); font-size: 13px; }
   .link { padding: 0; font: inherit; color: var(--accent); background: none; border: none; text-decoration: underline; cursor: pointer; }
 
   @keyframes pulse { from { opacity: 1; } to { opacity: .35; } }
@@ -236,7 +244,7 @@
     .composer { padding-left: var(--s4); padding-right: var(--s4); }
     textarea { font-size: 16px; }
     .keys, kbd { display: none; }
-    .qa :global(button) { min-height: 44px; flex: 1; }
+    .qa :global(button) { min-height: 44px; flex: 1; padding: 0 var(--s2); white-space: nowrap; }
     .stop :global(button) { min-height: 44px; }
   }
 </style>
