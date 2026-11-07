@@ -1,0 +1,79 @@
+# agents — what hypermemetic-infra needs to run plexus-agents behind the
+# edge (SUPERCONDUCTOR-20; the contract infra's roles/plexus_app reads, as
+# voice and menger declare theirs). A description, not a procedure:
+#
+#   deploy/build-image.sh                        # → ghcr.io/hypermemetic-ai/agents:<commit>
+#   bin/infra app.yml -e app_dir=../plexus-agents-SC20 -e env=test -e sha=<commit>
+#
+# prod (agents.menger.sh) is declared, not deployed: not by SUPERCONDUCTOR-20.
+# Nothing here is a secret.
+app: agents
+
+image:
+  name: ghcr.io/hypermemetic-ai/agents
+  # deploy/build-image.sh builds :<plexus-agents commit sha> from an assembled
+  # context (plexus-harness at the commit the Dockerfile pins). Deploy by sha.
+  tag: commit-sha
+  user: app            # uid 10001, non-root
+  stop_signal: SIGTERM
+
+environments:
+  prod:
+    host: agents.menger.sh
+    env_file: deploy/env/prod.env
+  test:
+    host: agents-test.menger.sh
+    env_file: deploy/env/test.env
+secret_env_file: secret.env
+
+# Secret files the box holds, placed by infra's secret.yml from a pipe, never
+# from here; infra sets `env` to each held file's path inside:
+#   server-key      the service's Ed25519 identity, a 32-byte seed (base64),
+#                   as plexus-agents' --service-key reads it (0400 is fine)
+#   workos-api-key  WorkOS's API key, of the environment menger's same env
+#                   uses (test: WorkOS staging) — for sign-in, once
+#                   plexus-agents reads it
+secrets:
+  mount: /run/secrets
+  owner: 10001
+  files:
+    - name: server-key
+      env: AGENTS_SERVICE_KEY_FILE
+    - name: workos-api-key
+      env: AGENTS_WORKOS_API_KEY_FILE
+
+# Inside the container, published on no host port. plexus-agents serves one
+# port, the WebSocket and its http answers alike: `shell` names the same port,
+# so the page (whatever plain http plexus-agents serves) goes there too.
+ports:
+  websocket: 4470
+  shell: 4470
+
+# Clients dial wss://<host>/ws, or an upgrade at any path (synapse dials /).
+routes:
+  - match: { path: /ws }
+    to: websocket
+  - match: { header: { Upgrade: websocket } }
+    to: websocket
+  - match: default
+    to: shell
+
+# One volume per environment: the SQLite file (/data/agents.db).
+data:
+  mount: /data
+  per_environment: true
+
+# The box (2 CPUs, 3.9 GB, swapping) also serves menger's prod and test, cal
+# and the edge: a small cap, a limit and not a reservation. No Claude runs
+# here; the service only routes.
+resources:
+  memory: 256m
+  cpus: 0.5
+
+# Healthy means all of these, over https through the edge.
+health:
+  - get: https://{host}/
+    status: 405
+  - websocket_upgrade: wss://{host}/ws
+    origin: https://{host}
+    status: 101
