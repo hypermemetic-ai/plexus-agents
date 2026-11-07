@@ -12,9 +12,16 @@
      the thread and follows it, each `event` an upsert, folded here in order.
      Its snapshot `hosts.threads { host, thread }` answers no row (plexus-ui's
      `live` has no shape for a stream alone); the folder comes from the same
-     method, called once. -->
+     method, called once.
+
+     superconductor-ui/modes: the header shows the thread's permission mode (its
+     `hosts.threads` row's `mode`, then each `permission_mode/<mode>` event) as a
+     control; it opens sc-modes, and a pick is `hosts.set_mode`, which applies from
+     Claude's next turn. Bypass is offered as the host allows it
+     (`hosts.capabilities`). A host from before modes (no `mode` on the row) shows
+     no control, and its approval cards no "Always allow". -->
 <script module>
-  export const uses = ["hosts.threads", "hosts.watch", "hosts.pending"];
+  export const uses = ["hosts.threads", "hosts.watch", "hosts.pending", "hosts.set_mode", "hosts.capabilities"];
 
   /** What the runtime told Claude, in the operator's words. */
   function runtimeWords(text) {
@@ -42,6 +49,7 @@
   import Approval from "./sc-approval.svelte";
   import Composer from "./sc-composer.svelte";
   import Empty from "./sc-empty.svelte";
+  import Modes, { labelOf, BYPASS } from "./sc-modes.svelte";
   import { editOf } from "./sc-diff.svelte";
   import { follow as followKeyboard, keyboardUp, onKeyboard } from "./sc-keyboard.svelte";
 
@@ -56,16 +64,43 @@
     on: { event: "upsert:event" },
   });
 
-  // The thread's folder, once.
+  // The thread's folder and permission mode, once; the mode then follows its events.
   let folder = $state("");
+  let mode = $state(null);         // null: not known yet, or a host from before modes
+  let bypass = $state(null);       // whether the host allows bypass; null: it doesn't say
+  let modeOpen = $state(false);
+  let modeBusy = $state(false);
+  let modeSaid = $state("");
+  let modeError = $state("");
   $effect(() => {
     const h = host, t = thread;
     untrack(async () => {
-      const r = await b.call("hosts.threads", { host: h, thread: t });
+      mode = null; bypass = null; modeOpen = false; modeSaid = ""; modeError = "";
+      const [r, c] = await Promise.all([
+        b.call("hosts.threads", { host: h, thread: t }),
+        b.call("hosts.capabilities", { host: h }),
+      ]);
+      if (h !== host || t !== thread) return;
       const v = (r.events ?? []).find((e) => e.type === "threads")?.threads?.find((x) => x.id === t);
       if (v?.cwd) folder = v.cwd;
+      if (typeof v?.mode === "string") mode = v.mode;
+      const caps = (c.events ?? []).find((e) => e.type === "capabilities");
+      if (caps) bypass = !!caps.bypass;
     });
   });
+  async function setMode(m) {
+    modeBusy = true; modeError = ""; modeSaid = "";
+    const r = await b.call("hosts.set_mode", { host, thread, mode: m });
+    modeBusy = false;
+    const set = (r.events ?? []).find((e) => e.type === "mode_set");
+    if (set) {
+      mode = set.mode;
+      modeSaid = `Set to ${labelOf(set.mode).toLowerCase()}. It applies from Claude's next turn.`;
+    } else {
+      const failed = (r.events ?? []).find((e) => e.type === "failed");
+      modeError = `The mode wasn't changed: ${failed?.message ?? r.message ?? "no reply"}.`;
+    }
+  }
 
   // The transcript, folded from the events in order.
   let items = $state([]);
@@ -188,6 +223,11 @@
         break;
       }
       case "run.ended": running = false; thinking = false; break;
+      case "native": {
+        const m = /^permission_mode\/(.+)$/.exec(ev.name ?? "");
+        if (m && mode !== null) mode = m[1];
+        break;
+      }
     }
   }
 
@@ -372,8 +412,24 @@
       <h1 class="title">{title || "New thread"}</h1>
       <p class="where">On <a href={`#/h/${encodeURIComponent(host)}`}>{host}</a>{#if place}, in <span class="folder" title={folder}>{place}</span>{/if}</p>
     </div>
+    {#if mode !== null}
+      <button type="button" class="mode" data-bypass={mode === BYPASS || undefined} aria-expanded={modeOpen} aria-controls="sc-thread-modes"
+        onclick={() => { modeOpen = !modeOpen; modeSaid = ""; modeError = ""; }} title="Change what Claude may do without asking">
+        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M8 1.5 2.75 3.5v4c0 3.2 2.2 5.9 5.25 7 3.05-1.1 5.25-3.8 5.25-7v-4z"/></svg>
+        <span>{labelOf(mode)}</span>
+      </button>
+    {/if}
     <Pill {status}/>
   </header>
+  {#if mode !== null && modeOpen}
+    <div class="modes" id="sc-thread-modes">
+      <Modes value={mode} onpick={setMode} {bypass} {host} busy={modeBusy} label="Permissions for this thread"/>
+      <p class="modes-note" role="status">{modeError || modeSaid || "A change applies from Claude's next turn. A turn under way keeps the mode it started with."}</p>
+      <button type="button" class="modes-done" onclick={() => (modeOpen = false)}>Done</button>
+    </div>
+  {:else if mode === BYPASS}
+    <p class="bypassing" role="status">Permissions are bypassed: Claude runs every command and edit here without asking.</p>
+  {/if}
 
   <div class="scroller" bind:this={scrollEl} onscroll={scrolled} onwheel={hand} onpointerdown={hand} onkeydown={hand}
     ontouchstart={() => { touching = true; hand(); }} ontouchend={() => { touching = false; hand(); }} ontouchcancel={() => { touching = false; }}>
@@ -396,7 +452,7 @@
           <div class="run"><ToolRun calls={it.calls} {folder}/></div>
         {:else if it.type === "ask"}
           {#if !it.outcome && asks[it.id]}
-            <div class="ask"><Approval {host} {thread} record={asks[it.id]}/></div>
+            <div class="ask"><Approval {host} {thread} record={asks[it.id]} rules={mode !== null}/></div>
           {:else if !it.outcome}
             <p class="note" data-tone="needs">Claude is waiting for your answer. Loading the request…</p>
           {:else if it.record}
@@ -446,6 +502,21 @@
   .where a { color: inherit; text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
   .folder { font-family: var(--font-mono); font-size: 12.5px; color: var(--ink); }
   .head :global(.pill) { margin-top: 3px; flex: none; }
+  .mode {
+    flex: none; display: inline-flex; align-items: center; gap: 6px; min-height: 30px; max-width: 40%; padding: 0 var(--s2);
+    font: inherit; font-size: var(--text-note); color: var(--muted); background: none;
+    border: var(--border) solid var(--line); border-radius: var(--radius-sm); cursor: pointer;
+  }
+  .mode span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mode svg { flex: none; fill: none; stroke: currentColor; stroke-width: 1.4; stroke-linejoin: round; }
+  .mode[aria-expanded=true] { color: var(--ink); background: var(--sel); border-color: var(--accent); }
+  .mode:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .mode[data-bypass] { color: var(--danger); background: var(--danger-wash); border-color: var(--danger); }
+  .modes { flex: none; display: grid; gap: var(--s2); padding: var(--s3) var(--s5) var(--s4); background: var(--panel); border-bottom: 1px solid var(--line); }
+  .modes-note { margin: 0; font-size: var(--text-note); color: var(--muted); }
+  .modes-done { justify-self: start; min-height: 32px; padding: 0 var(--s3); font: inherit; color: var(--accent); background: none; border: 0; cursor: pointer; }
+  .modes-done:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .bypassing { flex: none; margin: 0; padding: var(--s1) var(--s5); font-size: var(--text-note); color: var(--danger); background: var(--danger-wash); border-bottom: 1px solid var(--line); }
 
   .scroller { flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; overflow-anchor: none; -webkit-overflow-scrolling: touch; }
   .log { width: 100%; max-width: calc(72ch + 2 * var(--s5)); padding: var(--s4) var(--s5) var(--s6); min-width: 0; }
@@ -493,6 +564,8 @@
 
   @media (hover: hover) {
     .where a:hover { color: var(--ink); }
+    .mode:hover { color: var(--ink); background: var(--hover); }
+    .mode[data-bypass]:hover { color: var(--danger); background: var(--danger-wash); }
     .jump:hover { background: var(--hover); }
     .hold-menu button:hover { background: var(--hover); }
   }
@@ -505,7 +578,12 @@
   @media (max-width: 719.98px) {
     /* Into the frame's bottom inset: the composer pads itself above it. */
     .sc-thread { margin-bottom: calc(-1 * env(safe-area-inset-bottom)); }
-    .head { padding: var(--s3) var(--s4); }
+    .head { display: grid; grid-template-columns: minmax(0, 1fr) auto; row-gap: var(--s2); padding: var(--s3) var(--s4); }
+    .head :global(.pill) { grid-row: 1; grid-column: 2; }
+    .mode { grid-row: 2; grid-column: 1 / -1; justify-self: start; max-width: 100%; min-height: 36px; }
+    .modes { padding: var(--s3) var(--s4); max-height: 60vh; overflow-y: auto; }
+    .bypassing { padding: var(--s1) var(--s4); }
+    [data-kb] .mode, [data-kb] .modes, [data-kb] .bypassing { display: none; }
     .log { padding: var(--s3) var(--s4) var(--s5); }
     .user { padding: var(--s3); }
     /* The keyboard up (sc-keyboard): the thread is the visible area, its composer on the keyboard. */

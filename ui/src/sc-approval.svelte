@@ -3,13 +3,19 @@
      head. It says in words what Claude wants to do — a command as a command, an
      edit as a diff, a write as its file — and offers what the backend can do
      with it (plexus-harness InputAnswer): Allow once, or Deny (Claude is told,
-     and goes on). "Allow for this session" is not offered: the answer carries
-     no rule to keep (a gap, reported). A note with a denial goes from the
+     and goes on). superconductor-ui/modes: when the request carries Claude's
+     own rule suggestions (`request.raw.request.permission_suggestions`), each
+     one it can keep becomes an "Always allow …" button beside Allow once
+     (hosts.answer with `apply: [i]`), with a line saying in words what is
+     remembered and for how long: this thread, from now on; other threads still
+     ask. A switch to bypass is never offered here (that is the thread header's,
+     behind its confirm). `rules` false (a host from before modes) hides them.
+     A note with a denial goes from the
      composer: typing a reply while this is pending offers "Deny and send
      this" there.
 
      Keys while it waits (bus.keys, the newest card alone): `y` allows once,
-     `n` denies; a question's options are `1`…`9`. The chosen button fills and
+     `a` always allows (the first suggestion), `n` denies; a question's options are `1`…`9`. The chosen button fills and
      the others fade; once answered the card collapses to one line, which it
      keeps if the transcript keeps the record (`record.outcome`, the
      `input.resolved` outcome).
@@ -48,7 +54,53 @@
         return { head: `Use ${kind.tool ?? "a tool"}`, show: "code", code: JSON.stringify(i, null, 2), lang: "json", line: kind.tool ?? "a tool" };
     }
   }
-  const SAID = { allowed: "Allowed once", denied: "Denied", answered: "Answered", refused: "Refused" };
+  const SAID = { allowed: "Allowed once", always: "Allowed, and remembered for this thread", denied: "Denied", answered: "Answered", refused: "Refused" };
+
+  /** The request's own rule suggestions, whole, in its order (the index `apply` takes). */
+  export function suggestionsOf(record) {
+    const raw = record?.request?.raw ?? {};
+    const body = raw.request && typeof raw.request === "object" ? raw.request : raw;
+    return Array.isArray(body.permission_suggestions) ? body.permission_suggestions : [];
+  }
+  const MODE_WORDS = { default: "ask before each action", acceptEdits: "auto-accept edits", plan: "plan only" };
+  const EDITS = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+  /** One rule (`{toolName, ruleContent}`) in words: what Claude won't ask about again. */
+  function ruleWords(r) {
+    const tool = r?.toolName ?? "", c = r?.ruleContent ?? "";
+    if (tool === "Bash") {
+      if (!c) return { button: "Always allow commands", text: "running any command" };
+      const prefix = c.match(/^(.*?)(:\*| \*)$/);
+      if (prefix) return { button: "Always allow commands like this", text: "running commands that start with", code: prefix[1] };
+      return { button: "Always allow this command", text: "running", code: c };
+    }
+    if (EDITS.includes(tool)) return c ? { button: "Always allow these edits", text: "editing", code: c } : { button: "Always allow edits", text: "editing files" };
+    if (tool === "Read") return c ? { button: "Always allow reading these", text: "reading", code: c } : { button: "Always allow reading", text: "reading files" };
+    if (tool === "WebFetch") return c ? { button: "Always allow this site", text: "fetching from", code: c.replace(/^domain:/, "") } : { button: "Always allow fetching", text: "fetching web pages" };
+    return { button: `Always allow ${tool || "this"}`, text: `using ${tool || "this tool"}`, code: c || undefined };
+  }
+  /** What one suggestion offers: a button and what it remembers, or null when it isn't one to offer here. */
+  export function offerOf(sg) {
+    switch (sg?.type) {
+      case "addRules": {
+        if (sg.behavior && sg.behavior !== "allow") return null;
+        const rules = sg.rules ?? [];
+        if (!rules.length) return null;
+        const w = ruleWords(rules[0]);
+        if (rules.length > 1) return { button: "Always allow these", text: rules.map((r) => { const x = ruleWords(r); return x.code ? `${x.text} ${x.code}` : x.text; }).join("; ") };
+        return w;
+      }
+      case "addDirectories": {
+        const dirs = sg.directories ?? [];
+        if (!dirs.length) return null;
+        return { button: "Always allow this folder", text: "working in", code: dirs.join(", ") };
+      }
+      case "setMode":
+        if (!MODE_WORDS[sg.mode]) return null;  // bypass, or a mode this page doesn't know
+        return { button: sg.mode === "acceptEdits" ? "Allow, and auto-accept edits" : `Allow, and ${MODE_WORDS[sg.mode]}`, text: `switching this thread to ${MODE_WORDS[sg.mode]}`, mode: true };
+      default:
+        return null;
+    }
+  }
   /** The one-line record of an outcome (`input.resolved`'s, or this card's own). */
   export function said(outcome) {
     if (!outcome) return "";
@@ -64,11 +116,17 @@
   import Diff from "./sc-diff.svelte";
   import Text from "./sc-text.svelte";
 
-  let { host, thread, record } = $props();
+  let { host, thread, record, rules = true } = $props();
   const b = bus();
   const kind = $derived(record.request?.kind ?? {});
   const id = $derived(record.request?.id);
   const what = $derived(kind.kind === "tool_approval" ? describe(kind) : null);
+  // Claude's suggestions it can keep, each with its index into the request's list.
+  const offers = $derived(
+    rules && kind.kind === "tool_approval"
+      ? suggestionsOf(record).map((sg, i) => ({ i, ...(offerOf(sg) ?? {}) })).filter((o) => o.button).slice(0, 3)
+      : [],
+  );
 
   let busy = $state("");           // the answer under way: "allow" | "deny" | an option's label
   let mine = $state(null);         // { outcome, note } once answered from this page
@@ -76,11 +134,13 @@
   const outcome = $derived(mine?.outcome ?? record.outcome ?? null);
   const done = $derived(!!outcome);
 
-  async function answer(a, chosen, as) {
+  async function answer(a, chosen, as, apply) {
     if (busy || done) return;
     busy = chosen;
     error = "";
-    const r = await b.call("hosts.answer", { host, thread, request: id, answer: a });
+    const params = { host, thread, request: id, answer: a };
+    if (apply) params.apply = apply;
+    const r = await b.call("hosts.answer", params);
     const failed = (r.events ?? []).find((e) => e.type === "failed");
     busy = "";
     if (!r.ok || failed) {
@@ -93,6 +153,7 @@
     mine = { outcome: as };
   }
   const allow = () => answer({ answer: "allow" }, "allow", "allowed");
+  const always = (o) => answer({ answer: "allow" }, "always" + o.i, "always", [o.i]);
   const deny = () => answer({ answer: "deny", message: "The user denied this from the browser.", stop_turn: false }, "deny", "denied");
   const pick = (q, o) => answer({ answer: "answers", answers: { [q.question]: o.label } }, o.label, "answered");
   const refuse = () => answer({ answer: "refuse", reason: "the browser can't answer this kind of request" }, "refuse", "refused");
@@ -103,6 +164,7 @@
     const map = {};
     if (kind.kind === "tool_approval") {
       map.y = { to: allow, label: "allow once", only: true };
+      if (offers.length) map.a = { to: () => always(offers[0]), label: offers[0].button.toLowerCase(), only: true };
       map.n = { to: deny, label: "deny", only: true };
     } else if (kind.kind === "question") {
       const opts = (kind.questions?.[0]?.options ?? []).slice(0, 9);
@@ -114,7 +176,7 @@
 
 {#if done}
   <div class="record" data-surface="sc-approval" data-outcome={typeof outcome === "string" ? outcome : "cancelled"}>
-    <span class="mark" aria-hidden="true">{outcome === "allowed" || outcome === "answered" ? "✓" : "✕"}</span>
+    <span class="mark" aria-hidden="true">{outcome === "allowed" || outcome === "answered" || outcome === "always" ? "✓" : "✕"}</span>
     <span class="said">{said(outcome)}</span>
     {#if what}<span class="obj">{what.line}</span>{/if}
   </div>
@@ -141,8 +203,18 @@
       {/if}
       <div class="actions" data-busy={busy || null}>
         <span class="act" data-chosen={busy === "allow" || null}><Button kind="primary" disabled={!!busy} onclick={allow}>{busy === "allow" ? "Allowing…" : "Allow once"}<kbd>y</kbd></Button></span>
+        {#each offers as o, n (o.i)}
+          <span class="act always" data-chosen={busy === "always" + o.i || null}><Button kind="quiet" disabled={!!busy} onclick={() => always(o)}>{busy === "always" + o.i ? "Allowing…" : o.button}{#if n === 0}<kbd>a</kbd>{/if}</Button></span>
+        {/each}
         <span class="act" data-chosen={busy === "deny" || null}><Button kind="quiet" disabled={!!busy} onclick={deny}>{busy === "deny" ? "Denying…" : "Deny"}<kbd>n</kbd></Button></span>
       </div>
+      {#if offers.length}
+        <div class="keeps">
+          {#each offers as o (o.i)}
+            <p><strong>{o.button}</strong> also allows {o.text}{#if o.code}{" "}<code>{o.code}</code>{/if} without asking, in this thread from now on{o.mode ? "" : ", restarts included"}. Other threads still ask.</p>
+          {/each}
+        </div>
+      {/if}
       <p class="hint">To deny with a reason, type it in the reply box below.</p>
     {:else if kind.kind === "question"}
       <header><span class="ask">Claude asks</span></header>
@@ -208,7 +280,11 @@
     font-size: 13px; color: var(--muted); border-left: 2px solid var(--line); min-width: 0;
   }
   .record .said { color: var(--ink); font-weight: 500; white-space: nowrap; }
-  .record[data-outcome=allowed] .mark, .record[data-outcome=answered] .mark { color: var(--st-done-fg); }
+  .record[data-outcome=allowed] .mark, .record[data-outcome=answered] .mark, .record[data-outcome=always] .mark { color: var(--st-done-fg); }
+  .keeps { display: grid; gap: var(--s1); padding: var(--s2) var(--s3); font-size: var(--text-note); line-height: var(--leading); color: var(--muted); background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-sm); }
+  .keeps p { margin: 0; overflow-wrap: anywhere; }
+  .keeps strong { color: var(--ink); font-weight: var(--weight-medium); }
+  .keeps code { font: 12px var(--font-mono); color: var(--ink); }
   .record[data-outcome=denied] .mark, .record[data-outcome=refused] .mark { color: var(--st-failed-fg); }
   .obj { font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 
@@ -218,6 +294,7 @@
   @media (max-width: 719px) {
     .card { margin-left: calc(-1 * var(--s2)); margin-right: calc(-1 * var(--s2)); padding: var(--s3) var(--s3) var(--s3) calc(var(--s3) + 2px); }
     .actions { display: grid; grid-template-columns: 1fr 1fr; }
+    .actions .always { display: block; grid-column: 1 / -1; grid-row: 2; }
     .actions .act :global(button) { min-height: 48px; width: 100%; }
     .options { grid-template-columns: 1fr; }
   }
