@@ -14,9 +14,8 @@
      keeps if the transcript keeps the record (`record.outcome`, the
      `input.resolved` outcome).
 
-     Bus: says `sc.pending` (sticky) {host, thread, request, what} while it
-     waits, and null once answered; hears `sc.answered` {request, outcome,
-     note} when the composer answered it. -->
+     A card the composer answered (Deny and send this) collapses by the
+     record's outcome like any other. -->
 <script module>
   export const uses = ["hosts.answer"];
 
@@ -98,14 +97,6 @@
   const pick = (q, o) => answer({ answer: "answers", answers: { [q.question]: o.label } }, o.label, "answered");
   const refuse = () => answer({ answer: "refuse", reason: "the browser can't answer this kind of request" }, "refuse", "refused");
 
-  // Tell the composer what is waiting, and hear when it answered with a note.
-  $effect(() => {
-    if (done || !id) return;
-    b.emit("sc.pending", { host, thread, request: id, what: what?.head ?? "answer Claude" }, { sticky: true });
-    const off = b.on("sc.answered", (ev) => { if (ev?.request === id) mine = { outcome: ev.outcome, note: ev.note }; });
-    return () => { off(); b.emit("sc.pending", null, { sticky: true }); };
-  });
-
   // y / n (or 1…9 for a question) while it waits; the newest card alone.
   $effect(() => {
     if (done) return;
@@ -126,7 +117,6 @@
     <span class="mark" aria-hidden="true">{outcome === "allowed" || outcome === "answered" ? "✓" : "✕"}</span>
     <span class="said">{said(outcome)}</span>
     {#if what}<span class="obj">{what.line}</span>{/if}
-    {#if mine?.note}<span class="note">with your note</span>{/if}
   </div>
 {:else}
   <section class="card" data-surface="sc-approval" aria-label="Claude needs your answer">
