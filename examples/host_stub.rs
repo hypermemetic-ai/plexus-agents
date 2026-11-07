@@ -3,7 +3,7 @@
 //! opens no port: it dials the service and serves its `agents` on that socket.
 //!
 //!     host_stub --server URL --name NAME --db FILE [--token-file F] [--key F]
-//!               [--pins DIR] [--margin-secs N]
+//!               [--pins DIR] [--margin-secs N] [--root DIR]
 //!
 //! The pairing code and link go to stdout, as `plexus-agents host` prints them.
 
@@ -81,5 +81,8 @@ async fn main() -> anyhow::Result<()> {
     })
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if let Some(root) = value("--root") {
+        runtime.set_roots(vec![root.into()]);
+    }
     host::run(hub(runtime, harnesses, vec![host::server_grant()]), config).await
 }

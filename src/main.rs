@@ -73,10 +73,13 @@
 //! `AGENTS_TRUSTED_PROXIES`, `AGENTS_PLACEMENTS`, `AGENTS_KEY_AUDIENCES`,
 //! `AGENTS_ALLOW`, `AGENTS_UI_SIGNERS` (comma-separated). A flag wins.
 //!
+//! `--park-grace SECS` (`AGENTS_PARK_GRACE`, default 600) is how long a request
+//! waits with its process alive before a parking thread parks; 0 parks at once.
+//!
 //! ```text
 //! plexus-agents host --server URL --name NAME --db FILE
 //!                    [--token-file FILE] [--key FILE] [--pins DIR] [--app URL]
-//!                    [--placement NAME]...
+//!                    [--placement NAME]... [--root DIR]... [--park-grace SECS]
 //! ```
 //!
 //! runs a host: dials the service, attaches as `NAME`, and serves this machine's own
@@ -85,6 +88,10 @@
 //! key (`--key`, by default `~/.plexus/keys/NAME.key`, made if missing), and an
 //! unpaired key prints a code and a link to confirm in the browser. Server keys are
 //! pinned in `--pins` (default `~/.plexus/hosts`). See `plexus_agents::host`.
+//!
+//! `--root` (repeatable; `AGENTS_ROOTS`, comma-separated) names a folder threads
+//! start under, which `agents.folders` lists with the projects right under it; with
+//! none, the user's home. `--park-grace` is as above.
 
 use anyhow::{anyhow, Context};
 use plexus_agents::auth::Grant;
@@ -110,6 +117,17 @@ fn env_list(name: &str) -> Vec<String> {
     let list = env(name).unwrap_or_default();
     let items = list.split(',').map(str::trim).filter(|s| !s.is_empty());
     items.map(str::to_string).collect()
+}
+
+/// How long a request waits live before its thread parks: `AGENTS_PARK_GRACE`.
+const DEFAULT_PARK_GRACE: u64 = 600;
+
+fn park_grace(flag: Option<String>) -> anyhow::Result<std::time::Duration> {
+    let secs = flag
+        .or_else(|| env("AGENTS_PARK_GRACE"))
+        .map_or(Ok(DEFAULT_PARK_GRACE), |s| s.trim().parse())
+        .context("--park-grace takes whole seconds")?;
+    Ok(std::time::Duration::from_secs(secs))
 }
 
 #[tokio::main]
@@ -142,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
     let mut ui_db = env("AGENTS_UI_DB").map(std::path::PathBuf::from);
     let mut ui_signers = env_list("AGENTS_UI_SIGNERS");
     let mut allow = env_list("AGENTS_ALLOW");
+    let mut grace = None;
     // A list flag given replaces the environment's list.
     let mut replaced = std::collections::HashSet::new();
     let mut it = std::env::args().skip(1);
@@ -178,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
             "--ui-db" => ui_db = Some(value()?.into()),
             "--ui-signer" => list(&mut ui_signers, value()?, "ui-signer"),
             "--allow" => list(&mut allow, value()?, "allow"),
+            "--park-grace" => grace = Some(value()?),
             "--print-key" => {
                 println!(
                     "{}",
@@ -283,6 +303,7 @@ async fn main() -> anyhow::Result<()> {
     })
     .await
     .map_err(|e| anyhow!("{e}"))?;
+    runtime.set_park_grace(park_grace(grace)?);
     eprintln!("plexus-agents: on {bind}:{port}, recovered {recovery:?}");
     let backend = login.backend();
     let ui = UiActivation::new(store.clone(), signers);
@@ -318,6 +339,8 @@ async fn host() -> anyhow::Result<()> {
     let (mut server, mut name, mut db, mut record) = (None, None, None, None);
     let (mut token_file, mut key, mut pins, mut app) = (None, None, None, None);
     let mut placements = Vec::new();
+    let (mut roots, mut grace) = (env_list("AGENTS_ROOTS"), None);
+    let mut roots_given = false;
     let mut it = std::env::args().skip(2);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(anyhow!("{flag} needs a value"));
@@ -331,6 +354,13 @@ async fn host() -> anyhow::Result<()> {
             "--pins" => pins = Some(value()?.into()),
             "--app" => app = Some(value()?),
             "--placement" => placements.push(value()?),
+            "--root" => {
+                if !std::mem::replace(&mut roots_given, true) {
+                    roots.clear();
+                }
+                roots.push(value()?);
+            }
+            "--park-grace" => grace = Some(value()?),
             other => return Err(anyhow!("no flag {other}")),
         }
     }
@@ -374,6 +404,12 @@ async fn host() -> anyhow::Result<()> {
     })
     .await
     .map_err(|e| anyhow!("{e}"))?;
+    runtime.set_park_grace(park_grace(grace)?);
+    runtime.set_roots(roots.into_iter().map(std::path::PathBuf::from).collect());
+    eprintln!(
+        "plexus-agents host: threads start under {:?}",
+        runtime.roots()
+    );
     let hub = service::hub(runtime, harnesses, vec![host::server_grant()]);
     host::run(hub, config).await
 }
