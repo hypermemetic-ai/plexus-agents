@@ -106,7 +106,9 @@
 <style>
   .sc-diff { margin: var(--s1) 0; min-width: 0; overflow: hidden; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-md); }
   .edge { display: flex; align-items: baseline; gap: var(--s2); width: 100%; min-height: 36px; padding: var(--s2) var(--s3); text-align: left; color: var(--ink); background: none; border: 0; cursor: pointer; }
-  .edge:hover { background: var(--hover); }
+  @media (hover: hover) { .edge:hover { background: var(--hover); } }
+  .edge { -webkit-tap-highlight-color: transparent; }
+  .lines { overscroll-behavior: contain; }
   .edge:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
   .chev { flex: none; width: 1em; color: var(--muted); }
   .verb { flex: none; color: var(--muted); }

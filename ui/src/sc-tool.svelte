@@ -131,7 +131,8 @@
 <style>
   .tool { min-width: 0; }
   .row { display: flex; align-items: baseline; gap: var(--s2); width: 100%; min-height: 32px; padding: var(--s1) var(--s2); text-align: left; color: var(--ink); background: none; border: 0; border-radius: var(--radius-sm); cursor: pointer; }
-  .row:hover { background: var(--hover); }
+  @media (hover: hover) { .row:hover { background: var(--hover); } }
+  .row, .more { -webkit-tap-highlight-color: transparent; }
   .row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
   .state { flex: none; align-self: center; width: 7px; height: 7px; border-radius: var(--radius-pill); background: var(--line); }
   .tool[data-state=running] .state { background: var(--st-working-fg); animation: beat 1.2s ease-out infinite alternate; }
