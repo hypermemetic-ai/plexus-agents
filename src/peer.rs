@@ -82,7 +82,7 @@ impl PeerConfig {
 }
 
 /// The file's seed. Refused when group or others may read it.
-fn read_seed(path: &Path) -> Result<[u8; 32], String> {
+pub(crate) fn read_seed(path: &Path) -> Result<[u8; 32], String> {
     use std::os::unix::fs::PermissionsExt;
     let shown = path.display();
     let about = |e: std::io::Error| format!("the key file {shown}: {e}");
@@ -101,7 +101,7 @@ fn read_seed(path: &Path) -> Result<[u8; 32], String> {
     <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| format!("{shown} holds no 32-byte seed"))
 }
 
-fn principal_of(seed: &[u8; 32]) -> String {
+pub(crate) fn principal_of(seed: &[u8; 32]) -> String {
     let key = ed25519_dalek::SigningKey::from_bytes(seed);
     key_principal(key.verifying_key().as_bytes()).to_string()
 }
