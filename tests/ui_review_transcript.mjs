@@ -77,7 +77,7 @@ await both("thread-open", async () => {
 });
 
 step("scrolled up, the way back to the latest");
-await page.evaluate(() => (document.scrollingElement.scrollTop = 0));
+await page.evaluate(() => (document.querySelector(".sc-thread .scroller").scrollTop = 0));
 await page.waitForTimeout(200);
 await page.getByRole("button", { name: "Jump to latest" }).waitFor({ timeout: 5000 });
 await page.screenshot({ path: `${SHOTS}/thread-jump-1280.png` });
