@@ -80,6 +80,7 @@
 //! plexus-agents host --server URL --name NAME --db FILE
 //!                    [--token-file FILE] [--key FILE] [--pins DIR] [--app URL]
 //!                    [--placement NAME]... [--root DIR]... [--park-grace SECS]
+//!                    [--allow-bypass]
 //! ```
 //!
 //! runs a host: dials the service, attaches as `NAME`, and serves this machine's own
@@ -92,6 +93,11 @@
 //! `--root` (repeatable; `AGENTS_ROOTS`, comma-separated) names a folder threads
 //! start under, which `agents.folders` lists with the projects right under it; with
 //! none, the user's home. `--park-grace` is as above.
+//!
+//! `--allow-bypass` (`AGENTS_ALLOW_BYPASS=1`) lets this host's owner, through the
+//! service it is paired with, put a thread in `bypassPermissions`: no request ever
+//! reaches a person. Without it that mode is refused here. `agents.capabilities`
+//! says which, so the UI can offer it or not.
 
 use anyhow::{anyhow, Context};
 use plexus_agents::auth::Grant;
@@ -117,6 +123,14 @@ fn env_list(name: &str) -> Vec<String> {
     let list = env(name).unwrap_or_default();
     let items = list.split(',').map(str::trim).filter(|s| !s.is_empty());
     items.map(str::to_string).collect()
+}
+
+/// `1`, `true`, `yes` or `on`, for a switch set in the environment.
+fn truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// How long a request waits live before its thread parks: `AGENTS_PARK_GRACE`.
@@ -341,6 +355,7 @@ async fn host() -> anyhow::Result<()> {
     let mut placements = Vec::new();
     let (mut roots, mut grace) = (env_list("AGENTS_ROOTS"), None);
     let mut roots_given = false;
+    let mut allow_bypass = env("AGENTS_ALLOW_BYPASS").is_some_and(|v| truthy(&v));
     let mut it = std::env::args().skip(2);
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(anyhow!("{flag} needs a value"));
@@ -361,6 +376,7 @@ async fn host() -> anyhow::Result<()> {
                 roots.push(value()?);
             }
             "--park-grace" => grace = Some(value()?),
+            "--allow-bypass" => allow_bypass = true,
             other => return Err(anyhow!("no flag {other}")),
         }
     }
@@ -406,6 +422,13 @@ async fn host() -> anyhow::Result<()> {
     .map_err(|e| anyhow!("{e}"))?;
     runtime.set_park_grace(park_grace(grace)?);
     runtime.set_roots(roots.into_iter().map(std::path::PathBuf::from).collect());
+    runtime.set_allow_bypass(allow_bypass);
+    if allow_bypass {
+        eprintln!(
+            "plexus-agents host: --allow-bypass: this host's owner may start threads in \
+             bypassPermissions, where NO PERMISSION IS ASKED"
+        );
+    }
     eprintln!(
         "plexus-agents host: threads start under {:?}",
         runtime.roots()

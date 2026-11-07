@@ -1198,11 +1198,25 @@ async fn a_hosts_owner_picks_its_threads_modes_and_sees_its_folders() {
     let _b = Host::start(
         &a,
         "nat",
-        &["--token-file", file.to_str().unwrap(), "--root", root],
+        &[
+            "--token-file",
+            file.to_str().unwrap(),
+            "--root",
+            root,
+            "--allow-bypass",
+        ],
     );
     let ada = connect(a.port, Some(&ada_token)).await.unwrap();
     online(&ada, "nat", "user").await;
 
+    let caps = call(&ada, "hosts.capabilities", json!({"host": "nat"})).await;
+    assert_eq!(caps["type"], "capabilities", "{caps}");
+    assert_eq!(caps["bypass"], true, "{caps}");
+    assert_eq!(
+        caps["modes"],
+        json!(["default", "acceptEdits", "plan", "bypassPermissions"]),
+        "{caps}"
+    );
     let run = json!({"host": "nat", "cwd": "/recorded/cwd", "prompt": "p",
                      "mode": "bypassPermissions"});
     let started = call(&ada, "hosts.start", run).await;
@@ -1273,4 +1287,59 @@ async fn a_hosts_owner_picks_its_threads_modes_and_sees_its_folders() {
         let r = call(&ben, method, json!({"thread": thread, "mode": "plan"})).await;
         assert_eq!(r["error_kind"], "forbidden", "{method}: {r}");
     }
+    let r = call(&ben, "hosts.capabilities", json!({"host": "nat"})).await;
+    assert_eq!(r["type"], "failed", "{r}");
+}
+
+/// Without `--allow-bypass` a host refuses `bypassPermissions` even from its owner,
+/// says how to allow it, and says so in `capabilities`; every other mode is as
+/// with it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_without_allow_bypass_refuses_its_owner_bypass() {
+    let a = service().await;
+    let (file, ada_token) = a.token_file(ADA);
+    let _b = Host::start(&a, "nat", &["--token-file", file.to_str().unwrap()]);
+    let ada = connect(a.port, Some(&ada_token)).await.unwrap();
+    online(&ada, "nat", "user").await;
+
+    for (method, params) in [
+        ("hosts.capabilities", json!({"host": "nat"})),
+        ("agents.on.nat.capabilities", json!({})),
+    ] {
+        let caps = call(&ada, method, params).await;
+        assert_eq!(caps["type"], "capabilities", "{method}: {caps}");
+        assert_eq!(caps["bypass"], false, "{method}: {caps}");
+    }
+    let run = json!({"host": "nat", "cwd": "/recorded/cwd", "prompt": "p",
+                     "mode": "bypassPermissions"});
+    let refused = call(&ada, "hosts.start", run).await;
+    assert_eq!(refused["type"], "failed", "{refused}");
+    let why = refused["message"].as_str().unwrap_or_default();
+    assert!(why.contains("--allow-bypass"), "{refused}");
+
+    let run = json!({"host": "nat", "cwd": "/recorded/cwd", "prompt": "p", "mode": "plan"});
+    let started = call(&ada, "hosts.start", run).await;
+    assert_eq!(started["type"], "started", "{started}");
+    let thread = started["thread"].as_str().unwrap().to_string();
+    let set = call(
+        &ada,
+        "hosts.set_mode",
+        json!({"host": "nat", "thread": thread, "mode": "bypassPermissions"}),
+    )
+    .await;
+    assert_eq!(set["type"], "failed", "{set}");
+    assert!(
+        set["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("--allow-bypass"),
+        "{set}"
+    );
+    let listed = call(
+        &ada,
+        "hosts.threads",
+        json!({"host": "nat", "thread": thread}),
+    )
+    .await;
+    assert_eq!(listed["threads"][0]["mode"], "plan", "{listed}");
 }

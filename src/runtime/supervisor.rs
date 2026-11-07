@@ -64,6 +64,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -305,6 +306,8 @@ struct Inner {
     live_modes: Mutex<HashMap<ThreadId, PermissionMode>>,
     /// The folders a thread may start in: see [`crate::folders`].
     roots: RwLock<Vec<PathBuf>>,
+    /// Whether this host's owner may choose `bypassPermissions`: `--allow-bypass`.
+    allow_bypass: AtomicBool,
 }
 
 /// See the module docs. Cheap to clone.
@@ -1699,6 +1702,7 @@ impl Supervisor {
             park_grace: Mutex::new(Duration::ZERO),
             live_modes: Mutex::default(),
             roots: RwLock::new(crate::folders::default_roots()),
+            allow_bypass: AtomicBool::new(false),
         });
         let report = inner.recover().await?;
         Ok((Self { inner }, report))
@@ -2064,6 +2068,17 @@ impl Supervisor {
         *self.inner.park_grace.lock().expect("park_grace poisoned") = grace;
     }
 
+    /// Whether a host's owner may put threads in `bypassPermissions` here
+    /// (`plexus-agents host --allow-bypass`). Off unless set.
+    pub fn set_allow_bypass(&self, allow: bool) {
+        self.inner.allow_bypass.store(allow, AtomicOrdering::SeqCst);
+    }
+
+    /// See [`Supervisor::set_allow_bypass`].
+    pub fn allows_bypass(&self) -> bool {
+        self.inner.allow_bypass.load(AtomicOrdering::SeqCst)
+    }
+
     /// The folders threads may start in, each resolved; ones that don't resolve to
     /// a directory are dropped. Empty is the user's home.
     pub fn set_roots(&self, roots: Vec<PathBuf>) {
@@ -2136,8 +2151,9 @@ impl Supervisor {
     /// [`Supervisor::answer_as`], allowing and applying the request's own rule
     /// suggestions at `apply` ([`crate::permissions`]). The rules join the thread's,
     /// so the processes after this one have them too; a live process gets them with
-    /// the answer. `may_bypass` is whether this caller may put the thread in
-    /// `bypassPermissions`, which a suggestion could ask for.
+    /// the answer. `may_bypass` is whether this caller is one who may put the thread
+    /// in `bypassPermissions` ([`crate::mode::may_bypass`]), which a suggestion could
+    /// ask for; it also takes this host's [`Supervisor::set_allow_bypass`].
     pub async fn answer_applying(
         &self,
         thread: &ThreadId,
@@ -2174,8 +2190,13 @@ impl Supervisor {
         }
         let updates = crate::permissions::pick(&record.request, apply).map_err(mismatch)?;
         let rules = crate::permissions::thread_rules(&updates);
-        if rules.mode.is_some_and(PermissionMode::is_bypass) && !may_bypass {
-            return Err(mismatch(crate::mode::bypass_refused()));
+        if rules.mode.is_some_and(PermissionMode::is_bypass) {
+            if !may_bypass {
+                return Err(mismatch(crate::mode::bypass_refused()));
+            }
+            if !self.allows_bypass() {
+                return Err(mismatch(crate::mode::bypass_off()));
+            }
         }
         let row = self.inner.thread(thread).map_err(|e| delivery(&e))?;
         let previous = mode_of(&row.spec);

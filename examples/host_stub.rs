@@ -4,6 +4,7 @@
 //!
 //!     host_stub --server URL --name NAME --db FILE [--token-file F] [--key F]
 //!               [--pins DIR] [--margin-secs N] [--fixture DIR] [--root DIR]
+//!               [--allow-bypass]
 //!
 //! `--fixture` replays another parked run laid out as restart-parked is
 //! (`svc1/`, `svc2/`): tests/ui_review_transcript.rs's scripted run.
@@ -89,5 +90,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(root) = value("--root") {
         runtime.set_roots(vec![root.into()]);
     }
+    runtime.set_allow_bypass(args.iter().any(|a| a == "--allow-bypass"));
     host::run(hub(runtime, harnesses, vec![host::server_grant()]), config).await
 }

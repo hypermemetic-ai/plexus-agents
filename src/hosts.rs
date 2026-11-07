@@ -116,7 +116,7 @@ const WAITING_SINCE: &str = "host_waiting_since";
 /// Unpaired keys waiting at once, from anywhere.
 const MAX_WAITING: usize = 1024;
 /// What `agents.on.<host>.` reaches: a host's own `agents` surface.
-pub const HOST_METHODS: [&str; 13] = [
+pub const HOST_METHODS: [&str; 14] = [
     "start",
     "threads",
     "harnesses",
@@ -129,6 +129,7 @@ pub const HOST_METHODS: [&str; 13] = [
     "resume",
     "set_mode",
     "folders",
+    "capabilities",
     "claudecode.describe",
 ];
 /// The method both sides open a call with, and close it with.
@@ -1484,6 +1485,19 @@ impl HostsActivation {
     ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
         let params = json!({ "thread": thread, "mode": mode });
         self.forward(&caller, &host, "set_mode", params).await
+    }
+
+    /// What one of your hosts offers (its modes, whether it allows bypass, its
+    /// roots): `agents.capabilities` there. A host from before modes has none.
+    #[plexus_rpc::macros::method]
+    pub async fn capabilities(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the host */
+        host: HostName,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        self.forward(&caller, &host, "capabilities", json!({}))
+            .await
     }
 
     /// The folders a thread may start in on one of your hosts: `agents.folders` there.

@@ -15,7 +15,7 @@
 use crate::auth::{self, Access, AgentsRequest, Caller, Grant};
 use crate::folders::Folder;
 use crate::hosts::{Hosts, HostsActivation};
-use crate::mode::{may_bypass, PermissionMode};
+use crate::mode::{bypass_refusal, may_bypass, PermissionMode};
 use crate::on::OnRouter;
 use crate::peer::Peer;
 use crate::runtime::{
@@ -132,6 +132,16 @@ pub enum AgentsEvent {
         /// This host's roots, resolved.
         roots: Vec<String>,
         folders: Vec<Folder>,
+    },
+    /// What this host offers its owner: `capabilities`.
+    Capabilities {
+        /// The permission modes a thread may be put in, in the order to offer them.
+        modes: Vec<PermissionMode>,
+        /// Whether the caller may choose `bypassPermissions` here: the host's owner,
+        /// on a host started with `--allow-bypass`.
+        bypass: bool,
+        /// This host's roots, resolved: where `folders` looks.
+        roots: Vec<String>,
     },
     /// The sign-in behind a held-open `watch` ended.
     Ended,
@@ -269,8 +279,11 @@ impl AgentsActivation {
         mode: Option<PermissionMode>,
     ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
         let mode = mode.unwrap_or_default();
-        if mode.is_bypass() && !may_bypass(&caller.actor().id) {
-            return outcome(Err(RuntimeError::Start(crate::mode::bypass_refused())));
+        if mode.is_bypass() {
+            let allowed = self.runtime.allows_bypass();
+            if let Some(why) = bypass_refusal(&caller.actor().id, allowed) {
+                return outcome(Err(RuntimeError::Start(why)));
+            }
         }
         let spec = RunSpec {
             cwd: Some(cwd.0),
@@ -462,8 +475,10 @@ impl AgentsActivation {
         mode: PermissionMode,
     ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
         let actor = caller.actor().clone();
-        if mode.is_bypass() && !may_bypass(&actor.id) {
-            return outcome(Err(RuntimeError::Start(crate::mode::bypass_refused())));
+        if mode.is_bypass() {
+            if let Some(why) = bypass_refusal(&actor.id, self.runtime.allows_bypass()) {
+                return outcome(Err(RuntimeError::Start(why)));
+            }
         }
         let set = self.runtime.set_mode(&thread, mode, Some(actor)).await;
         outcome(set.map(|v| AgentsEvent::ModeSet {
@@ -494,6 +509,26 @@ impl AgentsActivation {
                 folders,
             },
             Err(message) => AgentsEvent::Failed { message },
+        })
+    }
+
+    /// What this host offers: the permission modes, whether the caller may choose
+    /// `bypassPermissions` here (`plexus-agents host --allow-bypass`), and the roots
+    /// threads start under.
+    #[plexus_rpc::macros::method]
+    pub async fn capabilities(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        let bypass = may_bypass(&caller.actor().id) && self.runtime.allows_bypass();
+        let roots = self.runtime.roots();
+        one(AgentsEvent::Capabilities {
+            modes: PermissionMode::ALL.to_vec(),
+            bypass,
+            roots: roots
+                .iter()
+                .map(|r| r.to_string_lossy().into_owned())
+                .collect(),
         })
     }
 

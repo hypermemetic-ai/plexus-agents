@@ -56,7 +56,7 @@ pub const OWNER_GRANTS: [&str; 9] = [
 /// caller reaches: its own hosts, for a user with no other grant.
 /// SUPERCONDUCTOR-11: and a host's `agents` by a fixed name (`hosts.watch` with the
 /// host as a parameter, see [`crate::hosts`]), each checked for its owner inside.
-pub const HOST_USER_GRANTS: [&str; 15] = [
+pub const HOST_USER_GRANTS: [&str; 16] = [
     "hosts.pairing",
     "hosts.confirm",
     "hosts.unpair",
@@ -71,6 +71,7 @@ pub const HOST_USER_GRANTS: [&str; 15] = [
     "hosts.answer",
     "hosts.set_mode",
     "hosts.folders",
+    "hosts.capabilities",
     "agents.on.placements",
 ];
 

@@ -107,6 +107,27 @@ pub fn bypass_refused() -> String {
     "bypassPermissions is only for a host's owner, on their own host".into()
 }
 
+/// The refusal when the owner asks but this host wasn't started with
+/// `--allow-bypass`: what to run instead.
+pub fn bypass_off() -> String {
+    "bypassPermissions is off on this host. To allow it, restart the host with \
+     `plexus-agents host ... --allow-bypass` (or AGENTS_ALLOW_BYPASS=1)"
+        .into()
+}
+
+/// Why `principal` may not put a thread in `bypassPermissions` here, if it may
+/// not: it must be the host's owner ([`may_bypass`]) on a host that opted in
+/// (`allowed`, `plexus-agents host --allow-bypass`).
+pub fn bypass_refusal(principal: &str, allowed: bool) -> Option<String> {
+    if !may_bypass(principal) {
+        Some(bypass_refused())
+    } else if !allowed {
+        Some(bypass_off())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +160,14 @@ mod tests {
         assert!(may_bypass(crate::host::SERVER_PRINCIPAL));
         assert!(!may_bypass("idp:someone"));
         assert!(!may_bypass("key:abcd"));
+    }
+
+    #[test]
+    fn the_owner_bypasses_only_on_a_host_that_opted_in() {
+        let owner = crate::host::SERVER_PRINCIPAL;
+        assert_eq!(bypass_refusal(owner, true), None);
+        let off = bypass_refusal(owner, false).unwrap();
+        assert!(off.contains("--allow-bypass"), "{off}");
+        assert_eq!(bypass_refusal("idp:someone", true), Some(bypass_refused()));
     }
 }

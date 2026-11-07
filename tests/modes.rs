@@ -462,6 +462,8 @@ async fn applying_a_suggestion_is_refused_where_it_doesnt_fit() {
     };
     for (answer, apply, may) in [
         (allow(), vec![0], false),
+        // The owner, on a host that didn't opt in (--allow-bypass).
+        (allow(), vec![0], true),
         (allow(), vec![7], true),
         (deny, vec![1], true),
     ] {
