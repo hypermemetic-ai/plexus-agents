@@ -3,5 +3,6 @@
   "#/pair": "sc-pair",
   "#/pair/:id": "sc-pair",
   "#/h/:host": "sc-host",
-  "#/h/:host/t/:thread": "sc-thread"
+  "#/h/:host/t/:thread": "sc-thread",
+  "#/h/:host/new": "sc-newthread"
 }
