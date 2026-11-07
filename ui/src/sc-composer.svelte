@@ -9,7 +9,16 @@
      and send this": hosts.answer's Deny carries a message Claude reads. On a phone it sticks to the bottom, above the safe area.
 
      Props: `status` is the thread's one status (sc-pill's: needs, working,
-     waiting, failed, done, idle, offline); needs and working mean a turn is on. -->
+     waiting, failed, done, idle, offline); needs and working mean a turn is on.
+
+     Mobile (menger v1's composer.rs, grow.rs): one line on a phone, Send inline,
+     the field the whole row once its text wraps; it grows with the text
+     (field-sizing, else its scrollHeight) up to ~45% of what is visible. Send keeps
+     the keyboard up (a touch sends on touchend, a press never takes the focus).
+     Up-arrow in the empty field brings back the last message sent. What you are
+     writing is kept per thread (localStorage) until it is sent. `quote(text)` puts
+     a quote of text in the field (sc-thread's long-press). The text stays small: a
+     focused field is kept from zooming by index.html's viewport, not by 16px. -->
 <script module>
   export const uses = ["hosts.send", "hosts.interrupt", "hosts.answer", "hosts.pending"];
   const clock = (ms) => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
@@ -18,6 +27,7 @@
 <script>
   import { bus } from "plexus-ui/host";
   import Button from "./sc-button.svelte";
+  import { keyboardUp, onKeyboard } from "./sc-keyboard.svelte";
 
   let { host, thread, status = "idle" } = $props();
   const b = bus();
@@ -29,6 +39,28 @@
   let sending = $state(false);
   let field = $state(null);
   let seq = 0;
+  let kb = $state(keyboardUp());
+  $effect(() => onKeyboard((up) => (kb = up)));
+
+  // What you are writing, kept per thread until it is sent; the last message sent, for up-arrow.
+  const store = (k) => `sc.${k}.${host}/${thread}`;
+  const load = (k) => { try { return localStorage.getItem(store(k)) ?? ""; } catch { return ""; } };
+  const save = (k, v) => { try { if (v) localStorage.setItem(store(k), v); else localStorage.removeItem(store(k)); } catch { /* private mode: kept in the page only */ } };
+  let loadedFor = "";
+  $effect(() => {
+    const at = host + "/" + thread;
+    if (at === loadedFor) return;
+    loadedFor = at;
+    text = load("draft");
+  });
+  $effect(() => { const v = text; if (loadedFor === host + "/" + thread) save("draft", v); });
+
+  /** sc-thread's long-press Quote: the text quoted, then a line to answer on. */
+  export function quote(said) {
+    const q = String(said ?? "").trim().split("\n").map((l) => "> " + l).join("\n") + "\n\n";
+    text = q + text;
+    queueMicrotask(() => { if (!field) return; field.focus(); field.setSelectionRange(text.length, text.length); grow(); });
+  }
 
   // The request waiting on this thread, if any (the oldest), while it needs you.
   let pending = $state(null);
@@ -66,27 +98,57 @@
     return !error;
   }
 
-  // Grow with the text, up to a third of the screen.
+  // Grow with the text (CSS field-sizing where there is one, else its scrollHeight,
+  // again a frame later), up to the field's max-height; once the text wraps, the
+  // field takes the whole row and Send goes under it.
+  const sized = typeof CSS !== "undefined" && CSS.supports?.("field-sizing", "content");
+  let wrapped = $state(false);
+  let line = 0;                     // the field's height holding one line
   function grow() {
     if (!field) return;
-    field.style.height = "auto";
-    field.style.height = Math.min(field.scrollHeight, Math.max(120, window.innerHeight / 3)) + "px";
+    if (!sized) {
+      field.style.height = "auto";
+      const cap = parseFloat(getComputedStyle(field).maxHeight) || Infinity;
+      field.style.height = Math.min(field.scrollHeight + 2, cap) + "px";
+    }
+    if (!text) { line = field.offsetHeight; wrapped = false; return; }
+    if (!line) line = field.offsetHeight;
+    wrapped = wrapped || field.offsetHeight > line + 4 || text.includes("\n");
   }
-  $effect(() => { text; queueMicrotask(grow); });
+  $effect(() => { text; queueMicrotask(grow); requestAnimationFrame(grow); });
 
   async function submit(ev) {
     ev?.preventDefault();
     const prompt = text.trim();
     if (!prompt || sending) return;
-    if (busy || queued.length) { queued.push({ id: ++seq, text: prompt, editing: false }); text = ""; return; }
+    if (busy || queued.length) { queued.push({ id: ++seq, text: prompt, editing: false }); save("last", prompt); text = ""; return; }
     sending = true;
     text = "";
+    save("last", prompt);
     if (!(await send(prompt))) text = prompt;
     else waiting = Date.now();
     sending = false;
   }
   function keydown(ev) {
-    if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); submit(); }
+    if (ev.isComposing || ev.keyCode === 229) return;
+    if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); submit(); }
+    else if (ev.key === "ArrowUp" && !text) {
+      const last = load("last");
+      if (last) { ev.preventDefault(); text = last; queueMicrotask(() => field?.setSelectionRange(last.length, last.length)); }
+    }
+  }
+
+  // Send keeps the keyboard up: a press never moves the focus off the field, and a
+  // tap (lifted within 10px and 500ms) sends on touchend, before any blur.
+  let touch = null;
+  function touchstart(ev) { const t = ev.touches[0]; touch = t ? { x: t.clientX, y: t.clientY, at: Date.now() } : null; }
+  function touchend(ev) {
+    const t = ev.changedTouches[0], was = touch;
+    touch = null;
+    if (!was || !t || Math.hypot(t.clientX - was.x, t.clientY - was.y) > 10 || Date.now() - was.at > 500) return;
+    if (ev.target.closest?.("button")?.disabled) return;
+    ev.preventDefault();
+    submit();
   }
 
   // The queue goes, in order, once the turn is over: one, then wait for its turn.
@@ -141,7 +203,7 @@
   }
 </script>
 
-<div class="composer" data-surface="sc-composer">
+<div class="composer" data-surface="sc-composer" data-kb={kb ? "" : undefined}>
   {#if queued.length}
     <ol class="queue" aria-label="Queued follow-ups">
       {#each queued as q, n (q.id)}
@@ -183,11 +245,13 @@
     </div>
   {/if}
 
-  <form onsubmit={submit}>
+  <form onsubmit={submit} class:wrap={wrapped}>
     <textarea bind:this={field} rows="1" bind:value={text} onkeydown={keydown} oninput={grow}
+      enterkeyhint="send" autocomplete="off"
       aria-label={busy ? "Queue a follow-up" : "Message Claude"}
       placeholder={busy ? "Queue a follow-up" : "Reply to Claude"}></textarea>
-    <span class="go"><Button kind="primary" type="submit" disabled={!text.trim() || sending}>{busy ? "Queue" : "Send"}</Button></span>
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <span class="go" data-keep-kb onmousedown={(e) => e.preventDefault()} ontouchstart={touchstart} ontouchend={touchend}><Button kind="primary" type="submit" disabled={!text.trim() || sending}>{busy ? "Queue" : "Send"}</Button></span>
   </form>
   <p class="keys">Enter {busy ? "queues" : "sends"}, Shift+Enter for a new line</p>
 
@@ -200,7 +264,7 @@
   .composer {
     position: sticky; bottom: 0; z-index: 2;
     display: grid; gap: var(--s2); min-width: 0;
-    padding: var(--s3) var(--s5) max(var(--s3), env(safe-area-inset-bottom));
+    padding: var(--s3) var(--s5) calc(var(--s3) + env(safe-area-inset-bottom));
     background: var(--panel); border-top: 1px solid var(--line);
   }
   .composer > * { max-width: 80ch; width: 100%; min-width: 0; }
@@ -226,12 +290,17 @@
   .deny span { flex: 1; min-width: 12ch; }
   .deny :global(button) { min-height: 36px; }
 
-  form { display: flex; gap: var(--s2); align-items: flex-end; }
+  form { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: flex-end; }
   textarea {
-    flex: 1; min-width: 0; min-height: 44px; padding: 10px var(--s3); resize: none;
+    flex: 1 1 0; min-width: 0; min-height: 44px; max-height: 45dvh; padding: 10px var(--s3); resize: none;
+    field-sizing: content; overflow-y: auto; overscroll-behavior: contain;
     font: inherit; line-height: var(--leading); color: var(--ink); background: var(--bg);
     border: 1px solid var(--line); border-radius: var(--radius-md);
   }
+  /* The text wraps: the field is the whole row, Send under it at the right. */
+  form.wrap textarea { flex-basis: 100%; }
+  form.wrap .go { margin-left: auto; }
+  .go { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
   textarea:focus-visible { outline: 2px solid var(--focus); outline-offset: -1px; border-color: var(--focus); }
   .go :global(button) { min-height: 44px; min-width: 76px; }
   .keys { margin: 0; font-size: 12px; color: var(--muted); }
@@ -242,7 +311,11 @@
   @media (prefers-reduced-motion: reduce) { .dot { animation: none; } }
   @media (max-width: 719px) {
     .composer { padding-left: var(--s4); padding-right: var(--s4); }
-    textarea { font-size: 16px; }
+    .composer { padding-top: var(--s2); }
+    .go :global(button) { min-width: 64px; }
+    /* The keyboard up: the field is held within the visible area, and the composer sits right on the keyboard. */
+    .composer[data-kb] { padding-bottom: var(--s2); }
+    [data-kb] textarea { max-height: calc(var(--kb-h) * .45); }
     .keys, kbd { display: none; }
     .qa :global(button) { min-height: 44px; flex: 1; padding: 0 var(--s2); white-space: nowrap; }
     .stop :global(button) { min-height: 44px; }

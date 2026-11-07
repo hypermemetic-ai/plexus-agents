@@ -69,7 +69,8 @@
 <style>
   .sc-toolrun { min-width: 0; }
   .summary { display: flex; align-items: baseline; gap: var(--s2); width: 100%; min-height: 32px; padding: var(--s1) var(--s2); text-align: left; color: var(--muted); background: none; border: 0; border-radius: var(--radius-sm); cursor: pointer; }
-  .summary:hover { color: var(--ink); background: var(--hover); }
+  @media (hover: hover) { .summary:hover { color: var(--ink); background: var(--hover); } }
+  .summary { -webkit-tap-highlight-color: transparent; }
   .summary:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
   .chev { flex: none; width: 1em; }
   .said { min-width: 0; }

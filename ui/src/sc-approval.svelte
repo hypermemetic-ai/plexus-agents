@@ -186,7 +186,8 @@
   .q { font-size: 16px; }
   .path { font: 500 15px/1.3 var(--font-mono); padding: 0 var(--s1); background: var(--st-needs-bg); border-radius: var(--radius-xs); overflow-wrap: anywhere; }
   .why { margin: 0; color: var(--muted); line-height: var(--leading); }
-  .scroll { max-height: 320px; overflow: auto; border-radius: var(--radius-sm); }
+  .scroll { max-height: 320px; overflow: auto; overscroll-behavior: contain; border-radius: var(--radius-sm); }
+  .card :global(button) { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
   .plan { padding: var(--s3); background: var(--card); border: 1px solid var(--line); }
   .warn { margin: 0; color: var(--st-failed-fg); background: var(--st-failed-bg); padding: var(--s2) var(--s3); border-radius: var(--radius-sm); }
   .hint { margin: 0; font-size: 13px; color: var(--muted); }

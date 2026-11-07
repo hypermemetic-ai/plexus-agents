@@ -43,6 +43,7 @@
   import Composer from "./sc-composer.svelte";
   import Empty from "./sc-empty.svelte";
   import { editOf } from "./sc-diff.svelte";
+  import { follow as followKeyboard, keyboardUp, onKeyboard } from "./sc-keyboard.svelte";
 
   let { host, thread } = $props();
   const b = bus();
@@ -232,37 +233,140 @@
     : "Working",
   );
 
-  // Follow the end while the reader is there; when they scroll up, stop, and offer the way back.
-  let root = $state(null);
-  let behind = $state(false);
-  function scroller() {
-    for (let p = root?.parentElement; p; p = p.parentElement) {
-      const o = getComputedStyle(p).overflowY;
-      if ((o === "auto" || o === "scroll") && p.scrollHeight > p.clientHeight) return p;
+  // Mobile: the phone's keyboard, followed (sc-keyboard): with it up, the thread is
+  // pinned to the visible area and its composer sits on the keyboard.
+  $effect(() => followKeyboard());
+  let kb = $state(keyboardUp());
+  $effect(() => onKeyboard((up) => (kb = up)));
+
+  // Sticky scroll (menger's turns.rs, chat_pane.rs). The transcript scrolls itself.
+  // Within PIN px of the end the reader is pinned there: growth follows them. Above
+  // it nothing moves: what arrives is counted, and the first item they can see stays
+  // where it is however the content above or around it grows (WebKit has no
+  // overflow-anchor, so this is ours on every engine). A thread opens once,
+  // unanimated, at its newest.
+  const PIN = 48;
+  let scrollEl = $state(null);
+  let logEl = $state(null);
+  let composer = $state(null);
+  let pinned = $state(true);
+  let gesture = -1e9;              // when the reader last touched, wheeled or keyed the transcript
+  let touching = false;
+  const hand = () => { gesture = performance.now(); };
+  let unread = $state(0);
+  let away = $state(false);        // more than a screen above the end
+  let anchor = null;               // { el, top }: the first item in sight, and where
+  const distance = () => scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
+  function remember() {
+    if (!scrollEl || !logEl) return;
+    const top = scrollEl.getBoundingClientRect().top;
+    anchor = null;
+    for (const el of logEl.children) {
+      const r = el.getBoundingClientRect();
+      if (r.bottom > top + 1) { anchor = { el, top: r.top - top }; break; }
     }
-    return document.scrollingElement ?? document.documentElement;
   }
-  function atEnd() {
-    if (!root) return true;
-    const s = scroller();
-    return s.scrollHeight - s.scrollTop - s.clientHeight < 96;
+  function toEnd() {
+    if (!scrollEl) return;
+    scrollEl.scrollTop = scrollEl.scrollHeight;
+    height = scrollEl.scrollHeight;
+    away = false;
+    remember();
   }
-  let stuck = true;                // the reader is at the end: growth follows them there
-  function follow() {
-    stuck = true;
-    requestAnimationFrame(() => { const s = scroller(); s.scrollTop = s.scrollHeight; behind = false; });
+  function latest() { pinned = true; unread = 0; toEnd(); }
+  // A scroll the layout made while pinned (content swapped under the reader, a
+  // clamp: the height changed and no hand moved) is put back at the end; the
+  // reader's own scroll, or a page's scrollIntoView, unpins.
+  let height = 0;
+  function scrolled() {
+    if (!scrollEl) return;
+    const d = distance();
+    const reflowed = scrollEl.scrollHeight !== height;
+    height = scrollEl.scrollHeight;
+    if (d < PIN) { pinned = true; unread = 0; }
+    else if (pinned && reflowed && !touching && performance.now() - gesture > 1500) { toEnd(); return; }
+    else pinned = false;
+    away = d > scrollEl.clientHeight;
+    remember();
   }
   $effect(() => {
-    if (!root) return;
-    const on = () => { stuck = atEnd(); behind = !stuck; };
-    addEventListener("scroll", on, { capture: true, passive: true });
-    const grew = new ResizeObserver(() => { if (stuck) follow(); else behind = true; });
-    grew.observe(root);
-    return () => { removeEventListener("scroll", on, { capture: true }); grew.disconnect(); };
+    if (!scrollEl || !logEl) return;
+    const grew = new ResizeObserver(() => {
+      if (pinned) { toEnd(); return; }
+      if (anchor?.el.isConnected) {
+        const now = anchor.el.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top;
+        if (Math.abs(now - anchor.top) > 0.5) scrollEl.scrollTop += now - anchor.top;
+      }
+      away = distance() > scrollEl.clientHeight;
+      remember();
+    });
+    grew.observe(logEl);
+    grew.observe(scrollEl);
+    return () => grew.disconnect();
   });
+  // A new thread lands at its end; items that arrive while the reader is up are counted.
+  let counted = 0;
+  $effect(() => { host; thread; untrack(() => { pinned = true; unread = 0; counted = 0; }); });
+  $effect(() => {
+    const n = items.length;
+    untrack(() => {
+      if (n > counted && !pinned) unread += n - counted;
+      counted = n;
+    });
+  });
+
+  // Long-press a message (500ms, still): copy it, or quote it into the composer.
+  let menu = $state(null);         // { text, x, y, copied }
+  let press = null;
+  function held(ev, text) {
+    const t = ev.touches?.[0];
+    if (!t || ev.touches.length > 1) return;
+    if (ev.target.closest?.("pre, .code-card, a, button")) return;
+    clearTimeout(press?.timer);
+    press = { x: t.clientX, y: t.clientY, fired: false };
+    press.timer = setTimeout(() => {
+      press.fired = true;
+      navigator.vibrate?.(10);
+      menu = { text, x: Math.min(press.x, innerWidth - 176), y: Math.max(8, press.y - 64), copied: false };
+    }, 500);
+  }
+  function drifted(ev) {
+    const t = ev.touches?.[0];
+    if (press && t && Math.hypot(t.clientX - press.x, t.clientY - press.y) > 10) { clearTimeout(press.timer); press = null; }
+  }
+  function lifted(ev) {
+    if (press?.fired) ev.preventDefault();
+    clearTimeout(press?.timer);
+    press = null;
+  }
+  async function copy() {
+    const text = menu.text;
+    try { await navigator.clipboard.writeText(text); }
+    catch {
+      const t = document.createElement("textarea");
+      t.value = text; t.setAttribute("readonly", ""); t.style.cssText = "position:fixed;opacity:0";
+      document.body.append(t); t.select();
+      try { document.execCommand("copy"); } catch { /* nothing more to try */ }
+      t.remove();
+    }
+    menu.copied = true;
+    setTimeout(() => (menu = null), 700);
+  }
+  function quote() { const text = menu.text; menu = null; composer?.quote(text); }
+  $effect(() => {
+    if (!menu) return;
+    const away = (ev) => { if (!ev.target.closest?.(".hold-menu")) menu = null; };
+    const t = setTimeout(() => addEventListener("pointerdown", away, true));
+    return () => { clearTimeout(t); removeEventListener("pointerdown", away, true); };
+  });
+
+  // A message longer than LONG lines shows its first LONG, and the rest on request.
+  const LONG = 200;
+  const linesOf = (text) => (text.match(/\n/g)?.length ?? 0) + 1;
+  const clip = (it) => (it.full || linesOf(it.text) <= LONG ? it.text : it.text.split("\n").slice(0, LONG).join("\n"));
 </script>
 
-<div class="sc-thread" bind:this={root}>
+<div class="sc-thread" data-kb={kb ? "" : undefined}>
   <header class="head">
     <div class="titles">
       <h1 class="title">{title || "New thread"}</h1>
@@ -271,61 +375,86 @@
     <Pill {status}/>
   </header>
 
-  <div class="log" aria-live="polite">
-    {#if log.status === "error" || log.status === "refused" || log.status === "closed"}
-      <Empty title="This thread can't be shown right now." body={`${log.message ?? "The host didn't answer."} Check that ${host} is online, then reload.`}/>
-    {:else if log.status === "pending" && !items.length}
-      <p class="quiet">Loading the conversation…</p>
-    {/if}
-    {#each items as it (it.key)}
-      {#if it.type === "user"}
-        <section class="user" aria-label="Your message"><Text text={it.text}/></section>
-      {:else if it.type === "agent"}
-        <div class="agent"><Text text={it.text}/></div>
-      {:else if it.type === "run"}
-        <div class="run"><ToolRun calls={it.calls} {folder}/></div>
-      {:else if it.type === "ask"}
-        {#if !it.outcome && asks[it.id]}
-          <div class="ask"><Approval {host} {thread} record={asks[it.id]}/></div>
-        {:else if !it.outcome}
-          <p class="note" data-tone="needs">Claude is waiting for your answer. Loading the request…</p>
-        {:else if it.record}
-          <p class="note" data-tone="answer">{OUTCOME[it.outcome] ?? "Withdrawn"}{#if askedFor(it.record)}&nbsp;<code>{askedFor(it.record)}</code>{/if}</p>
-        {/if}
-      {:else if it.type === "note"}
-        <p class="note" data-tone={it.tone}>{it.text}</p>
-      {:else if it.type === "foot"}
-        <TurnFoot foot={it} {host}/>
+  <div class="scroller" bind:this={scrollEl} onscroll={scrolled} onwheel={hand} onpointerdown={hand} onkeydown={hand}
+    ontouchstart={() => { touching = true; hand(); }} ontouchend={() => { touching = false; hand(); }} ontouchcancel={() => { touching = false; }}>
+    <div class="log" aria-live="polite" bind:this={logEl}>
+      {#if log.status === "error" || log.status === "refused" || log.status === "closed"}
+        <Empty title="This thread can't be shown right now." body={`${log.message ?? "The host didn't answer."} Check that ${host} is online, then reload.`}/>
+      {:else if log.status === "pending" && !items.length}
+        <p class="quiet">Loading the conversation…</p>
       {/if}
-    {/each}
-    {#if busyLine}<p class="busy"><span class="dot" aria-hidden="true"></span>{busyLine}</p>{/if}
-    {#if !items.length && log.status === "live"}
-      <Empty title="Nothing here yet." body="Send Claude a message below to start."/>
-    {/if}
+      {#each items as it (it.key)}
+        {#if it.type === "user" || it.type === "agent"}
+          <section class={it.type} aria-label={it.type === "user" ? "Your message" : undefined}
+            ontouchstart={(e) => held(e, it.text)} ontouchmove={drifted} ontouchend={lifted} ontouchcancel={lifted}>
+            <Text text={clip(it)}/>
+            {#if !it.full && linesOf(it.text) > LONG}
+              <button class="more" type="button" onclick={() => (it.full = true)}>Show all {linesOf(it.text)} lines</button>
+            {/if}
+          </section>
+        {:else if it.type === "run"}
+          <div class="run"><ToolRun calls={it.calls} {folder}/></div>
+        {:else if it.type === "ask"}
+          {#if !it.outcome && asks[it.id]}
+            <div class="ask"><Approval {host} {thread} record={asks[it.id]}/></div>
+          {:else if !it.outcome}
+            <p class="note" data-tone="needs">Claude is waiting for your answer. Loading the request…</p>
+          {:else if it.record}
+            <p class="note" data-tone="answer">{OUTCOME[it.outcome] ?? "Withdrawn"}{#if askedFor(it.record)}&nbsp;<code>{askedFor(it.record)}</code>{/if}</p>
+          {:else}
+            <span hidden></span>
+          {/if}
+        {:else if it.type === "note"}
+          <p class="note" data-tone={it.tone}>{it.text}</p>
+        {:else if it.type === "foot"}
+          <div class="foot"><TurnFoot foot={it} {host}/></div>
+        {/if}
+      {/each}
+      {#if busyLine}<p class="busy"><span class="dot" aria-hidden="true"></span>{busyLine}</p>{/if}
+      {#if !items.length && log.status === "live"}
+        <Empty title="Nothing here yet." body="Send Claude a message below to start."/>
+      {/if}
+    </div>
   </div>
 
   <div class="dock">
-    {#if behind}<button class="jump" type="button" onclick={follow}>Jump to latest</button>{/if}
-    <Composer {host} {thread} {status}/>
+    {#if !pinned && (away || unread)}
+      <button class="jump" type="button" data-keep-kb onclick={latest} aria-label={unread ? `Jump to latest, ${unread} new` : "Jump to latest"}>
+        <span aria-hidden="true">↓</span>
+        {#if unread}<span class="count" aria-hidden="true">{unread > 99 ? "99+" : unread}</span>{/if}
+      </button>
+    {/if}
+    <Composer bind:this={composer} {host} {thread} {status}/>
   </div>
+
+  {#if menu}
+    <div class="hold-menu" role="menu" style:left="{menu.x}px" style:top="{menu.y}px">
+      <button type="button" role="menuitem" onclick={copy}>{menu.copied ? "Copied" : "Copy"}</button>
+      <button type="button" role="menuitem" onclick={quote}>Quote</button>
+    </div>
+  {/if}
 </div>
 
 <style>
-  .sc-thread { display: flex; flex-direction: column; min-height: 100%; min-width: 0; }
-  .head { display: flex; align-items: flex-start; gap: var(--s3); padding: var(--s4) var(--s5) var(--s3); border-bottom: 1px solid var(--line); }
+  /* The page fills the frame's main and scrolls itself: the head, the transcript, the composer. */
+  .sc-thread { display: flex; flex-direction: column; height: 100%; min-height: 0; min-width: 0; }
+  .head { flex: none; display: flex; align-items: flex-start; gap: var(--s3); padding: var(--s4) var(--s5) var(--s3); border-bottom: 1px solid var(--line); }
   .head, .log, .dock > :global(*) { box-sizing: border-box; }
   .titles { flex: 1; min-width: 0; }
   .title { display: -webkit-box; margin: 0; overflow: hidden; font-size: 17px; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
   .where { margin: 2px 0 0; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
   .where a { color: inherit; text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
-  .where a:hover { color: var(--ink); }
   .folder { font-family: var(--font-mono); font-size: 12.5px; color: var(--ink); }
   .head :global(.pill) { margin-top: 3px; flex: none; }
 
-  .log { flex: 1; width: 100%; max-width: calc(72ch + 2 * var(--s5)); padding: var(--s4) var(--s5) var(--s6); }
+  .scroller { flex: 1; min-height: 0; overflow-x: hidden; overflow-y: auto; overscroll-behavior: contain; overflow-anchor: none; -webkit-overflow-scrolling: touch; }
+  .log { width: 100%; max-width: calc(72ch + 2 * var(--s5)); padding: var(--s4) var(--s5) var(--s6); min-width: 0; }
+  .log > * { min-width: 0; }
   .user { margin: var(--s5) 0 var(--s4); padding: var(--s3) var(--s4); background: var(--sel); border-radius: var(--radius-md); }
   .user:first-child { margin-top: var(--s2); }
   .agent { margin: var(--s3) 0; max-width: 72ch; }
+  .user, .agent { overflow-wrap: anywhere; }
+  .more { min-height: 36px; margin-top: var(--s2); padding: 0; color: var(--accent); background: none; border: 0; cursor: pointer; font: inherit; }
   .run { margin: var(--s1) 0; }
   .ask { margin: var(--s3) 0; }
   .note { margin: var(--s2) 0; padding-left: var(--s3); color: var(--muted); font-size: 12.5px; border-left: 2px solid var(--line); overflow-wrap: anywhere; }
@@ -337,19 +466,52 @@
   .busy { display: flex; align-items: center; gap: var(--s2); margin: var(--s3) 0; color: var(--st-working-fg); font-size: 13px; }
   .dot { width: 7px; height: 7px; border-radius: var(--radius-pill); background: var(--st-working-fg); animation: beat 1.2s ease-out infinite alternate; }
 
-  .dock { position: sticky; bottom: 0; z-index: 1; padding: var(--s3) var(--s5) var(--s4); background: var(--bg); border-top: 1px solid var(--line); }
-  .dock > :global(:not(.jump)) { max-width: 72ch; }
-  .jump { position: absolute; left: min(50%, calc(var(--s5) + 36ch)); bottom: calc(100% + var(--s3)); transform: translateX(-50%); min-height: 36px; padding: 0 var(--s4); color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-pill); cursor: pointer; }
-  .jump:hover { background: var(--hover); }
+  /* The composer is the dock; the way back to the latest rides on its top edge. */
+  .dock { flex: none; position: relative; z-index: 1; }
+  .jump {
+    position: absolute; right: var(--s4); bottom: calc(100% + var(--s3));
+    display: grid; place-items: center; width: 44px; height: 44px; padding: 0;
+    font-size: 18px; line-height: 1; color: var(--ink); background: var(--card);
+    border: 1px solid var(--line); border-radius: var(--radius-pill); box-shadow: 0 2px 8px var(--shadow);
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+  }
   .jump:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+  .count {
+    position: absolute; top: -6px; right: -6px; min-width: 20px; height: 20px; padding: 0 5px;
+    font-size: 11px; font-weight: 600; line-height: 20px; text-align: center;
+    color: var(--on-accent); background: var(--accent); border-radius: var(--radius-pill);
+  }
 
+  .hold-menu {
+    position: fixed; z-index: 30; display: flex; gap: 2px; padding: 4px;
+    background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-md); box-shadow: 0 4px 16px var(--shadow);
+  }
+  .hold-menu button { min-width: 76px; min-height: 44px; padding: 0 var(--s3); font: inherit; color: var(--ink); background: none; border: 0; border-radius: var(--radius-sm); cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  .hold-menu button:active { background: var(--hover); }
+
+  button { -webkit-tap-highlight-color: transparent; }
+
+  @media (hover: hover) {
+    .where a:hover { color: var(--ink); }
+    .jump:hover { background: var(--hover); }
+    .hold-menu button:hover { background: var(--hover); }
+  }
+  /* Touch: a held message opens Copy and Quote, not the browser's own callout. */
+  @media (hover: none) and (pointer: coarse) {
+    .user, .agent { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+  }
   @keyframes beat { from { opacity: 1; } to { opacity: .35; } }
   @media (prefers-reduced-motion: reduce) { .dot { animation: none; } }
-  @media (max-width: 719px) {
+  @media (max-width: 719.98px) {
+    /* Into the frame's bottom inset: the composer pads itself above it. */
+    .sc-thread { margin-bottom: calc(-1 * env(safe-area-inset-bottom)); }
     .head { padding: var(--s3) var(--s4); }
     .log { padding: var(--s3) var(--s4) var(--s5); }
-    .dock { padding: var(--s2) var(--s4) calc(var(--s3) + env(safe-area-inset-bottom)); }
     .user { padding: var(--s3); }
-    .jump { min-height: 44px; }
+    /* The keyboard up (sc-keyboard): the thread is the visible area, its composer on the keyboard. */
+    .sc-thread[data-kb] { position: fixed; left: 0; right: 0; top: var(--kb-top); height: var(--kb-h); margin: 0; z-index: 20; background: var(--bg); }
+    [data-kb] .head { padding-top: var(--s2); padding-bottom: var(--s2); }
+    [data-kb] .title { -webkit-line-clamp: 1; font-size: 15px; }
+    [data-kb] .where { display: none; }
   }
 </style>
