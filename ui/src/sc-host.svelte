@@ -180,7 +180,8 @@
   @media (max-width: 719px) {
     .sc-page { padding: var(--s4); }
     .head { flex-direction: column; align-items: stretch; }
-    .folder h2 { flex-direction: column; gap: 0; }
+    .folder h2 { flex-direction: column; align-items: stretch; gap: 0; }
+    .folder .path { white-space: normal; overflow-wrap: anywhere; }
     .actions { flex-direction: column; }
   }
 </style>

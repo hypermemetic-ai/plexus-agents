@@ -102,19 +102,22 @@
     {/if}
 
     <header class="head">
-      <h1>{needs.length ? "Everything else" : "Recent threads"}</h1>
+      <h1>Recent threads</h1>
       {#if online.length}
         <Button kind="primary" onclick={() => b.navigate(`#/h/${encodeURIComponent(online[0].name)}/new`)}>Start a thread</Button>
       {/if}
     </header>
 
     {#each hosts as h (h.name)}
-      {@const ts = (threads[h.name] ?? []).filter((t) => statusOf(t) !== "needs").slice(0, 6)}
+      {@const all = threads[h.name] ?? []}
+      {@const ts = all.filter((t) => statusOf(t) !== "needs").slice(0, 6)}
       <section class="host">
         <h2><a href={`#/h/${encodeURIComponent(h.name)}`}>{h.name}</a>
           <span class="state" data-online={h.online}>{h.online ? "Online" : `Offline, last seen ${ago(h.last_seen)}`}</span></h2>
         {#if !h.online}
           <p class="quiet">Its threads show up here when it's back.</p>
+        {:else if ts.length === 0 && all.length}
+          <p class="quiet">Nothing else on {h.name}: its threads are waiting for you above.</p>
         {:else if ts.length === 0}
           <p class="quiet">No threads yet. <a href={`#/h/${encodeURIComponent(h.name)}/new`}>Start one on {h.name}</a></p>
         {:else}
@@ -168,7 +171,7 @@
 
   @media (max-width: 719px) {
     .sc-page { padding: var(--s4); }
-    .what { flex-direction: column; gap: 0; }
+    .what { flex-direction: column; align-items: stretch; gap: 0; }
     .command { flex-direction: column; align-items: stretch; }
   }
 </style>
