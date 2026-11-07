@@ -48,13 +48,13 @@ const clipTop = () => page.addStyleTag({ content: ".sc-top { max-width: 100vw; o
 step("pair and start a thread");
 await page.goto(LINK);
 await page.getByText("Does your terminal show this code?").waitFor({ timeout: 20000 });
-await page.getByRole("button", { name: "Pair" }).click();
-await page.getByText("is yours").waitFor({ timeout: 20000 });
-await page.goto(`${BASE}/#/h/mac`);
-await page.getByRole("button", { name: "Start a thread" }).waitFor({ timeout: 30000 });
-await page.getByPlaceholder("/Users/you/project").fill("/tmp");
-await page.getByPlaceholder(/What should Claude do/).fill("say hello");
-await page.getByRole("button", { name: "Start a thread" }).click();
+await page.getByRole("button", { name: "Pair", exact: true }).click();
+await page.getByText("is paired").waitFor({ timeout: 20000 });
+await page.goto(`${BASE}/#/h/mac/new`);
+await page.getByLabel("Folder path").waitFor({ timeout: 30000 });
+await page.getByLabel("Folder path").fill("/tmp");
+await page.getByPlaceholder("What should Claude do?").fill("say hello");
+await page.getByRole("button", { name: "Start thread" }).click();
 await page.waitForURL(/#\/h\/mac\/t\//, { timeout: 30000 });
 
 step("the approval card, pending");

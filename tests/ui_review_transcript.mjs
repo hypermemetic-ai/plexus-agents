@@ -42,13 +42,13 @@ async function both(name, prep) {
 
 step("pair, and start a thread on the scripted run");
 await page.goto(LINK);
-await page.getByRole("button", { name: "Pair" }).click({ timeout: 20000 });
-await page.getByText("is yours").waitFor({ timeout: 20000 });
-await page.goto(`${BASE}/#/h/mac`);
-await page.getByRole("button", { name: "Start a thread" }).waitFor({ timeout: 30000 });
-await page.getByPlaceholder("/Users/you/project").fill("/home/op/dev/lantern");
-await page.getByPlaceholder(/What should Claude do/).fill("The parser tests fail on bracketed log levels. Find out why, fix it, and run the whole suite.");
-await page.getByRole("button", { name: "Start a thread" }).click();
+await page.getByRole("button", { name: "Pair", exact: true }).click({ timeout: 20000 });
+await page.getByText("is paired").waitFor({ timeout: 20000 });
+await page.goto(`${BASE}/#/h/mac/new`);
+await page.getByLabel("Folder path").waitFor({ timeout: 30000 });
+await page.getByLabel("Folder path").fill("/home/op/dev/lantern");
+await page.getByPlaceholder("What should Claude do?").fill("The parser tests fail on bracketed log levels. Find out why, fix it, and run the whole suite.");
+await page.getByRole("button", { name: "Start thread" }).click();
 await page.waitForURL(/#\/h\/mac\/t\//, { timeout: 30000 });
 
 step("the transcript, waiting on the approval");
