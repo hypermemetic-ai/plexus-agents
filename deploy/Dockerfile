@@ -13,13 +13,14 @@
 #   deploy/build-image.sh [COMMIT]   → ghcr.io/hypermemetic-ai/agents:<commit>
 #
 # The hosted service runs no Claude: there is no `claude` binary in this
-# image, and deploy/env/<env>.env names no `local` placement and grants no
-# one a role on any — runs go to hosts that dial in (agents.on.<host>).
+# image, and deploy/env/<env>.env sets AGENTS_NO_LOCAL=1 — runs go to hosts
+# that dial in (agents.on.<host>).
 #
 # One port, 4470, plain, bound to 0.0.0.0 inside the container and published
-# nowhere: the edge terminates TLS and reaches it over its `edge` network.
-# plexus-agents takes flags only; deploy/entrypoint.sh turns the AGENTS_*
-# variables (deploy/env/<env>.env, the box's secrets) into them.
+# nowhere: the page, the sign-in routes and the socket (/ or /ws) all on it.
+# The edge terminates TLS and reaches it over its `edge` network.
+# plexus-agents reads every flag from AGENTS_* (deploy/env/<env>.env, the box's
+# secret files, the box's AGENTS_TRUSTED_PROXIES).
 
 FROM rust:1.97-bookworm AS build
 WORKDIR /src
@@ -40,10 +41,10 @@ RUN apt-get update \
  && useradd --system --uid 10001 --user-group --home-dir /data --shell /usr/sbin/nologin app \
  && mkdir -p /data && chown app:app /data
 COPY --from=build /usr/local/bin/plexus-agents /usr/local/bin/plexus-agents
-COPY plexus-agents/deploy/entrypoint.sh /usr/local/bin/agents-entrypoint
 USER app
 WORKDIR /data
-# Everything the service keeps: threads, runs and paired hosts (one SQLite file).
+# Everything the service keeps: threads, runs and paired hosts (agents.db),
+# and sign-in sessions (agents.db.sessions).
 VOLUME /data
 ENV HOME=/data \
     AGENTS_DB=/data/agents.db \
@@ -54,4 +55,4 @@ ENV HOME=/data \
 EXPOSE 4470
 STOPSIGNAL SIGTERM
 LABEL org.opencontainers.image.title="agents"
-ENTRYPOINT ["/usr/local/bin/agents-entrypoint"]
+ENTRYPOINT ["/usr/local/bin/plexus-agents"]

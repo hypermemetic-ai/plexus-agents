@@ -28,28 +28,27 @@ secret_env_file: secret.env
 
 # Secret files the box holds, placed by infra's secret.yml from a pipe, never
 # from here; infra sets `env` to each held file's path inside:
-#   server-key      the service's Ed25519 identity, a 32-byte seed (base64),
-#                   as plexus-agents' --service-key reads it (0400 is fine)
+#   server-key      key_s, the service's Ed25519 identity hosts pin: a 32-byte
+#                   seed (base64), as plexus-agents' --server-key reads it
 #   workos-api-key  WorkOS's API key, of the environment menger's same env
-#                   uses (test: WorkOS staging) — for sign-in, once
-#                   plexus-agents reads it
+#                   uses (test: WorkOS staging), for sign-in
 secrets:
   mount: /run/secrets
   owner: 10001
   files:
     - name: server-key
-      env: AGENTS_SERVICE_KEY_FILE
+      env: AGENTS_SERVER_KEY
     - name: workos-api-key
       env: AGENTS_WORKOS_API_KEY_FILE
 
-# Inside the container, published on no host port. plexus-agents serves one
-# port, the WebSocket and its http answers alike: `shell` names the same port,
-# so the page (whatever plain http plexus-agents serves) goes there too.
+# Inside the container, published on no host port. One port serves the page,
+# the sign-in routes and the socket: `shell` names the same port.
 ports:
   websocket: 4470
   shell: 4470
 
-# Clients dial wss://<host>/ws, or an upgrade at any path (synapse dials /).
+# Clients dial wss://<host>/ws, or an upgrade at any path (synapse dials /);
+# the rest is the page and sign-in.
 routes:
   - match: { path: /ws }
     to: websocket
@@ -57,6 +56,7 @@ routes:
     to: websocket
   - match: default
     to: shell
+    encode: [zstd, gzip]
 
 # One volume per environment: the SQLite file (/data/agents.db).
 data:
@@ -70,13 +70,15 @@ resources:
   memory: 256m
   cpus: 0.5
 
-# Healthy means all of these, over https through the edge. plexus-agents
-# serves no page yet: a plain GET is answered 426 Upgrade Required (by the
-# service, through the edge), and it checks no Origin, so a foreign one is
-# not a 403 here (as menger's and voice's are) until it does.
+# Healthy means all of these, over https through the edge: the page, an
+# upgrade from its own origin, and one from a foreign origin refused.
 health:
   - get: https://{host}/
-    status: 426
+    status: 200
+    title_contains: plexus-agents
   - websocket_upgrade: wss://{host}/ws
     origin: https://{host}
     status: 101
+  - websocket_upgrade: wss://{host}/ws
+    origin: https://evil.example
+    status: 403
