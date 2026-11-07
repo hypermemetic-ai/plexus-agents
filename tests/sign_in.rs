@@ -12,7 +12,7 @@ use plexus_agents::pairing::ServerKey;
 use plexus_agents::runtime::{Supervisor, SupervisorConfig};
 use plexus_agents::service::{hub_with_login, Serving};
 use plexus_agents::ClaudeHarness;
-use plexus_auth_core::adapters::sign_key_proof;
+use plexus_rpc::auth_core::adapters::sign_key_proof;
 use plexus_harness::{Environment, Harness};
 use serde_json::{json, Value};
 use std::collections::HashMap;

@@ -30,12 +30,12 @@ use crate::runtime::ThreadId;
 use crate::service::{AgentsActivation, AgentsEvent, PlacementInfo};
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
-use plexus_auth_core::grants::Grant;
-use plexus_core::plexus::{
+use plexus_rpc::auth_core::grants::Grant;
+use plexus_rpc::core::plexus::{
     Activation, AuthContext, AuthzDenyReason, ChildRouter, ForwardPolicy, PlexusContext,
     PlexusError, PlexusStream, PlexusStreamItem, PluginSchema, ScopeRef, StreamMetadata,
 };
-use plexus_core::request::RawRequestContext;
+use plexus_rpc::core::request::RawRequestContext;
 use serde_json::{json, Map, Value};
 use std::sync::Arc;
 
@@ -59,7 +59,7 @@ impl OnActivation {
 }
 
 /// Where threads run: this service's placements, and its peers.
-#[plexus_macros::activation(
+#[plexus_rpc::macros::activation(
     namespace = "on",
     version = "0.1.0",
     auth = "required",
@@ -67,7 +67,7 @@ impl OnActivation {
 )]
 impl OnActivation {
     /// The placements here, and the peers answering now. An offline peer isn't listed.
-    #[plexus_macros::method(streaming)]
+    #[plexus_rpc::macros::method]
     pub async fn placements(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,
@@ -93,7 +93,7 @@ impl OnActivation {
     }
 
     /// One placement or peer.
-    #[plexus_macros::child(forward = "same_service")]
+    #[plexus_rpc::macros::child(forward = "same_service", opaque)]
     fn placement(&self, name: &str) -> Option<OnTarget> {
         Some(OnTarget {
             agents: self.agents.clone(),
@@ -226,10 +226,10 @@ impl OnTarget {
         }
         if method == "start" {
             let Some(object) = params.as_object_mut() else {
-                return Err(PlexusError::InvalidParams("start takes an object".into()));
+                return Err(PlexusError::invalid_params("start takes an object"));
             };
             if let Some(named) = object.get("placement").filter(|p| *p != &json!(self.name)) {
-                return Err(PlexusError::InvalidParams(format!(
+                return Err(PlexusError::invalid_params(format!(
                     "this is `{}`, not {named}",
                     self.name
                 )));
@@ -296,7 +296,7 @@ fn depth_refused(name: &str) -> PlexusStream {
     f.insert("child".into(), name.into());
     f.insert("max_depth".into(), MAX_DEPTH.into());
     let message = format!("a service's call can't go on to {name}: max_depth is {MAX_DEPTH}");
-    let item = PlexusStreamItem::typed_error(meta, message, "max_depth", false, f);
+    let item = crate::peer::typed_error(meta, message, "max_depth", false, f);
     Box::pin(futures::stream::iter([item]))
 }
 

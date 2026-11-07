@@ -21,10 +21,12 @@ use jsonrpsee::core::client::{Subscription, SubscriptionClientT};
 use jsonrpsee::core::params::{ArrayParams, ObjectParams};
 use jsonrpsee::core::ClientError;
 use jsonrpsee::ws_client::{HeaderMap, HeaderValue, WsClient, WsClientBuilder};
-use plexus_auth_core::adapters::{key_principal, sign_key_proof};
-use plexus_auth_core::grants::Reach;
-use plexus_core::plexus::{
-    error_item, Backoff, PlexusContext, PlexusError, PlexusStream, PlexusStreamItem, StreamMetadata,
+use plexus_rpc::auth_core::adapters::{key_principal, sign_key_proof};
+use plexus_rpc::auth_core::grants::Reach;
+use plexus_rpc::client::OtherError;
+use plexus_rpc::core::plexus::{
+    error_item, Backoff, DenyReason, PlexusContext, PlexusError, PlexusStream, PlexusStreamItem,
+    RemoteError, StreamMetadata,
 };
 use serde_json::{json, Map, Value};
 use std::collections::VecDeque;
@@ -121,12 +123,61 @@ fn fields(name: &str) -> Map<String, Value> {
     f
 }
 
+/// SUPERCONDUCTOR-24: Plexus 0.7's `PlexusStreamItem::typed_error`, on 0.8's
+/// typed error frame: the same wire (`error_kind` and the kind's own fields
+/// flattened beside `message`), with the typed `RemoteError` 0.8 carries beside
+/// it — the known kind where there is one, else the kind kept whole
+/// (`RemoteError::Other`, as `max_depth`).
+pub(crate) fn typed_error(
+    metadata: StreamMetadata,
+    message: String,
+    kind: &str,
+    recoverable: bool,
+    fields: Map<String, Value>,
+) -> PlexusStreamItem {
+    let text = |k: &str| fields.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+    let number = |k: &str| fields.get(k).and_then(Value::as_u64).unwrap_or_default();
+    let error = match kind {
+        "forbidden" => RemoteError::Forbidden {
+            reason: DenyReason::NotAccepted,
+        },
+        "child_unavailable" => RemoteError::ChildUnavailable {
+            child: text("child"),
+            reason: text("reason"),
+        },
+        "child_timeout" => RemoteError::ChildTimeout {
+            child: text("child"),
+            timeout_ms: number("timeout_ms"),
+        },
+        "too_many_calls" => RemoteError::TooManyCalls {
+            max: number("max"),
+            child: fields.get("child").and_then(Value::as_str).map(str::to_string),
+        },
+        other => {
+            RemoteError::Other(OtherError {
+                kind: other.to_string(),
+                fields: fields.clone(),
+            })
+        }
+    };
+    let mut fields = fields;
+    fields.insert("error_kind".into(), Value::String(kind.to_string()));
+    PlexusStreamItem::Error {
+        metadata,
+        message,
+        code: Some(kind.to_string()),
+        recoverable,
+        error,
+        fields,
+    }
+}
+
 /// `child_unavailable`: one error, and the end.
 pub(crate) fn unavailable(name: &str, why: &str) -> PlexusStreamItem {
     let mut f = fields(name);
     f.insert("reason".into(), why.into());
     let message = format!("child {name} is unavailable: {why}");
-    PlexusStreamItem::typed_error(meta(name), message, "child_unavailable", true, f)
+    crate::peer::typed_error(meta(name), message, "child_unavailable", true, f)
 }
 
 /// `child_timeout`: the peer didn't open the call in time.
@@ -134,14 +185,14 @@ pub(crate) fn timed_out(name: &str, timeout: Duration) -> PlexusStreamItem {
     let mut f = fields(name);
     f.insert("timeout_ms".into(), (timeout.as_millis() as u64).into());
     let message = format!("child {name} did not open the call in {timeout:?}");
-    PlexusStreamItem::typed_error(meta(name), message, "child_timeout", true, f)
+    crate::peer::typed_error(meta(name), message, "child_timeout", true, f)
 }
 
 fn too_many(name: &str, max: usize) -> PlexusStreamItem {
     let mut f = fields(name);
     f.insert("max".into(), max.into());
     let message = format!("too many calls open on child {name} (at most {max})");
-    PlexusStreamItem::typed_error(meta(name), message, "too_many_calls", true, f)
+    crate::peer::typed_error(meta(name), message, "too_many_calls", true, f)
 }
 
 pub(crate) fn one(item: PlexusStreamItem) -> PlexusStream {

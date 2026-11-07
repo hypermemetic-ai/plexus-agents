@@ -25,7 +25,7 @@ use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
-use plexus_core::plexus::{DynamicHub, SessionValidator};
+use plexus_rpc::core::plexus::{DynamicHub, SessionValidator};
 use plexus_login::simple::SimpleAccess;
 use plexus_login::{Branding, LoginOptions, Wired, Wiring};
 use std::net::{IpAddr, SocketAddr};
@@ -108,7 +108,7 @@ pub struct Login {
 
 impl Login {
     /// The `auth` activation's backend, for [`crate::service::hub_with_login`].
-    pub fn backend(&self) -> Arc<dyn plexus_core::plexus::AuthBackend> {
+    pub fn backend(&self) -> Arc<dyn plexus_rpc::core::plexus::AuthBackend> {
         self.wired.backend.clone()
     }
 

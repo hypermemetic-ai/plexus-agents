@@ -8,13 +8,14 @@ license = "MIT"
 [dependencies]
 # Unpublished, so by local path for now. Everything else is a published crate.
 plexus-harness = { path = "../plexus-harness" }
-plexus-core = "0.7.0"
-plexus-macros = "0.7.0"
-plexus-transport = { version = "0.6.0", default-features = false }
-plexus-auth-core = { version = "0.2.2", features = ["adapters"] }
+# SUPERCONDUCTOR-24: the Plexus 0.8 line, as plexus-ui 0.2.1 and menger take it:
+# plexus-core 0.8.0, plexus-macros 0.8.1, plexus-transport 0.7.0 and
+# plexus-auth-core 0.3.0 through the plexus-rpc umbrella (`plexus_rpc::core`,
+# `::macros`, `::transport`, `::auth_core`), so one binary links one Plexus.
+plexus-rpc = { version = "0.8.0", features = ["auth-adapters"] }
 # SUPERCONDUCTOR-19: sign-in (WorkOS, key), sessions and the auth activation, as
-# menger links it. 0.2.x is the Plexus 0.7 line; 0.3 is Plexus 0.8.
-plexus-login = "0.2.3"
+# menger links it. 0.3 is the Plexus 0.8 line.
+plexus-login = "0.3.1"
 anyhow = "1"
 async-stream = "0.3"
 # The one public port: the page, the sign-in routes, and the socket in front.

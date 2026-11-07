@@ -64,13 +64,13 @@ use crate::pairing::{self, ServerKey};
 use crate::peer::{meta, one, timed_out, unavailable};
 use async_trait::async_trait;
 use futures::Stream;
-use plexus_auth_core::grants::Grant;
-use plexus_core::plexus::{
+use plexus_rpc::auth_core::grants::Grant;
+use plexus_rpc::core::plexus::{
     AuthContext, AuthzDenyReason, PlexusError, PlexusStream, PlexusStreamItem, ScopeRef,
     SessionValidator,
 };
-use plexus_transport::websocket::Connection;
-use plexus_transport::{ConnectionHook, ConnectionWriter, Hooks, Outbound};
+use plexus_rpc::transport::websocket::Connection;
+use plexus_rpc::transport::{ConnectionHook, ConnectionWriter, Hooks, Outbound};
 use rusqlite::params;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -202,6 +202,16 @@ pub struct HostInfo {
     /// A live, signed-in socket is attached as it now.
     pub online: bool,
     pub last_seen: Option<i64>,
+}
+
+/// SUPERCONDUCTOR-24: Plexus 0.8's typed client yields a call that failed on
+/// the client's side as the stream's last event: `Failed`, as the server would.
+impl plexus_rpc::client::FromClientError for HostsEvent {
+    fn from_client_error(error: plexus_rpc::client::ClientError) -> Self {
+        HostsEvent::Failed {
+            message: error.to_string(),
+        }
+    }
 }
 
 /// Everything `hosts` yields.
@@ -537,7 +547,7 @@ impl Hosts {
         Hooks::new(move |conn, ext| {
             let ctx = ext.get::<Arc<AuthContext>>()?;
             let principal = ctx.principal()?.to_string();
-            let forwarded = ext.get::<plexus_transport::proxy::ForwardedClient>();
+            let forwarded = ext.get::<plexus_rpc::transport::proxy::ForwardedClient>();
             let ip = forwarded.map_or(conn.peer().ip(), |f| f.ip);
             let wire = Arc::new(Wire {
                 ip: Some(ip),
@@ -1051,7 +1061,7 @@ fn relay(
                 let mut f = Map::new();
                 f.insert("child".into(), name.clone().into());
                 let message = format!("host {name} is no longer yours");
-                yield PlexusStreamItem::typed_error(meta(&name), message, "forbidden", false, f);
+                yield crate::peer::typed_error(meta(&name), message, "forbidden", false, f);
                 break;
             }
             yield item;
@@ -1239,7 +1249,7 @@ fn outcome(r: Result<HostsEvent, String>) -> futures::stream::Iter<std::vec::Int
 }
 
 /// Hosts that dial in: pair a key by a code both sides show, list yours, attach a socket.
-#[plexus_macros::activation(
+#[plexus_rpc::macros::activation(
     trait = "HostsRpc",
     namespace = "hosts",
     version = "0.1.0",
@@ -1250,7 +1260,7 @@ fn outcome(r: Result<HostsEvent, String>) -> futures::stream::Iter<std::vec::Int
 impl HostsActivation {
     /// An unpaired host's key asks to pair as `name`. Answers with this service's
     /// key and its signature over `nonce`, so the host can check whom it's talking to.
-    #[plexus_macros::method(streaming)]
+    #[plexus_rpc::macros::method]
     pub async fn request(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,
@@ -1263,7 +1273,7 @@ impl HostsActivation {
     }
 
     /// Waits until a signed-in user confirms this key's pairing, or it lapses.
-    #[plexus_macros::method(streaming)]
+    #[plexus_rpc::macros::method]
     pub async fn wait(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,
@@ -1280,7 +1290,7 @@ impl HostsActivation {
     }
 
     /// A pending pairing, by its id (the link) or the code its host shows.
-    #[plexus_macros::method(streaming)]
+    #[plexus_rpc::macros::method]
     pub async fn pairing(
         &self,
         #[from_auth(self.access.verify)] _caller: Caller,
@@ -1297,7 +1307,7 @@ impl HostsActivation {
     }
 
     /// Confirms a pending pairing: the host becomes yours, and goes on as a machine.
-    #[plexus_macros::method(streaming)]
+    #[plexus_rpc::macros::method]
     pub async fn confirm(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,
@@ -1308,7 +1318,7 @@ impl HostsActivation {
     }
 
     /// Forgets a host of yours: its key is refused, and its socket is closed.
-    #[plexus_macros::method(streaming)]
+    #[plexus_rpc::macros::method]
     pub async fn unpair(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,
@@ -1319,7 +1329,7 @@ impl HostsActivation {
     }
 
     /// Your hosts: name, mode, whether it's online, when it was last seen.
-    #[plexus_macros::method(streaming)]
+    #[plexus_rpc::macros::method]
     pub async fn list(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,
@@ -1329,7 +1339,7 @@ impl HostsActivation {
 
     /// Makes the socket this call came in on the host's: `agents.on.<name>` goes
     /// out on it. A machine is attached as the name its key is paired with.
-    #[plexus_macros::method(streaming)]
+    #[plexus_rpc::macros::method]
     pub async fn attach(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,

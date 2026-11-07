@@ -22,17 +22,17 @@ use crate::runtime::{
 };
 use anyhow::Context;
 use futures::stream::{self, Stream, StreamExt};
-use plexus_auth_core::adapters::{Carriers, KeyProofAdapter, OidcAdapter};
-use plexus_auth_core::grants::Gate;
-use plexus_auth_core::identity::AuthenticatorChain;
-use plexus_auth_core::oidc::{Audience, OidcConfig, OidcSessionValidator, OidcValidator};
-use plexus_auth_core::IssuerUrl;
-use plexus_core::plexus::{DynamicHub, SessionValidator};
+use plexus_rpc::auth_core::adapters::{Carriers, KeyProofAdapter, OidcAdapter};
+use plexus_rpc::auth_core::grants::Gate;
+use plexus_rpc::auth_core::identity::AuthenticatorChain;
+use plexus_rpc::auth_core::oidc::{Audience, OidcConfig, OidcSessionValidator, OidcValidator};
+use plexus_rpc::auth_core::IssuerUrl;
+use plexus_rpc::core::plexus::{DynamicHub, SessionValidator};
 use plexus_harness::{
     Capabilities, Harness, InputAnswer, InputRequest, InputRequestId, InterruptOutcome, ModelName,
     RunSpec, StopMode, StopReport, ToolName, ToolPolicy, TurnId, UserInput,
 };
-use plexus_transport::TransportServer;
+use plexus_rpc::transport::TransportServer;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
@@ -127,6 +127,14 @@ pub enum AgentsEvent {
     },
 }
 
+/// SUPERCONDUCTOR-24: Plexus 0.8's typed client yields a call that failed on
+/// the client's side as the stream's last event: `Failed`, as the server would.
+impl plexus_rpc::client::FromClientError for AgentsEvent {
+    fn from_client_error(error: plexus_rpc::client::ClientError) -> Self {
+        failed(error)
+    }
+}
+
 fn failed(e: impl std::fmt::Display) -> AgentsEvent {
     AgentsEvent::Failed {
         message: e.to_string(),
@@ -162,7 +170,7 @@ impl HarnessActivation {
 }
 
 /// A coding-agent harness, served from its Harness impl.
-#[plexus_macros::activation(
+#[plexus_rpc::macros::activation(
     trait = "HarnessWire",
     namespace = "harness",
     namespace_fn = "ns",
@@ -172,7 +180,7 @@ impl HarnessActivation {
 )]
 impl HarnessActivation {
     /// What this harness can do.
-    #[plexus_macros::method(streaming, public)]
+    #[plexus_rpc::macros::method(public)]
     pub async fn describe(&self) -> impl Stream<Item = AgentsEvent> + Send + 'static {
         one(AgentsEvent::Harnesses {
             harnesses: vec![HarnessInfo {
@@ -219,7 +227,7 @@ impl AgentsActivation {
 }
 
 /// Coding agents as durable threads, addressed by thread.
-#[plexus_macros::activation(
+#[plexus_rpc::macros::activation(
     version = "0.1.0",
     auth = "mixed",
     request = AgentsRequest,
@@ -227,7 +235,7 @@ impl AgentsActivation {
 )]
 impl AgentsActivation {
     /// Starts a thread on a placement, and its first turn.
-    #[plexus_macros::method(streaming, target = "placement")]
+    #[plexus_rpc::macros::method(target = "placement")]
     #[allow(clippy::too_many_arguments)]
     pub async fn start(
         &self,
@@ -272,7 +280,7 @@ impl AgentsActivation {
     }
 
     /// The threads this caller may see, or one of them.
-    #[plexus_macros::method(streaming, target = "thread")]
+    #[plexus_rpc::macros::method(target = "thread")]
     pub async fn threads(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,
@@ -290,7 +298,7 @@ impl AgentsActivation {
     }
 
     /// The harnesses this service runs.
-    #[plexus_macros::method(streaming, public)]
+    #[plexus_rpc::macros::method(public)]
     pub async fn harnesses(&self) -> impl Stream<Item = AgentsEvent> + Send + 'static {
         let harnesses = self.harnesses.iter().map(|h| HarnessInfo {
             name: h.name().to_string(),
@@ -302,7 +310,7 @@ impl AgentsActivation {
     }
 
     /// Replays from `since`, then follows live, across resumes and threads.
-    #[plexus_macros::method(streaming, target = "thread")]
+    #[plexus_rpc::macros::method(target = "thread")]
     pub async fn watch(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,
@@ -332,7 +340,7 @@ impl AgentsActivation {
     }
 
     /// Sends a prompt, starting or resuming a process if there's none.
-    #[plexus_macros::method(streaming, target = "thread")]
+    #[plexus_rpc::macros::method(target = "thread")]
     pub async fn send(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,
@@ -347,7 +355,7 @@ impl AgentsActivation {
     }
 
     /// Stops the turn. On a thread with no process, cancels what it was waiting on.
-    #[plexus_macros::method(streaming, target = "thread")]
+    #[plexus_rpc::macros::method(target = "thread")]
     pub async fn interrupt(
         &self,
         #[from_auth(self.access.verify)] _caller: Caller,
@@ -359,7 +367,7 @@ impl AgentsActivation {
     }
 
     /// Stops the thread's process.
-    #[plexus_macros::method(streaming, target = "thread")]
+    #[plexus_rpc::macros::method(target = "thread")]
     pub async fn stop(
         &self,
         #[from_auth(self.access.verify)] _caller: Caller,
@@ -374,7 +382,7 @@ impl AgentsActivation {
     }
 
     /// Every undecided request this caller may see, oldest first, across threads.
-    #[plexus_macros::method(streaming)]
+    #[plexus_rpc::macros::method]
     pub async fn pending(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,
@@ -386,7 +394,7 @@ impl AgentsActivation {
     }
 
     /// Answers a request on a thread. The first answer wins.
-    #[plexus_macros::method(streaming, target = "thread")]
+    #[plexus_rpc::macros::method(target = "thread")]
     pub async fn answer(
         &self,
         #[from_auth(self.access.verify)] caller: Caller,
@@ -412,7 +420,7 @@ impl AgentsActivation {
     }
 
     /// Resumes a parked thread with no answer, so its call is asked again.
-    #[plexus_macros::method(streaming, target = "thread")]
+    #[plexus_rpc::macros::method(target = "thread")]
     pub async fn resume(
         &self,
         #[from_auth(self.access.verify)] _caller: Caller,
@@ -424,13 +432,13 @@ impl AgentsActivation {
     }
 
     /// The same surface, addressed by where it runs.
-    #[plexus_macros::child]
+    #[plexus_rpc::macros::child(opaque)]
     fn on(&self) -> OnRouter {
         OnRouter::new(self.clone())
     }
 
     /// The Claude harness.
-    #[plexus_macros::child]
+    #[plexus_rpc::macros::child(opaque)]
     fn claudecode(&self) -> HarnessActivation {
         let claude = self.harnesses.iter().find(|h| h.name() == CLAUDE);
         HarnessActivation::new("claudecode", claude.expect("composed with Claude").clone())
@@ -487,7 +495,7 @@ pub fn hub_with_login(
     grants: Vec<Grant>,
     peers: Vec<Arc<Peer>>,
     hosts: Option<Arc<Hosts>>,
-    backend: Arc<dyn plexus_core::plexus::AuthBackend>,
+    backend: Arc<dyn plexus_rpc::core::plexus::AuthBackend>,
 ) -> Arc<DynamicHub> {
     let names: Vec<String> = peers.iter().map(|p| p.name().to_string()).collect();
     let store = hosts.as_ref().map(|h| h.store());
@@ -620,7 +628,7 @@ pub async fn serve_with(
         builder = builder.with_hooks(hosts.hooks());
     }
     if !serving.trusted_proxies.is_empty() {
-        let proxies = plexus_transport::proxy::TrustedProxies::parse(&serving.trusted_proxies)
+        let proxies = plexus_rpc::transport::proxy::TrustedProxies::parse(&serving.trusted_proxies)
             .map_err(|e| anyhow::anyhow!("--trusted-proxy: {e}"))?;
         builder = builder.with_trusted_proxies(proxies);
     }

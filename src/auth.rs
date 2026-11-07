@@ -23,12 +23,12 @@
 //! thread reads the same as one for a thread that doesn't exist.
 
 use crate::runtime::{Supervisor, ThreadId};
-use plexus_auth_core::grants::{
+use plexus_rpc::auth_core::grants::{
     Gate, GrantSet, Membership, Memberships, Reach, Resolve, RoleTable, Roles, ScopeRef,
 };
-use plexus_auth_core::identity::Principal;
-use plexus_auth_core::RoleName;
-use plexus_core::plexus::{current_reach, AuthContext, PlexusError};
+use plexus_rpc::auth_core::identity::Principal;
+use plexus_rpc::auth_core::RoleName;
+use plexus_rpc::core::plexus::{current_reach, AuthContext, PlexusError};
 use plexus_harness::Actor;
 use std::sync::Arc;
 
@@ -68,7 +68,7 @@ pub fn roles() -> RoleTable {
     t.set(USER, GrantSet::listed(["agents.start"]));
     let owner = OWNER_GRANTS.iter().chain(HOST_USER_GRANTS.iter()).copied();
     t.set(OWNER, GrantSet::listed(owner));
-    t.set(plexus_auth_core::grants::ADMIN, GrantSet::All);
+    t.set(plexus_rpc::auth_core::grants::ADMIN, GrantSet::All);
     t
 }
 
@@ -230,26 +230,26 @@ impl Resolve for Homes {
 /// SUPERCONDUCTOR-19: `auth.role_set`, `auth.grant` and `auth.revoke` change
 /// nothing here. Roles are this module's, and memberships come from flags
 /// (`--grant`, `--admin`) and the host store.
-fn fixed() -> plexus_core::plexus::StoreError {
-    plexus_core::plexus::StoreError::new(
+fn fixed() -> plexus_rpc::core::plexus::StoreError {
+    plexus_rpc::core::plexus::StoreError::new(
         "roles and grants here are set by flags (--grant, --admin) and pairing",
     )
 }
 
 #[async_trait::async_trait]
-impl plexus_core::plexus::RoleStore for AgentsRoles {
+impl plexus_rpc::core::plexus::RoleStore for AgentsRoles {
     async fn set(
         &self,
         _role: &RoleName,
         _grants: GrantSet,
-    ) -> Result<(), plexus_core::plexus::StoreError> {
+    ) -> Result<(), plexus_rpc::core::plexus::StoreError> {
         Err(fixed())
     }
 }
 
 #[async_trait::async_trait]
-impl plexus_core::plexus::MembershipStore for Members {
-    async fn grant(&self, _m: Membership) -> Result<(), plexus_core::plexus::StoreError> {
+impl plexus_rpc::core::plexus::MembershipStore for Members {
+    async fn grant(&self, _m: Membership) -> Result<(), plexus_rpc::core::plexus::StoreError> {
         Err(fixed())
     }
 
@@ -258,7 +258,7 @@ impl plexus_core::plexus::MembershipStore for Members {
         _principal: &Principal,
         _role: Option<&RoleName>,
         _scope: &ScopeRef,
-    ) -> Result<Vec<RoleName>, plexus_core::plexus::StoreError> {
+    ) -> Result<Vec<RoleName>, plexus_rpc::core::plexus::StoreError> {
         Err(fixed())
     }
 }
@@ -270,11 +270,11 @@ pub fn auth_setup(
     peers: Vec<String>,
     grants: impl IntoIterator<Item = Grant>,
     hosts: Option<Arc<crate::hosts::HostStore>>,
-    backend: Arc<dyn plexus_core::plexus::AuthBackend>,
-) -> plexus_core::plexus::AuthSetup {
+    backend: Arc<dyn plexus_rpc::core::plexus::AuthBackend>,
+) -> plexus_rpc::core::plexus::AuthSetup {
     let mut members = Members::new(grants);
     members.1 = hosts.clone();
-    plexus_core::plexus::AuthSetup::new(
+    plexus_rpc::core::plexus::AuthSetup::new(
         backend,
         Arc::new(AgentsRoles {
             table: roles(),
@@ -351,7 +351,7 @@ impl Caller {
 
 /// The per-call context an activation names. Optional, so the resolver is what
 /// refuses a call and says why. What decides is [`Access::verify`], never this.
-#[derive(plexus_macros::PlexusRequest)]
+#[derive(plexus_rpc::macros::PlexusRequest)]
 pub struct AgentsRequest {
     /// The identity the connection's upgrade proved, if it proved one.
     #[from_auth_context]

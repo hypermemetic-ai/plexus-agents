@@ -23,13 +23,13 @@ use plexus_agents::pairing::{self, ServerKey};
 use plexus_agents::runtime::{Supervisor, SupervisorConfig};
 use plexus_agents::service::{hub, hub_with_hosts, serve_with_hosts};
 use plexus_agents::ClaudeHarness;
-use plexus_auth_core::adapters::{sign_key_proof, Carriers, KeyProofAdapter, OidcAdapter};
-use plexus_auth_core::identity::AuthenticatorChain;
-use plexus_auth_core::oidc::{
+use plexus_rpc::auth_core::adapters::{sign_key_proof, Carriers, KeyProofAdapter, OidcAdapter};
+use plexus_rpc::auth_core::identity::AuthenticatorChain;
+use plexus_rpc::auth_core::oidc::{
     Audience, FetchError, FetchedDocument, JwksFetcher, OidcConfig, OidcValidator,
 };
-use plexus_auth_core::IssuerUrl;
-use plexus_core::plexus::SessionValidator;
+use plexus_rpc::auth_core::IssuerUrl;
+use plexus_rpc::core::plexus::SessionValidator;
 use plexus_harness::{Environment, Harness};
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;

@@ -46,9 +46,9 @@ use crate::peer::{meta, principal_of, read_seed};
 use anyhow::{anyhow, Context};
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
-use plexus_auth_core::adapters::sign_key_proof;
-use plexus_auth_core::identity::Authenticated;
-use plexus_core::plexus::{error_item, AuthContext, DynamicHub, PlexusStreamItem};
+use plexus_rpc::auth_core::adapters::sign_key_proof;
+use plexus_rpc::auth_core::identity::Authenticated;
+use plexus_rpc::core::plexus::{error_item, AuthContext, DynamicHub, PlexusStreamItem};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -715,7 +715,7 @@ impl Inner {
                 let mut f = Map::new();
                 f.insert("reason".into(), why.clone().into());
                 let refused =
-                    PlexusStreamItem::typed_error(meta("host"), why, "forbidden", false, f);
+                    crate::peer::typed_error(meta("host"), why, "forbidden", false, f);
                 let refused = serde_json::to_value(refused).unwrap_or_default();
                 self.send(item(&sub, refused));
                 return;

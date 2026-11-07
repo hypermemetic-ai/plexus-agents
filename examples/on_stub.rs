@@ -6,7 +6,7 @@
 use async_stream::stream;
 use futures::Stream;
 use plexus_agents::service::{serve, SignIn};
-use plexus_core::plexus::DynamicHub;
+use plexus_rpc::core::plexus::DynamicHub;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,61 +28,86 @@ impl Drop for Open {
     }
 }
 
-fn ticks() -> impl Stream<Item = u64> + Send + 'static {
+/// A count, on the wire as the bare number it was (Plexus 0.8's generated
+/// client needs its items to take a client failure, which `u64` can't).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(transparent)]
+struct Tick(u64);
+
+/// The stub's client is never used; a failure there ends the count at its top.
+impl plexus_rpc::client::FromClientError for Tick {
+    fn from_client_error(_: plexus_rpc::client::ClientError) -> Self {
+        Tick(u64::MAX)
+    }
+}
+
+fn ticks() -> impl Stream<Item = Tick> + Send + 'static {
     stream! {
         let _open = Open::new();
         for n in 0.. {
-            yield n;
+            yield Tick(n);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }
 
-fn open() -> impl Stream<Item = u64> + Send + 'static {
-    futures::stream::iter([OPEN.load(Ordering::SeqCst) as u64])
+fn open() -> impl Stream<Item = Tick> + Send + 'static {
+    futures::stream::iter([Tick(OPEN.load(Ordering::SeqCst) as u64)])
 }
 
-#[derive(Clone)]
-struct FirstActivation;
+/// The peer as first published (each in a module of its own: Plexus 0.8 emits
+/// an `AgentsEvent` aggregate beside each `agents` activation).
+mod first {
+    use super::*;
 
-/// The peer as first published.
-#[plexus_macros::activation(namespace = "agents", version = "0.1.0", auth = "none")]
-impl FirstActivation {
-    /// Counts until dropped.
-    #[plexus_macros::method(streaming)]
-    pub async fn ticks(&self) -> impl Stream<Item = u64> + Send + 'static {
-        ticks()
-    }
+    #[derive(Clone)]
+    pub struct FirstActivation;
 
-    /// How many `ticks` are open.
-    #[plexus_macros::method(streaming)]
-    pub async fn open(&self) -> impl Stream<Item = u64> + Send + 'static {
-        open()
+    /// The peer as first published.
+    #[plexus_rpc::macros::activation(namespace = "agents", version = "0.1.0", auth = "none")]
+    impl FirstActivation {
+        /// Counts until dropped.
+        #[plexus_rpc::macros::method]
+        pub async fn ticks(&self) -> impl Stream<Item = Tick> + Send + 'static {
+            ticks()
+        }
+
+        /// How many `ticks` are open.
+        #[plexus_rpc::macros::method]
+        pub async fn open(&self) -> impl Stream<Item = Tick> + Send + 'static {
+            open()
+        }
     }
 }
 
-#[derive(Clone)]
-struct SecondActivation;
+/// The peer after an upgrade (each in a module of its own: Plexus 0.8 emits
+/// an `AgentsEvent` aggregate beside each `agents` activation).
+mod second {
+    use super::*;
 
-/// The peer after an upgrade.
-#[plexus_macros::activation(namespace = "agents", version = "0.2.0", auth = "none")]
-impl SecondActivation {
-    /// Counts until dropped.
-    #[plexus_macros::method(streaming)]
-    pub async fn ticks(&self) -> impl Stream<Item = u64> + Send + 'static {
-        ticks()
-    }
+    #[derive(Clone)]
+    pub struct SecondActivation;
 
-    /// How many `ticks` are open.
-    #[plexus_macros::method(streaming)]
-    pub async fn open(&self) -> impl Stream<Item = u64> + Send + 'static {
-        open()
-    }
+    /// The peer after an upgrade.
+    #[plexus_rpc::macros::activation(namespace = "agents", version = "0.2.0", auth = "none")]
+    impl SecondActivation {
+        /// Counts until dropped.
+        #[plexus_rpc::macros::method]
+        pub async fn ticks(&self) -> impl Stream<Item = Tick> + Send + 'static {
+            ticks()
+        }
 
-    /// New in this version.
-    #[plexus_macros::method(streaming)]
-    pub async fn added(&self) -> impl Stream<Item = u64> + Send + 'static {
-        futures::stream::iter([1])
+        /// How many `ticks` are open.
+        #[plexus_rpc::macros::method]
+        pub async fn open(&self) -> impl Stream<Item = Tick> + Send + 'static {
+            open()
+        }
+
+        /// New in this version.
+        #[plexus_rpc::macros::method]
+        pub async fn added(&self) -> impl Stream<Item = Tick> + Send + 'static {
+            futures::stream::iter([Tick(1)])
+        }
     }
 }
 
@@ -97,9 +122,9 @@ async fn main() -> anyhow::Result<()> {
     let port: u16 = value("--port")?.parse()?;
     let hub = DynamicHub::new("plexus-agents");
     let hub = if args.iter().any(|a| a == "--added") {
-        hub.register(SecondActivation)
+        hub.register(second::SecondActivation)
     } else {
-        hub.register(FirstActivation)
+        hub.register(first::FirstActivation)
     };
     let sign_in = SignIn {
         tokens: None,

@@ -7,7 +7,7 @@
 
 use futures::stream::{self, Stream};
 use plexus_agents::ClaudeHarness;
-use plexus_core::plexus::Activation;
+use plexus_rpc::core::plexus::Activation;
 use plexus_harness::{
     AgentEvent, AgentEventKind, Capabilities, EventSeq, Harness, InputAnswer, InputRequest,
 };
@@ -19,6 +19,16 @@ enum WireEvent {
     Capabilities { capabilities: Capabilities },
     Agent { event: Box<AgentEvent> },
     Inputs { requests: Vec<InputRequest> },
+    /// Plexus 0.8: the generated client's failure, in band.
+    Failed { message: String },
+}
+
+impl plexus_rpc::client::FromClientError for WireEvent {
+    fn from_client_error(error: plexus_rpc::client::ClientError) -> Self {
+        WireEvent::Failed {
+            message: error.to_string(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -34,7 +44,7 @@ impl HarnessActivation {
 }
 
 /// A coding-agent harness, served from its `Harness` impl.
-#[plexus_macros::activation(
+#[plexus_rpc::macros::activation(
     trait = "HarnessWire",
     namespace = "harness",
     namespace_fn = "ns",
@@ -42,7 +52,7 @@ impl HarnessActivation {
 )]
 impl HarnessActivation {
     /// What this harness can do.
-    #[plexus_macros::method(streaming)]
+    #[plexus_rpc::macros::method]
     pub async fn describe(&self) -> impl Stream<Item = WireEvent> + Send + 'static {
         stream::iter(vec![WireEvent::Capabilities {
             capabilities: self.h.capabilities(),
@@ -50,7 +60,7 @@ impl HarnessActivation {
     }
 
     /// One run's events.
-    #[plexus_macros::method(streaming)]
+    #[plexus_rpc::macros::method]
     pub async fn events(&self) -> impl Stream<Item = WireEvent> + Send + 'static {
         let event = AgentEvent {
             seq: EventSeq(1),
@@ -68,7 +78,7 @@ impl HarnessActivation {
     }
 
     /// Answers a request.
-    #[plexus_macros::method(streaming)]
+    #[plexus_rpc::macros::method]
     pub async fn answer(
         &self,
         /** the answer */

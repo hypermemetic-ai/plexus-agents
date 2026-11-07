@@ -14,11 +14,11 @@ use plexus_agents::auth::Grant;
 use plexus_agents::runtime::{Supervisor, SupervisorConfig, ThreadId, ThreadOptions};
 use plexus_agents::service::{hub, serve};
 use plexus_agents::ClaudeHarness;
-use plexus_auth_core::oidc::{
+use plexus_rpc::auth_core::oidc::{
     Audience, FetchError, FetchedDocument, JwksFetcher, OidcConfig, OidcSessionValidator,
     OidcValidator,
 };
-use plexus_auth_core::IssuerUrl;
+use plexus_rpc::auth_core::IssuerUrl;
 use plexus_harness::conformance::replay::{ExitTrigger, ReplayEnvironment, ReplayScript};
 use plexus_harness::{Actor, Environment, Harness, LaunchPlan, Process, RunSpec, SpawnError};
 use rsa::pkcs1::EncodeRsaPrivateKey;
@@ -339,7 +339,7 @@ async fn a_public_methods_reach_is_empty_for_anon() {
     let ada = connect(s.port, &token(ADA, "ada")).await;
     let thread = start(&ada).await;
     let gate = plexus_agents::auth::gate(&s.runtime, vec![], grants());
-    let grant = plexus_auth_core::grants::Grant::new("agents.harnesses");
+    let grant = plexus_rpc::auth_core::grants::Grant::new("agents.harnesses");
     let reach = gate.reach_of_public(None, &grant);
     assert!(reach.is_empty());
     assert!(reach.held_on().is_empty());
