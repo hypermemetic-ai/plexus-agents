@@ -11,7 +11,7 @@
      no shape for a stream alone (a gap, in the report). Everything the agent says
      is drawn as text, never HTML. -->
 <script module>
-  export const uses = ["hosts.threads", "hosts.watch", "hosts.send", "hosts.interrupt", "hosts.pending"];
+  export const uses = ["hosts.threads", "hosts.watch", "hosts.pending"];
 </script>
 
 <script>
@@ -22,6 +22,7 @@
   import Pill from "./sc-pill.svelte";
   import Tool from "./sc-tool.svelte";
   import Approval from "./sc-approval.svelte";
+  import Composer from "./sc-composer.svelte";
 
   let { host, thread } = $props();
   const b = bus();
@@ -71,7 +72,7 @@
       case "tool.call": tools.set(ev.id, push({ type: "tool", id: ev.id, name: ev.name, input: ev.input, output: null, is_error: false, done: false, turn })); reply = null; break;
       case "tool.result": { const t = tools.get(ev.id); if (t) { t.output = ev.output; t.is_error = !!ev.is_error; t.done = true; } break; }
       case "input.requested": unresolved.add(ev.id); break;
-      case "input.resolved": unresolved.delete(ev.id); delete asks[ev.id]; break;
+      case "input.resolved": unresolved.delete(ev.id); if (asks[ev.id]) asks[ev.id] = { ...asks[ev.id], outcome: ev.outcome }; break;
       case "turn.parked": push({ type: "note", text: "Waiting for your answer; the process is parked.", turn }); break;
       case "turn.terminal": {
         running = false; reply = null;
@@ -107,7 +108,6 @@
       for (const row of [...rows].sort((a, b) => a.seq - b.seq)) fold(row);
       ask();
       if (stick) follow();
-      flush();
     });
   }));
 
@@ -124,41 +124,7 @@
     }
     return out;
   });
-  const status = $derived(Object.keys(asks).length || unresolved.size ? "needs" : running ? "working" : failed ? "failed" : "idle");
-
-  // The composer.
-  let text = $state("");
-  let queued = $state([]);
-  let error = $state("");
-  async function send(prompt) {
-    error = "";
-    const r = await b.call("hosts.send", { host, thread, prompt });
-    const f = (r.events ?? []).find((e) => e.type === "failed");
-    if (!r.ok || f) { error = f ? f.message : (r.message ?? "not sent"); return false; }
-    return true;
-  }
-  async function submit(ev) {
-    ev?.preventDefault();
-    const prompt = text.trim();
-    if (!prompt) return;
-    text = "";
-    if (running) queued.push(prompt);
-    else if (!(await send(prompt))) text = prompt;
-  }
-  async function flush() {
-    if (running || !queued.length || log.status !== "live") return;
-    const next = queued.shift();
-    if (!(await send(next))) queued.unshift(next);
-  }
-  function keydown(ev) {
-    if (ev.key === "Enter" && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); submit(); }
-  }
-  async function stop() {
-    const r = await b.call("hosts.interrupt", { host, thread });
-    const f = (r.events ?? []).find((e) => e.type === "failed");
-    if (!r.ok || f) error = f ? f.message : (r.message ?? "not stopped");
-  }
-  b.keys({ escape: { to: () => { if (running) stop(); }, label: "stop the turn", in_inputs: true } });
+  const status = $derived(Object.values(asks).some((a) => !a.outcome) || unresolved.size ? "needs" : running ? "working" : failed ? "failed" : "idle");
 
   // Follow the end while it's in view; else offer to jump there.
   let scroller = $state(null);
@@ -207,19 +173,7 @@
         {#if log.status === "pending"}<p class="muted">…</p>{/if}
       </div>
       {#if behind}<button class="jump" type="button" onclick={follow}>Jump to latest ↓</button>{/if}
-      <div class="composer">
-        {#if running}
-          <div class="strip"><span>Working…</span><button class="stop" type="button" onclick={stop}>■ Stop</button></div>
-        {/if}
-        {#each queued as q, n (n + q)}
-          <div class="queued"><span class="muted">Queued:</span> <span class="q">{q}</span> <button class="x" type="button" aria-label="take it back" onclick={() => queued.splice(n, 1)}>✕</button></div>
-        {/each}
-        <form onsubmit={submit}>
-          <textarea rows="2" value={text} oninput={(e) => (text = e.currentTarget.value)} onkeydown={keydown} placeholder={running ? "Queue a follow-up… (Enter)" : "Reply… (Enter sends, Shift+Enter for a new line)"}></textarea>
-          <button class="primary" type="submit">{running ? "Queue" : "Send"}</button>
-        </form>
-        {#if error}<p class="error">{error}</p>{/if}
-      </div>
+      <Composer {host} {thread} {status}/>
     </main>
   </div>
 </div>
@@ -239,16 +193,6 @@
   .note { margin: 6px 0; color: var(--muted); font-size: 12px; }
   .note[data-status=failed] { color: var(--warn); }
   .jump { position: absolute; right: 24px; bottom: 120px; padding: 4px 12px; background: var(--card); border: var(--border) solid var(--line); border-radius: var(--radius-pill); cursor: pointer; }
-  .composer { padding: 10px 20px 14px; border-top: var(--border) solid var(--line); background: var(--panel); }
-  .strip { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; color: var(--st-working-fg); }
-  .stop { margin-left: auto; padding: 4px 12px; color: var(--warn); background: var(--card); border: var(--border) solid var(--warn); border-radius: var(--radius); cursor: pointer; }
-  .queued { display: flex; gap: 6px; align-items: baseline; margin-bottom: 6px; padding: 4px 8px; background: var(--card); border: var(--border) dashed var(--line); border-radius: var(--radius); }
-  .q { flex: 1; white-space: pre-wrap; overflow-wrap: anywhere; }
-  .x { background: none; border: none; color: var(--muted); cursor: pointer; }
-  form { display: flex; gap: 8px; align-items: flex-end; }
-  textarea { flex: 1; padding: 8px 10px; color: var(--ink); background: var(--bg); border: var(--border) solid var(--line); border-radius: var(--radius); resize: vertical; }
-  textarea:focus-visible { outline: none; border-color: var(--focus); }
-  .primary { padding: 8px 16px; color: var(--on-accent); background: var(--accent); border: none; border-radius: var(--radius); cursor: pointer; }
   code { font-family: var(--font-text); font-size: 12px; }
   .muted { color: var(--muted); }
   .error { color: var(--warn); font-size: 12px; }
