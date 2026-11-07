@@ -62,7 +62,7 @@
 
   const online = $derived((hosts ?? []).filter((h) => h.online));
   const needs = $derived(Object.entries(threads).flatMap(([h, ts]) => ts.filter((t) => statusOf(t) === "needs").map((t) => ({ host: h, t }))));
-  const command = $derived(`plexus-agents host --server ${location.origin.replace(/^http/, "ws")}/ws --name my-laptop`);
+  const command = $derived(`plexus-agents host --server ${location.origin.replace(/^http/, "ws")}/ws --app ${location.origin} --name my-laptop --db ~/.plexus/agents-my-laptop.db`);
   async function copy() {
     try { await navigator.clipboard.writeText(command); copied = true; setTimeout(() => (copied = false), 1800); } catch { /* no clipboard here */ }
   }
@@ -170,6 +170,8 @@
   .link-button { display: inline-flex; align-items: center; min-height: 44px; padding: 0 var(--s4); color: var(--on-accent); background: var(--accent); border-radius: var(--radius-sm); font-weight: 500; }
 
   @media (max-width: 719px) {
+    /* On a phone the nav above is the home screen and already lists what needs you. */
+    .needs { display: none; }
     .sc-page { padding: var(--s4); }
     .what { flex-direction: column; align-items: stretch; gap: 0; }
     .command { flex-direction: column; align-items: stretch; }

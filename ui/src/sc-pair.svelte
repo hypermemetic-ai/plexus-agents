@@ -50,7 +50,7 @@
     if (code.trim()) find({ code: code.trim().toUpperCase() });
   }
   function cancel() { found = null; error = ""; b.navigate("#/pair"); }
-  const command = $derived(`plexus-agents host --server ${location.origin.replace(/^http/, "ws")}/ws --name my-laptop`);
+  const command = $derived(`plexus-agents host --server ${location.origin.replace(/^http/, "ws")}/ws --app ${location.origin} --name my-laptop --db ~/.plexus/agents-my-laptop.db`);
   async function copy() {
     try { await navigator.clipboard.writeText(command); copied = true; setTimeout(() => (copied = false), 1800); } catch { /* no clipboard here */ }
   }

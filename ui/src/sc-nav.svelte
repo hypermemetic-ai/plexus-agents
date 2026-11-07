@@ -356,8 +356,8 @@
     {:else if !hosts.length}
       <Empty title="Pair a machine to start" body="Threads run Claude Code on your own computers. Run this on the machine you want to use, then open the link it prints.">
         <div class="cmd">
-          <code>{`plexus-agents host \\\n  --server ${server} \\\n  --name laptop`}</code>
-          <button type="button" class="copy" onclick={() => copy(`plexus-agents host --server ${server} --name laptop`)}>{copied ? "Copied" : "Copy"}</button>
+          <code>{`plexus-agents host \\\n  --server ${server} \\\n  --app ${location.origin} \\\n  --name laptop \\\n  --db ~/.plexus/agents-laptop.db`}</code>
+          <button type="button" class="copy" onclick={() => copy(`plexus-agents host --server ${server} --app ${location.origin} --name laptop --db ~/.plexus/agents-laptop.db`)}>{copied ? "Copied" : "Copy"}</button>
         </div>
         <a class="link" href="#/pair">Have a pairing code? Enter it</a>
       </Empty>
