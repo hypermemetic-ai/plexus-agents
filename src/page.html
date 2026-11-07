@@ -20,6 +20,22 @@
   button.primary { background: var(--accent); color: #fff; border: 0; border-radius: 4px; }
   .error { color: #c62828; } .muted { color: var(--muted); }
   a { color: var(--accent); }
+  main.wide { max-width: 46rem; }
+  .bar { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; flex-wrap: wrap; }
+  .log { display: flex; flex-direction: column; gap: .6rem; margin: 1rem 0; }
+  .msg { padding: .5rem .75rem; border-radius: 8px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.user { align-self: flex-end; max-width: 85%; background: var(--accent); color: #fff; }
+  .msg.agent { align-self: flex-start; max-width: 100%; border: 1px solid var(--line); }
+  .meta { color: var(--muted); font-size: .8rem; }
+  details.tool { font: .85rem/1.4 ui-monospace, monospace; border-left: 3px solid var(--line); padding: .1rem .6rem; }
+  details.tool summary { cursor: pointer; overflow-wrap: anywhere; }
+  details.tool pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 20rem; overflow: auto; margin: .3rem 0; }
+  .ask { border: 1px solid var(--accent); border-radius: 8px; padding: .6rem .75rem; }
+  .ask pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .85rem; }
+  form.say { display: flex; gap: .5rem; align-items: flex-end; position: sticky; bottom: 0; background: var(--bg); padding: .5rem 0; }
+  form.say textarea { flex: 1; font: inherit; padding: .4rem; min-height: 2.6rem; resize: vertical; }
+  label.field { display: block; margin: .6rem 0; } label.field input, label.field textarea { width: 100%; box-sizing: border-box; font: inherit; }
+  .threads td { font-size: .9rem; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
@@ -46,6 +62,8 @@ function signIn() {
 }
 
 // One socket, same origin; each call is a `plexus-agents.call` subscription.
+// A subscription yields `data` items until `done` (or `error`); `stream` hands
+// every item to `onItem`, and `call` takes the first.
 let socket, opened, nextId = 1;
 const waiting = new Map(), subs = new Map();
 function connect() {
@@ -55,34 +73,54 @@ function connect() {
   socket.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.id != null && waiting.has(m.id)) {
-      const w = waiting.get(m.id); waiting.delete(m.id);
-      if (m.error) w.reject(new Error(m.error.message)); else subs.set(String(m.result), w);
+      const s = waiting.get(m.id); waiting.delete(m.id);
+      if (m.error) s.end(new Error(m.error.message));
+      else if (s.cancelled) s.end();
+      else { s.sub = String(m.result); subs.set(s.sub, s); }
     } else if (m.params && m.params.subscription != null) {
-      const w = subs.get(String(m.params.subscription));
-      const item = m.params.result;
-      if (!w || !item) return;
-      if (item.type === "data") { subs.delete(String(m.params.subscription)); w.resolve(item.content); }
-      else if (item.type === "error") { subs.delete(String(m.params.subscription)); w.reject(new Error(item.message)); }
+      const key = String(m.params.subscription), s = subs.get(key), item = m.params.result;
+      if (!s || !item) return;
+      if (item.type === "data") s.item(item.content);
+      else if (item.type === "done") { subs.delete(key); s.end(); }
+      else if (item.type === "error") { subs.delete(key); s.end(new Error(item.message || "the call failed")); }
     }
   };
-  socket.onclose = () => { opened = null; for (const w of [...waiting.values(), ...subs.values()]) w.reject(new Error("the connection closed")); waiting.clear(); subs.clear(); };
-  opened = new Promise((ok, no) => { socket.onopen = ok; socket.onerror = () => no(new Error("can't reach the service")); });
+  socket.onclose = () => {
+    opened = null;
+    for (const s of [...waiting.values(), ...subs.values()]) s.end(new Error("the connection closed"));
+    waiting.clear(); subs.clear();
+  };
+  opened = new Promise((ok, no) => { socket.onopen = ok; socket.onerror = () => { opened = null; no(new Error("can't reach the service")); }; });
   return opened;
 }
+// Streams `method`: `onItem` gets each item. Returns `{ done, cancel }`; `done`
+// settles when the stream ends, and `cancel` stops delivering its items.
+function stream(method, params, onItem) {
+  let finish;
+  const s = { cancelled: false, item: (c) => { if (!s.cancelled) onItem(c); }, end: (err) => finish(err) };
+  const done = new Promise((ok, no) => { finish = (err) => (err ? no(err) : ok()); });
+  connect().then(() => {
+    const id = nextId++;
+    waiting.set(id, s);
+    socket.send(JSON.stringify({ jsonrpc: "2.0", id, method: "plexus-agents.call", params: { method, params: params || {} } }));
+  }, (err) => finish(err));
+  return { done, cancel: () => { s.cancelled = true; if (s.sub) subs.delete(s.sub); finish(); } };
+}
 async function call(method, params) {
-  await connect();
-  const id = nextId++;
-  const p = new Promise((resolve, reject) => waiting.set(id, { resolve, reject }));
-  socket.send(JSON.stringify({ jsonrpc: "2.0", id, method: "plexus-agents.call", params: { method, params: params || {} } }));
-  const out = await p;
-  if (out && out.type === "failed") throw new Error(out.message);
-  return out;
+  let first;
+  const s = stream(method, params, (c) => { if (first === undefined) first = c; });
+  await s.done;
+  if (first === undefined) throw new Error(`${method} answered nothing`);
+  if (first && first.type === "failed") throw new Error(first.message);
+  return first;
 }
 
 async function hosts() {
   const r = await call("hosts.list");
   const rows = r.hosts.map((h) => `<tr><td>${esc(h.name)}</td><td class="${h.online ? "on" : "off"}">${h.online ? "online" : "offline"}</td>
-    <td class="muted">${esc(h.mode)}</td><td><button data-unpair="${esc(h.name)}">Unpair</button></td></tr>`).join("");
+    <td class="muted">${esc(h.mode)}</td>
+    <td>${h.online && h.mode === "machine" ? `<a href="#/chat?host=${encodeURIComponent(h.name)}">Chat</a>` : ""}</td>
+    <td><button data-unpair="${esc(h.name)}">Unpair</button></td></tr>`).join("");
   show(`<h2>Your hosts</h2>${rows ? `<table>${rows}</table>` : `<p class="muted">None yet. Run <code>plexus-agents host --server … --name …</code> on a machine, and open the link it prints.</p>`}
     <p><a href="#/pair">Pair a host by its code</a></p>`);
   view.querySelectorAll("[data-unpair]").forEach((b) => b.onclick = async () => {
@@ -111,11 +149,176 @@ async function pending(by) {
   };
 }
 
+// ── chat: a thread on one of your hosts (SUPERCONDUCTOR-22) ──────────────────
+// Every call goes to `agents.on.<host>.*`; the service carries it over the
+// socket the host dialed. Agent text is set with textContent, never as HTML.
+let live = null;                      // the open `watch`, dropped on leaving the view
+const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = text; return n; };
+const on = (host, method) => `agents.on.${host}.${method}`;
+const cwdKey = (host) => `agents.cwd.${host}`;
+const remembered = (host) => { try { return localStorage.getItem(cwdKey(host)) || ""; } catch { return ""; } };
+const remember = (host, cwd) => { try { localStorage.setItem(cwdKey(host), cwd); } catch { /* private window */ } };
+const enterSends = (area, form) => area.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); form.requestSubmit(); }
+});
+
+async function chatHome(host) {
+  const r = await call(on(host, "threads"));
+  const rows = (r.threads || []).slice().reverse().map((t) => `<tr>
+    <td><a href="#/chat?host=${encodeURIComponent(host)}&thread=${encodeURIComponent(t.id)}"><code>${esc(String(t.id).slice(0, 8))}</code></a></td>
+    <td class="muted">${esc(t.cwd || "")}</td><td>${esc(typeof t.status === "string" ? t.status : Object.keys(t.status || {})[0] || "")}</td>
+    <td class="muted">${esc(t.last_turn)} turn${t.last_turn === 1 ? "" : "s"}</td></tr>`).join("");
+  show(`<div class="bar"><h2>Chat on <code>${esc(host)}</code></h2><a href="#/">Your hosts</a></div>
+    <form id="new">
+      <label class="field">Folder on ${esc(host)}<input id="cwd" required placeholder="/Users/you/project" value="${esc(remembered(host))}"></label>
+      <label class="field">Message<textarea id="prompt" required rows="3" placeholder="What should Claude do?"></textarea></label>
+      <button class="primary">Start</button> <span class="muted">Claude runs on ${esc(host)}, in that folder, with Bash.</span>
+      <p class="error" id="err"></p>
+    </form>
+    ${rows ? `<h3>Threads</h3><table class="threads">${rows}</table>` : ""}`);
+  const form = document.getElementById("new"), prompt = document.getElementById("prompt");
+  enterSends(prompt, form);
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const cwd = document.getElementById("cwd").value.trim();
+    form.querySelector("button").disabled = true;
+    try {
+      remember(host, cwd);
+      const s = await call(on(host, "start"), { placement: "local", cwd, prompt: prompt.value });
+      location.hash = `#/chat?host=${encodeURIComponent(host)}&thread=${encodeURIComponent(s.thread)}`;
+    } catch (err) { document.getElementById("err").textContent = err.message; form.querySelector("button").disabled = false; }
+  };
+}
+
+function chatThread(host, thread) {
+  show(`<div class="bar"><h2>Chat on <code>${esc(host)}</code></h2>
+      <span><a href="#/chat?host=${encodeURIComponent(host)}">Threads</a> · <a href="#/">Your hosts</a></span></div>
+    <div class="meta" id="info">thread <code>${esc(thread)}</code></div>
+    <div class="log" id="log"></div>
+    <form class="say" id="say"><textarea id="text" rows="2" placeholder="Reply… (Enter sends, Shift+Enter for a new line)"></textarea>
+      <button class="primary" id="send">Send</button><button type="button" id="stop" hidden>Stop</button></form>
+    <p class="error" id="err"></p>`);
+  const log = document.getElementById("log"), info = document.getElementById("info");
+  const form = document.getElementById("say"), text = document.getElementById("text");
+  const stopBtn = document.getElementById("stop"), err = document.getElementById("err");
+  const tools = new Map(), asks = new Map();
+  let reply = null, busy = false;
+  const atEnd = () => window.innerHeight + window.scrollY >= document.body.scrollHeight - 80;
+  const add = (node) => { const follow = atEnd(); log.append(node); if (follow) node.scrollIntoView({ block: "end" }); return node; };
+  const setBusy = (b) => { busy = b; stopBtn.hidden = !b; };
+
+  async function ask(id) {
+    if (asks.has(id)) return;
+    asks.set(id, null);
+    let rec;
+    try { rec = ((await call(on(host, "pending"))).requests || []).find((r) => r.thread === thread && r.request.id === id); }
+    catch (e) { err.textContent = e.message; return; }
+    if (!rec) return;
+    const kind = rec.request.kind, card = add(el("div", "ask"));
+    asks.set(id, card);
+    const answer = async (a) => {
+      card.querySelectorAll("button").forEach((b) => b.disabled = true);
+      try { await call(on(host, "answer"), { thread, request: id, answer: a }); }
+      catch (e) { err.textContent = e.message; card.querySelectorAll("button").forEach((b) => b.disabled = false); }
+    };
+    if (kind.kind === "tool_approval") {
+      card.append(el("div", null, `Claude wants to use ${kind.tool}`));
+      if (kind.description) card.append(el("div", "meta", kind.description));
+      card.append(el("pre", null, kind.input && kind.input.command ? kind.input.command : JSON.stringify(kind.input, null, 2)));
+      if (rec.after_unknown_outcome) card.append(el("div", "error", "An earlier answer's outcome is unknown: it may have run already."));
+      const yes = el("button", "primary", "Allow"), no = el("button", null, "Deny");
+      yes.onclick = () => answer({ answer: "allow" });
+      no.onclick = () => answer({ answer: "deny", message: "Denied from the browser.", stop_turn: false });
+      card.append(yes, " ", no);
+    } else if (kind.kind === "question") {
+      for (const q of kind.questions) {
+        card.append(el("div", null, q.question));
+        for (const o of q.options) {
+          const b = el("button", null, o.label);
+          b.title = o.description || "";
+          b.onclick = () => answer({ answer: "answers", answers: { [q.question]: o.label } });
+          card.append(b, " ");
+        }
+      }
+    } else {
+      card.append(el("div", null, `Claude asks for “${kind.name || kind.kind}”, which this page can't answer.`));
+      const b = el("button", null, "Refuse");
+      b.onclick = () => answer({ answer: "refuse", reason: "the browser can't answer this" });
+      card.append(b);
+    }
+  }
+
+  function onEvent(ev) {
+    switch (ev.kind) {
+      case "turn.started": reply = null; setBusy(true); break;
+      case "user.message": add(el("div", "msg user", ev.text)); reply = null; break;
+      case "session.started": info.textContent = `Claude ${ev.harness_version || ""} · ${ev.model || ""} · thread ${thread}`; break;
+      case "text.delta":
+        if (!reply) reply = add(el("div", "msg agent", ""));
+        reply.textContent += ev.text; if (atEnd()) reply.scrollIntoView({ block: "end" });
+        break;
+      case "message":
+        if (reply) reply.textContent = ev.text; else add(el("div", "msg agent", ev.text));
+        reply = null; break;
+      case "tool.call": {
+        const d = el("details", "tool"), sum = el("summary");
+        const shown = ev.input && (ev.input.command || ev.input.file_path || ev.input.pattern || ev.input.url);
+        sum.textContent = `${ev.name}${shown ? ": " + shown : ""}`;
+        d.append(sum, el("pre", "meta", "running…"));
+        tools.set(ev.id, d); add(d); reply = null; break;
+      }
+      case "tool.result": {
+        const d = tools.get(ev.id); if (!d) break;
+        const out = typeof ev.output === "string" ? ev.output : JSON.stringify(ev.output, null, 2);
+        const pre = d.querySelector("pre"); pre.className = ev.is_error ? "error" : ""; pre.textContent = out || "(no output)";
+        break;
+      }
+      case "input.requested": ask(ev.id); break;
+      case "input.resolved": { const c = asks.get(ev.id); if (c) c.remove(); asks.delete(ev.id); break; }
+      case "turn.terminal": {
+        setBusy(false); reply = null;
+        // TurnStatus is tagged `status`: {status: "completed"} | {status: "failed", failure, detail}
+        const st = ev.status && typeof ev.status === "object" ? ev.status : { status: ev.status };
+        if (st.status === "interrupted") add(el("div", "meta", "stopped"));
+        else if (st.status && st.status !== "completed") add(el("div", "error", `turn failed: ${st.failure || st.status}${st.detail ? " · " + st.detail : ""}`));
+        break;
+      }
+      case "turn.parked": add(el("div", "meta", "waiting for an answer; the process is parked")); break;
+      case "run.ended": setBusy(false); break;
+    }
+  }
+
+  live = stream(on(host, "watch"), { thread }, (item) => {
+    if (item.type === "event") onEvent(item.event.event);
+    else if (item.type === "failed") err.textContent = item.message;
+    else if (item.type === "ended") err.textContent = "Your sign-in ended. Sign in again to keep following.";
+  });
+  live.done.catch((e) => { err.textContent = `${e.message}. Reload to follow again.`; });
+
+  enterSends(text, form);
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const prompt = text.value.trim();
+    if (!prompt) return;
+    document.getElementById("send").disabled = true; err.textContent = "";
+    try { await call(on(host, "send"), { thread, prompt }); text.value = ""; }
+    catch (e2) { err.textContent = e2.message; }
+    finally { document.getElementById("send").disabled = false; text.focus(); }
+  };
+  stopBtn.onclick = async () => { try { await call(on(host, "interrupt"), { thread }); } catch (e) { err.textContent = e.message; } };
+}
+
 async function render() {
   const r = route();
+  if (live) { live.cancel(); live = null; }
+  document.querySelector("main").classList.toggle("wide", r.path === "/chat");
   try {
     if (r.path === "/pair") { const id = r.params.get("id"); return id ? pending({ pairing_id: id }) : typeCode(); }
-    return hosts();
+    if (r.path === "/chat" && r.params.get("host")) {
+      const host = r.params.get("host"), thread = r.params.get("thread");
+      return thread ? chatThread(host, thread) : await chatHome(host);
+    }
+    return await hosts();
   } catch (e) { show(`<p class="error">${esc(e.message)}</p>`); }
 }
 
