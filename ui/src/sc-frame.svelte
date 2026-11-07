@@ -2,7 +2,8 @@
      sections — `top` (sc-top), `nav` (sc-nav), `palette` (sc-palette), their
      defaults in slots.json and swappable from the section menu — and `main`, a
      bound mark whose component is the route's page, chosen here from the route:
-     a thread → sc-thread, `#/h/:host/new` → sc-newthread, a host → sc-host, `#/pair[/:id]` → sc-pair, else
+     a thread → sc-thread, `#/h/:host/new` → sc-newthread, a host → sc-host, `#/pair[/:id]` → sc-pair, `#/people` → sc-people
+     (test only: an admin acts as someone), else
      sc-home. The route's params reach the page as props through the mark's
      data-* (`host`, `thread`, `id`, as strings), and follow it on update.
 
@@ -28,7 +29,7 @@
   });
 
   const page = $derived(
-    thread ? "sc-thread" : host && /\/new$/.test(hash) ? "sc-newthread" : host ? "sc-host" : /^#\/pair(\/|$)/.test(hash) ? "sc-pair" : "sc-home",
+    thread ? "sc-thread" : host && /\/new$/.test(hash) ? "sc-newthread" : host ? "sc-host" : /^#\/pair(\/|$)/.test(hash) ? "sc-pair" : /^#\/people$/.test(hash) ? "sc-people" : "sc-home",
   );
   const here = $derived(page === "sc-home" ? "home" : "page");
 
