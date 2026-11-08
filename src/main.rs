@@ -10,6 +10,7 @@
 //!               [--issuer URL --audience AUD] [--key-audience URL]...
 //!               [--server-key FILE [--generate-server-key]] [--trusted-proxy CIDR]...
 //!               [--sessions-file FILE] [--service-key FILE] [--peer NAME=URL]...
+//!               [--env test|prod|local]
 //! ```
 //!
 //! One port serves everything (SUPERCONDUCTOR-19, -11): an upgrade on any path (`/`,
@@ -41,6 +42,14 @@
 //! `auth.*` (`login`, `whoami`, `providers`, …) is mounted, so `synapse _login`
 //! works against the service.
 //!
+//! **The env.** `--env` (`AGENTS_ENV`): `test`, `prod` or `local` (the default).
+//! Only `test` — and never on `agents.menger.sh` — offers the people page: an admin
+//! (on the sign-in cookie) lists the users this service knows, acts as any of them
+//! (`people.act_as`), makes a test user `oidc:test/<name>` with `user@*`
+//! (`people.create_user`, kept in the db's `people_grants`), and returns
+//! (`people.unbecome`). Elsewhere `people.*` doesn't exist. See
+//! `plexus_agents::people`.
+//!
 //! `--public-url` is where people and hosts reach this service: `https://host` or
 //! `wss://host/ws`, the same origin either way. `--trusted-proxy` names the proxy
 //! in front (a CIDR, or `none`): its `X-Forwarded-For` is believed.
@@ -69,7 +78,7 @@
 //! Every flag can come from the environment instead: `AGENTS_DB`, `AGENTS_PORT`,
 //! `AGENTS_BIND`, `AGENTS_PUBLIC_URL`, `AGENTS_SERVER_KEY`, `AGENTS_NO_LOCAL=1`,
 //! `AGENTS_WORKOS_CLIENT`, `AGENTS_WORKOS_API_KEY_FILE`, `AGENTS_IDENTITY`,
-//! `AGENTS_SESSIONS_FILE`, `AGENTS_UI_DB`, and the lists `AGENTS_ADMINS`,
+//! `AGENTS_SESSIONS_FILE`, `AGENTS_UI_DB`, `AGENTS_ENV`, and the lists `AGENTS_ADMINS`,
 //! `AGENTS_TRUSTED_PROXIES`, `AGENTS_PLACEMENTS`, `AGENTS_KEY_AUDIENCES`,
 //! `AGENTS_ALLOW`, `AGENTS_UI_SIGNERS` (comma-separated). A flag wins.
 //!
@@ -175,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
     let mut ui_signers = env_list("AGENTS_UI_SIGNERS");
     let mut allow = env_list("AGENTS_ALLOW");
     let mut grace = None;
+    let mut env_name = env("AGENTS_ENV");
     // A list flag given replaces the environment's list.
     let mut replaced = std::collections::HashSet::new();
     let mut it = std::env::args().skip(1);
@@ -212,6 +222,7 @@ async fn main() -> anyhow::Result<()> {
             "--ui-signer" => list(&mut ui_signers, value()?, "ui-signer"),
             "--allow" => list(&mut allow, value()?, "allow"),
             "--park-grace" => grace = Some(value()?),
+            "--env" => env_name = Some(value()?),
             "--print-key" => {
                 println!(
                     "{}",
@@ -243,6 +254,11 @@ async fn main() -> anyhow::Result<()> {
         .as_deref()
         .map_or(format!("ws://{bind}:{port}"), front::socket_url);
     let db: std::path::PathBuf = db.context("--db is required")?.into();
+    let deploy_env: plexus_agents::people::Environment = env_name
+        .as_deref()
+        .map_or(Ok(Default::default()), str::parse)
+        .map_err(|e: String| anyhow!("--env (AGENTS_ENV): {e}"))?;
+    eprintln!("plexus-agents: env {deploy_env}");
     let sign_in = SignInConfig {
         public_url: origin,
         workos_client,
@@ -255,6 +271,17 @@ async fn main() -> anyhow::Result<()> {
         sessions_file: Some(sessions_file.unwrap_or_else(|| db.with_extension("sessions"))),
         loopback: bind.is_loopback(),
         allow,
+        env: deploy_env,
+        prod_hosts: None,
+        grants: grants.clone(),
+        // The people page's grants live in the agents db, test only.
+        people_grants: match deploy_env {
+            plexus_agents::people::Environment::Test => Some(
+                plexus_agents::people::GrantStore::open(&db)
+                    .map_err(|e| anyhow!("the people grants in {}: {e}", db.display()))?,
+            ),
+            _ => None,
+        },
     };
     let login = front::sign_in(&sign_in, port)?;
     eprintln!(
@@ -321,7 +348,7 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("plexus-agents: on {bind}:{port}, recovered {recovery:?}");
     let backend = login.backend();
     let ui = UiActivation::new(store.clone(), signers);
-    let hub = service::hub_with_ui(
+    let hub = service::hub_with_people(
         runtime,
         harnesses,
         grants,
@@ -329,6 +356,8 @@ async fn main() -> anyhow::Result<()> {
         hosts.clone(),
         backend,
         Some(ui),
+        login.people.clone(),
+        login.people_grants.clone(),
     );
     let serving = service::Serving {
         hosts,

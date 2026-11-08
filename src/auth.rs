@@ -184,7 +184,13 @@ impl std::str::FromStr for Grant {
 /// Configured memberships, and the [`OWNER`] scope of every caller who isn't a key.
 /// A key is a service, and has nothing here until a peer grants it: a valid proof
 /// shows who's calling and admits it to nothing.
-pub struct Members(Vec<Membership>, Option<Arc<crate::hosts::HostStore>>);
+pub struct Members(
+    Vec<Membership>,
+    Option<Arc<crate::hosts::HostStore>>,
+    /// Grants written on the people page (test only, [`crate::people`]), read
+    /// on every call.
+    Option<Arc<crate::people::GrantStore>>,
+);
 
 impl Members {
     pub fn new(grants: impl IntoIterator<Item = Grant>) -> Self {
@@ -193,7 +199,7 @@ impl Members {
             role: RoleName::new(&g.role),
             scope: g.scope,
         });
-        Self(held.collect(), None)
+        Self(held.collect(), None, None)
     }
 }
 
@@ -205,6 +211,9 @@ impl Memberships for Members {
             .filter(|m| m.principal == *who)
             .cloned()
             .collect();
+        if let Some(people) = &self.2 {
+            held.extend(people.held(who));
+        }
         let id = who.to_string();
         if !held.is_empty() || !is_service(&id) {
             held.push(Membership {
@@ -313,10 +322,12 @@ pub fn auth_setup(
     peers: Vec<String>,
     grants: impl IntoIterator<Item = Grant>,
     hosts: Option<Arc<crate::hosts::HostStore>>,
+    people: Option<Arc<crate::people::GrantStore>>,
     backend: Arc<dyn plexus_rpc::core::plexus::AuthBackend>,
 ) -> plexus_rpc::core::plexus::AuthSetup {
     let mut members = Members::new(grants);
     members.1 = hosts.clone();
+    members.2 = people;
     plexus_rpc::core::plexus::AuthSetup::new(
         backend,
         Arc::new(AgentsRoles {
@@ -337,7 +348,7 @@ pub fn gate(
     peers: Vec<String>,
     grants: impl IntoIterator<Item = Grant>,
 ) -> Gate {
-    gate_with_hosts(runtime, peers, grants, None)
+    gate_with_hosts(runtime, peers, grants, None, None)
 }
 
 /// [`gate`], with the hosts that dialed in (SUPERCONDUCTOR-15) in its memberships
@@ -347,9 +358,11 @@ pub fn gate_with_hosts(
     peers: Vec<String>,
     grants: impl IntoIterator<Item = Grant>,
     hosts: Option<Arc<crate::hosts::HostStore>>,
+    people: Option<Arc<crate::people::GrantStore>>,
 ) -> Gate {
     let mut members = Members::new(grants);
     members.1 = hosts.clone();
+    members.2 = people;
     Gate::new(
         Arc::new(members),
         Arc::new(AgentsRoles {

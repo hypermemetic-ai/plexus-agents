@@ -2,6 +2,7 @@
   "#/": "sc-frame",
   "#/pair": "sc-frame",
   "#/pair/:id": "sc-frame",
+  "#/people": "sc-frame",
   "#/h/:host": "sc-frame",
   "#/h/:host/new": "sc-frame",
   "#/h/:host/t/:thread": "sc-frame"

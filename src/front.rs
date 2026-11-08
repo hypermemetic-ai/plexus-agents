@@ -36,6 +36,7 @@ use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use futures::{SinkExt, StreamExt};
+use crate::people::{AgentsAccess, Environment, GrantStore};
 use plexus_login::simple::SimpleAccess;
 use plexus_login::{Allow, Branding, LoginOptions, Wired, Wiring};
 use plexus_rpc::core::plexus::{DynamicHub, SessionValidator};
@@ -86,6 +87,17 @@ pub struct SignInConfig {
     /// `principal:<principal>`, each one or several comma-separated. None: everyone
     /// gets a session, which WorkOS on a public URL refuses to start with.
     pub allow: Vec<String>,
+    /// `--env`/`AGENTS_ENV`: only `test` offers the people page (an admin acts as
+    /// anyone, [`crate::people`]), and never on [`crate::people::PROD_HOSTS`].
+    pub env: Environment,
+    /// Hosts acting is refused on whatever `env` says; default
+    /// [`crate::people::PROD_HOSTS`].
+    pub prod_hosts: Option<Vec<String>>,
+    /// Every configured grant (`--grant`, `--admin` as `admin@*`): who is admin, and
+    /// who the people page lists.
+    pub grants: Vec<crate::auth::Grant>,
+    /// Where a created user's grants are kept (the agents db); none, none made.
+    pub people_grants: Option<Arc<GrantStore>>,
 }
 
 /// `https://host`, `wss://host/ws` or `ws://127.0.0.1:4470` as the page's origin:
@@ -126,13 +138,18 @@ pub fn loopback_origin(origin: &str) -> bool {
 
 /// Sign-in, wired: the session gate, the `auth` backend, the page's routes.
 pub struct Login {
-    pub wired: Wired<SimpleAccess>,
+    pub wired: Wired<AgentsAccess>,
     /// The origins whose pages may open the socket.
     pub origins: Vec<String>,
     /// Whether WorkOS sign-in is on.
     pub workos: bool,
     /// Who may have a session (SUPERCONDUCTOR-25): everyone when empty.
     pub allow: Allow,
+    /// Test only: plexus-login's `people.*` — an admin acts as any user, or makes
+    /// one — to register on the hub. None anywhere else: the methods don't exist.
+    pub people: Option<plexus_login::acting::PeopleActivation>,
+    /// The store a created user's grants are kept in, for the gate.
+    pub people_grants: Option<Arc<GrantStore>>,
 }
 
 impl Login {
@@ -219,8 +236,33 @@ pub fn sign_in(config: &SignInConfig, port: u16) -> anyhow::Result<Login> {
     opts.sessions_file = config.sessions_file.clone();
     opts.shell_loopback = config.loopback;
     let wiring = Wiring::new(opts)?;
-    let access = SimpleAccess::new(wiring.sessions(), &config.admins)?;
+    let simple = SimpleAccess::new(wiring.sessions(), &config.admins)?;
+    let mut configured = config.grants.clone();
+    for a in &config.admins {
+        if let Ok(g) = format!("{a}=admin@*").parse::<crate::auth::Grant>() {
+            if !configured.contains(&g) {
+                configured.push(g);
+            }
+        }
+    }
+    let access = AgentsAccess::new(simple, configured, config.people_grants.clone());
     let wired = wiring.finish(access, None)?;
+    let prod_hosts = config
+        .prod_hosts
+        .clone()
+        .unwrap_or_else(|| crate::people::PROD_HOSTS.iter().map(|h| h.to_string()).collect());
+    let people = match wired.acting(config.env, &prod_hosts) {
+        Ok(p) if config.people_grants.is_some() => Some(p),
+        Ok(_) => {
+            eprintln!("plexus-agents: --env test, but no grant store: the people page is off");
+            None
+        }
+        Err(plexus_login::acting::NotEnabled::NotTest(_)) => None,
+        Err(why) => {
+            eprintln!("plexus-agents: the people page is off: {why}");
+            None
+        }
+    };
     let mut origins = wired.origins.clone();
     if let Some(o) = origin {
         if !origins.contains(&o) {
@@ -232,6 +274,8 @@ pub fn sign_in(config: &SignInConfig, port: u16) -> anyhow::Result<Login> {
         origins,
         workos,
         allow,
+        people,
+        people_grants: config.people_grants.clone(),
     })
 }
 

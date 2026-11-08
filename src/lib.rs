@@ -12,6 +12,7 @@ mod local;
 pub mod mode;
 pub mod on;
 pub mod pairing;
+pub mod people;
 pub mod peer;
 pub mod permissions;
 pub mod record;
