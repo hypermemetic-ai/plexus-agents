@@ -4,13 +4,16 @@
 
 pub mod auth;
 pub mod claude;
+pub mod folders;
 pub mod front;
 pub mod host;
 pub mod hosts;
 mod local;
+pub mod mode;
 pub mod on;
 pub mod pairing;
 pub mod peer;
+pub mod permissions;
 pub mod record;
 pub mod runner;
 pub mod runtime;

@@ -331,7 +331,9 @@ impl InputResponder for Responder {
                     t.stop.get_or_insert(StopCause::DenyAndStop);
                 }
             }
-            let frame = frames::control_response(&native, &request.raw["request"], &answer);
+            let updates = crate::permissions::take(&request.id);
+            let frame =
+                frames::control_response(&native, &request.raw["request"], &answer, updates);
             shared.write(&frame).await.map_err(|e| e.to_string())?;
             let outcome = answer.outcome();
             let who = Attribution {
@@ -380,7 +382,9 @@ fn on_init(shared: &Shared, frame: Frame) -> Option<(FailureKind, String, RawFra
         }
     }
     let mode = f["permissionMode"].as_str().map(str::to_string);
-    if mode.as_deref() == Some("bypassPermissions") {
+    // Only a thread put in bypass may run in it: the CLI must not get there alone.
+    let asked = crate::mode::mode_of(&shared.spec);
+    if mode.as_deref() == Some("bypassPermissions") && !asked.is_bypass() {
         let detail = "the CLI reports bypassed permissions; refusing to drive it".to_string();
         return Some((FailureKind::Protocol, detail, raw));
     }

@@ -24,11 +24,32 @@
 //! Killing the process kills whatever else it was doing. Tools it had allowed run
 //! one at a time around a request, so none is in flight then, but a subagent or a
 //! background task is lost with it, and the agent has to start that again.
+//!
+//! ## A grace period first
+//!
+//! With [`Supervisor::set_park_grace`] above zero, a request first waits with the
+//! process alive, `live`: an answer in that time goes straight to the process, as on
+//! a thread that doesn't park, with no resume and no runtime message. When the grace
+//! runs out with the request still undecided, its row (and every other undecided one
+//! of that run) is rerouted `parked`, with an `input.rerouted` event, in the same
+//! transaction an answer would have to win, and only then is the process killed.
+//! So an answer is either live and delivered, or parked and resumed, never both.
+//!
+//! ## Permission modes
+//!
+//! A thread's mode ([`crate::mode`]) is in its spec, so every process it starts
+//! takes it. [`Supervisor::set_mode`] changes the spec, and the next prompt to a
+//! process started in the old mode restarts it (stop, then resume) when no turn is
+//! open; a prompt that would queue behind a running turn goes to it as it is. Each
+//! change is in the log as `native` `permission_mode/<mode>`, its raw frame saying
+//! who and from what.
 
 use super::store::{EventLog, Store, StoreError, Tx};
 use super::{GlobalSeq, ReadFilter, StoredEvent, ThreadId};
+use crate::mode::{mode_of, PermissionMode};
 use futures::future::{BoxFuture, FutureExt};
 use futures::stream::{BoxStream, StreamExt};
+use plexus_harness::RawFrame;
 use plexus_harness::{
     now_ms, resume_or_restart, retry_answer, same_call, Actor, AgentEvent, AgentEventKind,
     Attribution, CancelReason, Environment, EventSeq, Harness, InputAnswer, InputError,
@@ -43,6 +64,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -165,6 +187,8 @@ pub struct ThreadView {
     /// When its newest event happened, Unix milliseconds. Kept as it advances.
     #[serde(default)]
     pub last_activity: Option<u64>,
+    /// The permission mode its next process starts in.
+    pub mode: PermissionMode,
 }
 
 /// What a restart found.
@@ -284,6 +308,15 @@ struct Inner {
     live: Mutex<HashMap<ThreadId, Arc<dyn Run>>>,
     /// One at a time per thread, for whatever starts or feeds a process.
     gates: Mutex<HashMap<ThreadId, Arc<tokio::sync::Mutex<()>>>>,
+    /// How long a request waits with its process alive before a parking thread
+    /// parks. Zero parks at once.
+    park_grace: Mutex<Duration>,
+    /// The mode each live process was started in, or was told to switch to.
+    live_modes: Mutex<HashMap<ThreadId, PermissionMode>>,
+    /// The folders a thread may start in: see [`crate::folders`].
+    roots: RwLock<Vec<PathBuf>>,
+    /// Whether this host's owner may choose `bypassPermissions`: `--allow-bypass`.
+    allow_bypass: AtomicBool,
 }
 
 /// See the module docs. Cheap to clone.
@@ -320,6 +353,17 @@ impl Tx<'_> {
         who: Attribution,
         kind: AgentEventKind,
     ) -> Result<GlobalSeq, StoreError> {
+        self.run_event_raw(thread, run, who, kind, None)
+    }
+
+    fn run_event_raw(
+        &mut self,
+        thread: &ThreadId,
+        run: &RunId,
+        who: Attribution,
+        kind: AgentEventKind,
+        raw: Option<RawFrame>,
+    ) -> Result<GlobalSeq, StoreError> {
         let n: i64 = self.sql.query_row(
             "SELECT COUNT(*) FROM events WHERE thread = ? AND run = ?",
             params![thread.as_str(), run.as_str()],
@@ -331,7 +375,7 @@ impl Tx<'_> {
             in_turn: who.turn,
             agent: who.agent,
             kind,
-            raw: None,
+            raw,
         };
         let seq = self.append(thread, run, &event)?;
         self.effects(thread, run, &event, &HashMap::new(), None)?;
@@ -397,6 +441,46 @@ impl Tx<'_> {
             "UPDATE threads SET status = ? WHERE id = ?",
             params![status.as_str(), thread.as_str()],
         )?;
+        Ok(())
+    }
+
+    fn set_spec(&self, thread: &ThreadId, spec: &RunSpec) -> Result<(), StoreError> {
+        self.sql.execute(
+            "UPDATE threads SET spec = ? WHERE id = ?",
+            params![serde_json::to_string(spec)?, thread.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// `native` `permission_mode/<mode>`, on the thread's latest run. A thread that
+    /// has had no run says its mode in `session.started` when it gets one.
+    fn mode_event(
+        &mut self,
+        thread: &ThreadId,
+        mode: PermissionMode,
+        previous: PermissionMode,
+        by: Option<&Actor>,
+        via: &str,
+    ) -> Result<(), StoreError> {
+        let run: Option<String> = self
+            .sql
+            .query_row(
+                "SELECT id FROM runs WHERE thread = ? ORDER BY started_ms DESC, rowid DESC LIMIT 1",
+                [thread.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(run) = run else {
+            return Ok(());
+        };
+        let raw = serde_json::json!({
+            "type": "permission_mode", "mode": mode, "previous": previous, "by": by, "via": via,
+        });
+        let kind = AgentEventKind::Native {
+            name: format!("permission_mode/{mode}"),
+        };
+        let raw = Some(RawFrame::new(raw.to_string()));
+        self.run_event_raw(thread, &RunId::new(run), Attribution::default(), kind, raw)?;
         Ok(())
     }
 
@@ -575,6 +659,90 @@ impl Inner {
             .clone()
     }
 
+    fn park_grace(&self) -> Duration {
+        *self.park_grace.lock().expect("park_grace poisoned")
+    }
+
+    /// Whether `thread`'s process was started in a mode other than its spec's.
+    fn stale_mode(&self, thread: &ThreadId, spec: &RunSpec) -> bool {
+        let live = self.live_modes.lock().expect("live_modes poisoned");
+        live.get(thread).is_some_and(|m| *m != mode_of(spec))
+    }
+
+    /// Reroutes `run`'s undecided live requests to `parked`, each with its event, and
+    /// says which. With `only_if`, nothing moves unless that one is still undecided
+    /// and live: its grace is what ran out.
+    fn reroute_parked(
+        &self,
+        thread: &ThreadId,
+        run: &RunId,
+        only_if: Option<&InputRequestId>,
+    ) -> Result<Vec<InputRequestId>, StoreError> {
+        self.store.tx(|tx| {
+            let ids: Vec<String> = {
+                let mut q = tx.sql.prepare(
+                    "SELECT id FROM inputs WHERE thread = ? AND run = ? AND delivery = ? ORDER BY rowid",
+                )?;
+                let rows = q
+                    .query_map(
+                        params![thread.as_str(), run.as_str(), Delivery::Pending.as_str()],
+                        |r| r.get(0),
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let mut live = Vec::new();
+            for id in ids {
+                let id = InputRequestId::new(id);
+                if let Some((r, ..)) = tx.input(&id)? {
+                    if r.route == InputRoute::Live && ParkedCall::of(&r).is_some() {
+                        live.push(r);
+                    }
+                }
+            }
+            if only_if.is_some_and(|w| !live.iter().any(|r| r.id == *w)) {
+                return Ok(Vec::new());
+            }
+            let mut moved = Vec::new();
+            for mut r in live {
+                r.route = InputRoute::Parked;
+                tx.set_input(&r.id, Some(&r), Delivery::Pending)?;
+                let who = Attribution {
+                    turn: Some(r.turn),
+                    agent: r.agent.clone(),
+                };
+                let kind = AgentEventKind::InputRerouted {
+                    id: r.id.clone(),
+                    route: InputRoute::Parked,
+                };
+                tx.run_event(thread, run, who, kind)?;
+                moved.push(r.id);
+            }
+            Ok(moved)
+        })
+    }
+
+    /// `id`'s grace ran out: if it's still undecided on the live `run`, park.
+    async fn park_late(
+        self: &Arc<Self>,
+        thread: &ThreadId,
+        run: &Arc<dyn Run>,
+        id: &InputRequestId,
+    ) -> Result<(), RuntimeError> {
+        let run_id = run.info().run;
+        let current = self
+            .live_run(thread)
+            .is_some_and(|r| r.info().run == run_id);
+        if !current || run.parked().is_some() {
+            return Ok(());
+        }
+        let moved = self.reroute_parked(thread, &run_id, Some(id))?;
+        if !moved.is_empty() {
+            run.park().await?;
+        }
+        Ok(())
+    }
+
     fn live_run(&self, thread: &ThreadId) -> Option<Arc<dyn Run>> {
         self.live
             .lock()
@@ -739,6 +907,12 @@ impl Inner {
             .lock()
             .expect("live poisoned")
             .insert(thread.clone(), run.clone());
+        // Under the thread's gate, so this is the spec the process was planned from.
+        let mode = mode_of(&self.thread(thread)?.spec);
+        self.live_modes
+            .lock()
+            .expect("live_modes poisoned")
+            .insert(thread.clone(), mode);
         let inner = self.clone();
         let thread = thread.clone();
         tokio::spawn(async move { inner.pump(thread, run).await });
@@ -778,8 +952,12 @@ impl Inner {
         let mut requests = HashMap::new();
         let mut retries = Vec::new();
         let mut park_now = false;
+        let mut waiting = Vec::new();
+        let grace = self.park_grace();
         if let (true, Some(q)) = (asked, run.inputs()) {
             let parks = self.thread(thread)?.spec.park;
+            // A request that comes while the process is going parks with it.
+            let at_once = grace.is_zero() || run.parked().is_some();
             let mut pool = self.retry_pool(thread)?;
             for e in &batch {
                 let AgentEventKind::InputRequested { id } = &e.kind else {
@@ -791,10 +969,15 @@ impl Inner {
                 if let Some(taken) = take_retry(&mut pool, &r) {
                     retries.push((r.clone(), taken));
                 } else if parks && ParkedCall::of(&r).is_some() {
-                    // In the row before anyone can see it, so an answer that beats
-                    // the kill waits for the resume.
-                    r.route = InputRoute::Parked;
-                    park_now = true;
+                    if at_once {
+                        // In the row before anyone can see it, so an answer that
+                        // beats the kill waits for the resume.
+                        r.route = InputRoute::Parked;
+                        park_now = true;
+                    } else {
+                        // Live for now: see "A grace period first".
+                        waiting.push(id.clone());
+                    }
                 }
                 requests.insert(id.clone(), r);
             }
@@ -823,17 +1006,30 @@ impl Inner {
         if park_now {
             run.park().await?;
         }
+        for id in waiting {
+            let (inner, thread, run) = (self.clone(), thread.clone(), run.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(grace).await;
+                if let Err(e) = inner.park_late(&thread, &run, &id).await {
+                    eprintln!("runtime: thread {thread}: parking after the grace: {e}");
+                }
+            });
+        }
         let ended = batch.iter().find_map(|e| match &e.kind {
             AgentEventKind::RunEnded { reason, .. } => Some(*reason),
             _ => None,
         });
         if let Some(reason) = ended {
             self.live.lock().expect("live poisoned").remove(thread);
+            self.live_modes
+                .lock()
+                .expect("live_modes poisoned")
+                .remove(thread);
             if reason == RunEndReason::Parked {
                 let inner = self.clone();
                 let thread = thread.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = inner.after_park(&thread).await {
+                    if let Err(e) = inner.after_park(&thread, &id).await {
                         eprintln!("runtime: thread {thread}: {e}");
                     }
                 });
@@ -875,8 +1071,14 @@ impl Inner {
         Ok(())
     }
 
-    /// After a park: an answer may have come while the process was going.
-    async fn after_park(self: &Arc<Self>, thread: &ThreadId) -> Result<(), RuntimeError> {
+    /// After a park: an answer may have come while the process was going, and a
+    /// request may have come live after the reroute and before the kill.
+    async fn after_park(
+        self: &Arc<Self>,
+        thread: &ThreadId,
+        run: &RunId,
+    ) -> Result<(), RuntimeError> {
+        self.reroute_parked(thread, run, None)?;
         self.try_apply(thread).await
     }
 
@@ -1127,7 +1329,12 @@ impl Inner {
         let park = harness
             .park()
             .ok_or_else(|| RuntimeError::Start("this harness can't park".into()))?;
-        let u = park.plan_unpark(parked, answers).map_err(|e| fail(&e))?;
+        // The thread's mode and rules now, not the parked process's.
+        let mut parked = parked.clone();
+        let row = self.thread(thread)?;
+        parked.spec.env = row.spec.env;
+        parked.spec.tools = row.spec.tools;
+        let u = park.plan_unpark(&parked, answers).map_err(|e| fail(&e))?;
         let env = self.env_of(thread);
         let process = env.spawn(u.plan).await.map_err(|e| fail(&e))?;
         let run = harness.drive(u.spec, process).await.map_err(|e| fail(&e))?;
@@ -1335,6 +1542,18 @@ impl Inner {
     }
 
     /// Turns a run started and never ended.
+    /// Waits for the pump to take `run` out of the live map, after its process
+    /// ended: until then a new process for the thread would be taken out with it.
+    async fn wait_gone(&self, thread: &ThreadId, run: &RunId) -> Result<(), RuntimeError> {
+        let gone = tokio::time::timeout(Duration::from_secs(30), async {
+            while self.live_run(thread).is_some_and(|r| r.info().run == *run) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        gone.map_err(|_| RuntimeError::Start("the old process didn't end".into()))
+    }
+
     fn open_turns(&self, run: &RunId) -> Result<Vec<TurnId>, StoreError> {
         let bodies = self.store.with(|c| {
             let mut q = c.prepare(
@@ -1494,6 +1713,10 @@ impl Supervisor {
                 .collect(),
             live: Mutex::default(),
             gates: Mutex::default(),
+            park_grace: Mutex::new(Duration::ZERO),
+            live_modes: Mutex::default(),
+            roots: RwLock::new(crate::folders::default_roots()),
+            allow_bypass: AtomicBool::new(false),
         });
         let report = inner.recover().await?;
         Ok((Self { inner }, report))
@@ -1621,8 +1844,15 @@ impl Supervisor {
             });
         }
         if let Some(run) = self.inner.live_run(thread) {
-            return Ok(run.send(input).await?);
+            let idle = self.inner.open_turns(&run.info().run)?.is_empty();
+            if !(idle && self.inner.stale_mode(thread, &row.spec)) {
+                return Ok(run.send(input).await?);
+            }
+            // Started in another mode, and between turns: start again in this one.
+            run.stop(StopMode::Graceful).await?;
+            self.inner.wait_gone(thread, &run.info().run).await?;
         }
+        let row = self.inner.thread(thread)?;
         // A prompt supersedes a parked call whose outcome is unknown: the agent
         // drops it (AGENTS-33 `h_prompt_undecided`).
         let input = match &row.note {
@@ -1837,6 +2067,7 @@ impl Supervisor {
             Ok((runs as u64, GlobalSeq(seq as u64)))
         })?;
         let home = self.home(id).unwrap_or_default();
+        let mode = mode_of(&row.spec);
         Ok(ThreadView {
             id: id.clone(),
             harness: row.harness,
@@ -1852,6 +2083,7 @@ impl Supervisor {
             last_seq,
             title: row.title,
             last_activity: row.last_ms.map(|ms| ms as u64),
+            mode,
         })
     }
 
@@ -1872,5 +2104,198 @@ impl Supervisor {
     /// Whether any process is running on `thread`.
     pub fn is_live(&self, thread: &ThreadId) -> bool {
         self.inner.live_run(thread).is_some()
+    }
+
+    /// How long a request on a parking thread waits with its process alive before
+    /// the thread parks. Zero, the default, parks at once.
+    pub fn set_park_grace(&self, grace: Duration) {
+        *self.inner.park_grace.lock().expect("park_grace poisoned") = grace;
+    }
+
+    /// Whether a host's owner may put threads in `bypassPermissions` here
+    /// (`plexus-agents host --allow-bypass`). Off unless set.
+    pub fn set_allow_bypass(&self, allow: bool) {
+        self.inner.allow_bypass.store(allow, AtomicOrdering::SeqCst);
+    }
+
+    /// See [`Supervisor::set_allow_bypass`].
+    pub fn allows_bypass(&self) -> bool {
+        self.inner.allow_bypass.load(AtomicOrdering::SeqCst)
+    }
+
+    /// The folders threads may start in, each resolved; ones that don't resolve to
+    /// a directory are dropped. Empty is the user's home.
+    pub fn set_roots(&self, roots: Vec<PathBuf>) {
+        let roots = if roots.is_empty() {
+            crate::folders::default_roots()
+        } else {
+            roots
+        };
+        *self.inner.roots.write().expect("roots poisoned") = roots;
+    }
+
+    /// The roots, resolved.
+    pub fn roots(&self) -> Vec<PathBuf> {
+        let roots = self.inner.roots.read().expect("roots poisoned").clone();
+        crate::folders::resolve_roots(&roots)
+    }
+
+    /// The working directories of the newest threads, newest first, each once.
+    pub fn recent_cwds(&self, limit: usize) -> Result<Vec<String>, RuntimeError> {
+        let rows = self.inner.store.with(|c| {
+            let mut q = c.prepare(
+                "SELECT cwd FROM threads WHERE cwd IS NOT NULL
+                 GROUP BY cwd ORDER BY MAX(created_ms) DESC LIMIT ?",
+            )?;
+            let rows = q
+                .query_map([limit as i64], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })?;
+        Ok(rows)
+    }
+
+    /// See [`crate::folders::list`]: the roots, their projects, and recent folders.
+    pub fn folders(
+        &self,
+        under: Option<&std::path::Path>,
+    ) -> Result<Vec<crate::folders::Folder>, String> {
+        let recent = self
+            .recent_cwds(crate::folders::MAX_RECENT * 2)
+            .map_err(|e| e.to_string())?;
+        crate::folders::list(&self.roots(), &recent, under)
+    }
+
+    /// Sets `thread`'s permission mode for its next process: see the module docs.
+    /// Whoever calls this has decided `by` may choose `mode`, `bypassPermissions`
+    /// included ([`crate::mode::may_bypass`]).
+    pub async fn set_mode(
+        &self,
+        thread: &ThreadId,
+        mode: PermissionMode,
+        by: Option<Actor>,
+    ) -> Result<ThreadView, RuntimeError> {
+        let gate = self.inner.gate(thread);
+        let _held = gate.lock().await;
+        let row = self.inner.thread(thread)?;
+        let previous = mode_of(&row.spec);
+        if previous != mode {
+            let mut spec = row.spec;
+            crate::mode::set_mode(&mut spec, mode);
+            self.inner.store.tx(|tx| {
+                tx.set_spec(thread, &spec)?;
+                tx.mode_event(thread, mode, previous, by.as_ref(), "set_mode")
+            })?;
+            log_mode(thread, mode, previous, by.as_ref());
+        }
+        drop(_held);
+        self.thread(thread)
+    }
+
+    /// [`Supervisor::answer_as`], allowing and applying the request's own rule
+    /// suggestions at `apply` ([`crate::permissions`]). The rules join the thread's,
+    /// so the processes after this one have them too; a live process gets them with
+    /// the answer. `may_bypass` is whether this caller is one who may put the thread
+    /// in `bypassPermissions` ([`crate::mode::may_bypass`]), which a suggestion could
+    /// ask for; it also takes this host's [`Supervisor::set_allow_bypass`].
+    pub async fn answer_applying(
+        &self,
+        thread: &ThreadId,
+        id: &InputRequestId,
+        answer: InputAnswer,
+        actor: Actor,
+        apply: &[u32],
+        may_bypass: bool,
+    ) -> Result<InputRequest, InputError> {
+        if apply.is_empty() {
+            return self.answer_as(thread, id, answer, actor).await;
+        }
+        let mismatch = |detail: String| InputError::AnswerMismatch {
+            id: id.clone(),
+            detail,
+        };
+        if !matches!(answer, InputAnswer::Allow { .. }) {
+            return Err(mismatch("only an allow applies suggestions".into()));
+        }
+        let delivery = |e: &dyn fmt::Display| InputError::Delivery {
+            id: id.clone(),
+            detail: e.to_string(),
+        };
+        let records = self.inner.records(thread).map_err(|e| delivery(&e))?;
+        let record = records
+            .into_iter()
+            .find(|r| r.request.id == *id)
+            .ok_or_else(|| InputError::NotFound(id.clone()))?;
+        if !record.request.state.is_pending() {
+            return Err(InputError::AlreadyResolved {
+                id: id.clone(),
+                state: Box::new(record.request.state),
+            });
+        }
+        let updates = crate::permissions::pick(&record.request, apply).map_err(mismatch)?;
+        let rules = crate::permissions::thread_rules(&updates);
+        if rules.mode.is_some_and(PermissionMode::is_bypass) {
+            if !may_bypass {
+                return Err(mismatch(crate::mode::bypass_refused()));
+            }
+            if !self.allows_bypass() {
+                return Err(mismatch(crate::mode::bypass_off()));
+            }
+        }
+        let row = self.inner.thread(thread).map_err(|e| delivery(&e))?;
+        let previous = mode_of(&row.spec);
+        let mut spec = row.spec;
+        for r in rules.allow {
+            if !spec.tools.preapproved.contains(&r) {
+                spec.tools.preapproved.push(r);
+            }
+        }
+        for r in rules.deny {
+            if !spec.tools.denied.contains(&r) {
+                spec.tools.denied.push(r);
+            }
+        }
+        let mode = rules.mode.unwrap_or(previous);
+        crate::mode::set_mode(&mut spec, mode);
+        self.inner
+            .store
+            .tx(|tx| {
+                tx.set_spec(thread, &spec)?;
+                if mode != previous {
+                    tx.mode_event(thread, mode, previous, Some(&actor), "suggestion")?;
+                }
+                Ok(())
+            })
+            .map_err(|e| delivery(&e))?;
+        if mode != previous {
+            log_mode(thread, mode, previous, Some(&actor));
+        }
+        let live = record.request.route == InputRoute::Live;
+        if live {
+            crate::permissions::stash(id, updates);
+            if rules.mode.is_some() {
+                // The process switches with the answer, so it needn't start again.
+                let mut g = self.inner.live_modes.lock().expect("live_modes poisoned");
+                if let Some(m) = g.get_mut(thread) {
+                    *m = mode;
+                }
+            }
+        }
+        let answered = self.answer_as(thread, id, answer, actor).await;
+        if live {
+            // Delivered or not, it's no one's now.
+            crate::permissions::take(id);
+        }
+        answered
+    }
+}
+
+/// Every mode change goes to the service's log; a bypass says so loudly.
+fn log_mode(thread: &ThreadId, mode: PermissionMode, previous: PermissionMode, by: Option<&Actor>) {
+    let who = by.map_or("nobody verified", |a| a.id.as_str());
+    if mode.is_bypass() {
+        eprintln!("runtime: thread {thread}: permission mode {previous} -> {mode} by {who}: PERMISSION CHECKS BYPASSED");
+    } else {
+        eprintln!("runtime: thread {thread}: permission mode {previous} -> {mode} by {who}");
     }
 }

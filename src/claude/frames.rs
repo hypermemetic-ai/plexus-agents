@@ -106,17 +106,29 @@ pub fn input_kind(request: &Value) -> InputKind {
 }
 
 /// The `control_response` for `answer`. `request` is the CLI's own `request` body.
-pub fn control_response(native_id: &str, request: &Value, answer: &InputAnswer) -> Value {
+/// `updates`, on an allow, go as `updatedPermissions`: see [`crate::permissions`].
+pub fn control_response(
+    native_id: &str,
+    request: &Value,
+    answer: &InputAnswer,
+    updates: Option<Vec<Value>>,
+) -> Value {
     let success = |body: Value| {
         json!({"type": "control_response", "response": {
             "subtype": "success", "request_id": native_id, "response": body}})
     };
     let input = &request["input"];
     match answer {
-        InputAnswer::Allow { updated_input } => success(json!({
-            "behavior": "allow",
-            "updatedInput": updated_input.as_ref().unwrap_or(input),
-        })),
+        InputAnswer::Allow { updated_input } => {
+            let mut body = json!({
+                "behavior": "allow",
+                "updatedInput": updated_input.as_ref().unwrap_or(input),
+            });
+            if let Some(updates) = updates.filter(|u| !u.is_empty()) {
+                body["updatedPermissions"] = json!(updates);
+            }
+            success(body)
+        }
         InputAnswer::Deny { message, stop_turn } => {
             let mut body = json!({"behavior": "deny", "message": message});
             if *stop_turn {
@@ -221,7 +233,7 @@ mod tests {
             message: "no".into(),
             stop_turn: true,
         };
-        let f = control_response("r1", &json!({}), &answer);
+        let f = control_response("r1", &json!({}), &answer, None);
         assert_eq!(f["response"]["response"]["interrupt"], true);
         assert_eq!(f["response"]["request_id"], "r1");
     }
@@ -231,8 +243,39 @@ mod tests {
         let answer = InputAnswer::Allow {
             updated_input: None,
         };
-        let f = control_response("r", &json!({"input": {"command": "x"}}), &answer);
+        let f = control_response("r", &json!({"input": {"command": "x"}}), &answer, None);
         assert_eq!(f["response"]["response"]["updatedInput"]["command"], "x");
+        assert!(f["response"]["response"]
+            .get("updatedPermissions")
+            .is_none());
+    }
+
+    #[test]
+    fn an_allow_that_applies_suggestions_sends_them_as_updated_permissions() {
+        let answer = InputAnswer::Allow {
+            updated_input: None,
+        };
+        let rule = json!({"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "x *"}],
+                          "behavior": "allow", "destination": "session"});
+        let request = json!({"input": {"command": "x"}});
+        let f = control_response("r", &request, &answer, Some(vec![rule.clone()]));
+        let body = &f["response"]["response"];
+        assert_eq!(body["behavior"], "allow");
+        assert_eq!(body["updatedPermissions"], json!([rule]));
+        // Nothing to apply is no field at all.
+        let f = control_response("r", &request, &answer, Some(vec![]));
+        assert!(f["response"]["response"]
+            .get("updatedPermissions")
+            .is_none());
+        // A deny never carries them.
+        let deny = InputAnswer::Deny {
+            message: "no".into(),
+            stop_turn: false,
+        };
+        let f = control_response("r", &request, &deny, Some(vec![rule]));
+        assert!(f["response"]["response"]
+            .get("updatedPermissions")
+            .is_none());
     }
 
     #[test]
@@ -242,6 +285,7 @@ mod tests {
             "r",
             &json!({"input": {"questions": [{"question": "Which?"}]}}),
             &InputAnswer::Answers { answers },
+            None,
         );
         let updated = &f["response"]["response"]["updatedInput"];
         assert_eq!(updated["answers"]["Which?"], "Blue");
@@ -256,6 +300,7 @@ mod tests {
             &InputAnswer::Refuse {
                 reason: "no".into(),
             },
+            None,
         );
         assert_eq!(f["response"]["subtype"], "error");
     }

@@ -1,17 +1,26 @@
 <!-- SUPERCONDUCTOR-34: `#/h/:host/new`, starting a thread composer-first (after
-     T3 and Claude desktop): the prompt first and large; below it the folder, from
-     the folders this machine's threads already use or any other path; the
-     machine (any of yours, online shown); the model, the one other option
-     hosts.start takes. Start, or Cmd/Ctrl+Enter, lands on the new thread. The
-     folder is remembered per machine in this browser. Main content only. -->
+     T3 and Claude desktop): the prompt first and large; below it the folder, the
+     permission mode, the model. Start, or Cmd/Ctrl+Enter, lands on the new thread.
+     Main content only.
+
+     superconductor-ui/modes: the folder is one field, "Folder path", that both
+     filters the host's folders as you type and takes any path typed in full. The
+     list under it (`hosts.folders`) is the folders recent threads used first, then
+     the projects under the host's roots, a git checkout marked; "Other folder…"
+     clears the field for a path of your own. The last folder is remembered per
+     machine in this browser. The permission mode (sc-modes) is offered when the
+     host says what it allows (`hosts.capabilities`); bypass only where the host
+     was started with --allow-bypass. A host from before modes gets neither, and
+     its folders come from its threads as before. -->
 <script module>
-  export const uses = ["hosts.list", "hosts.threads", "hosts.start"];
+  export const uses = ["hosts.list", "hosts.threads", "hosts.start", "hosts.folders", "hosts.capabilities"];
 </script>
 
 <script>
   import { bus } from "plexus-ui/host";
   import Button from "./sc-button.svelte";
   import Field from "./sc-field.svelte";
+  import Modes from "./sc-modes.svelte";
 
   let { host } = $props();
   const b = bus();
@@ -19,20 +28,24 @@
 
   let hosts = $state([]);
   let info = $state(undefined);
-  let recent = $state([]);
+  let folders = $state([]);        // [{ path, name, recent, git }]
+  let roots = $state([]);
+  let caps = $state(undefined);    // the host's capabilities; null: a host from before modes
   let prompt = $state("");
   let folder = $state("");
-  let other = $state(false);
+  let mode = $state("default");
   let model = $state("");
   let starting = $state(false);
   let said = $state("");
   let field;
+  let pathField = $state(null);
 
   const event = (r, type) => (r.events ?? []).find((e) => e.type === type);
   const failure = (r) => event(r, "failed")?.message ?? (r.ok ? "" : (r.message ?? ""));
   const key = $derived("superconductor.cwd." + host);
   const remembered = (k) => { try { return localStorage.getItem(k) || ""; } catch { return ""; } };
   const base = (p) => (p ?? "").replace(/\/+$/, "").split("/").pop() || p;
+  const home = (p) => (p ?? "").replace(/^\/(Users|home)\/[^/]+/, "~");
   const mac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
 
   async function load() {
@@ -40,20 +53,33 @@
     hosts = event(r, "hosts")?.hosts ?? [];
     info = hosts.find((h) => h.name === host) ?? null;
     if (!info?.online) return;
-    const t = await b.call("hosts.threads", { host });
+    const [t, f, c] = await Promise.all([
+      b.call("hosts.threads", { host }),
+      b.call("hosts.folders", { host }),
+      b.call("hosts.capabilities", { host }),
+    ]);
+    caps = event(c, "capabilities") ?? null;
+    const listed = event(f, "folders");
+    roots = listed?.roots ?? caps?.roots ?? [];
+    // Recent first: this browser's last, the threads' own, then the host's.
     const rows = (event(t, "threads")?.threads ?? []).slice().sort((x, y) => (y.last_seq ?? 0) - (x.last_seq ?? 0));
-    const seen = [];
+    const out = [];
+    const add = (path, extra = {}) => {
+      if (!path) return;
+      const had = out.find((x) => x.path === path);
+      if (had) { Object.assign(had, { git: had.git || !!extra.git }); return; }
+      out.push({ path, name: base(path), recent: false, git: false, ...extra });
+    };
     const last = remembered(key);
-    if (last) seen.push(last);
-    for (const row of rows) if (row.cwd && !seen.includes(row.cwd)) seen.push(row.cwd);
-    recent = seen.slice(0, 6);
-    if (!folder && !other) {
-      if (recent.length) folder = recent[0];
-      else other = true;
-    }
+    if (last) add(last, { recent: true });
+    for (const row of rows) add(row.cwd, { recent: true });
+    for (const x of listed?.folders ?? []) add(x.path, { name: x.name || base(x.path), recent: !!x.recent, git: !!x.git });
+    out.sort((x, y) => Number(y.recent) - Number(x.recent));
+    folders = out;
+    if (!folder && out.length && out[0].recent) folder = out[0].path;
   }
   function fresh() {
-    info = undefined; recent = []; folder = ""; other = false; said = "";
+    info = undefined; folders = []; roots = []; caps = undefined; folder = ""; mode = "default"; said = "";
     load();
   }
   $effect(() => {
@@ -69,6 +95,22 @@
 
   const cwd = $derived(folder.trim());
   const ready = $derived(!!info?.online && !!cwd && !!prompt.trim() && !starting);
+  // Typing filters; a folder picked from the list shows them all again.
+  const query = $derived(folders.some((x) => x.path === cwd) ? "" : cwd.toLowerCase());
+  const shown = $derived(query ? folders.filter((x) => x.path.toLowerCase().includes(query) || x.name.toLowerCase().includes(query)) : folders);
+  const recentShown = $derived(shown.filter((x) => x.recent));
+  const projectsShown = $derived(shown.filter((x) => !x.recent));
+  const where = $derived(roots.length === 1 ? `In ${home(roots[0])}` : "In your project folders");
+  const hasModes = $derived(!!caps?.modes?.length);
+  // Under a root, a folder is said from the root (the group head names it); a
+  // folder only one level down needs nothing past its name.
+  function from(x) {
+    const r = roots.find((r) => x.path === r || x.path.startsWith(r.replace(/\/+$/, "") + "/"));
+    if (!r) return home(x.path);
+    const rel = x.path.slice(r.replace(/\/+$/, "").length + 1);
+    return rel === x.name ? "" : rel;
+  }
+  const typedOwn = $derived(!!cwd && !folders.some((x) => x.path === cwd));
 
   async function start(ev) {
     ev?.preventDefault?.();
@@ -81,6 +123,7 @@
     try { localStorage.setItem(key, cwd); } catch { /* a private window */ }
     const params = { host, cwd, prompt };
     if (model) params.model = model;
+    if (hasModes && mode !== "default") params.mode = mode;
     const r = await b.call("hosts.start", params);
     starting = false;
     const started = event(r, "started");
@@ -93,9 +136,17 @@
     "ctrl+enter": { to: () => start(), label: "Start the thread", in_inputs: true },
     "meta+enter": { to: () => start(), label: "Start the thread", in_inputs: true },
   });
-  function pick(path) { folder = path; other = false; }
-  function pickOther() { other = true; folder = ""; }
+  function pick(path) { folder = path; }
+  function pickOther() { folder = ""; pathField?.focus(); }
 </script>
+
+{#snippet row(x)}
+  <button type="button" class="row" role="radio" aria-checked={cwd === x.path} onclick={() => pick(x.path)} title={x.path}>
+    <span class="name">{x.name}</span>
+    {#if x.git}<span class="git" title="A git checkout"><svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><circle cx="4" cy="3.5" r="1.75"/><circle cx="4" cy="12.5" r="1.75"/><circle cx="12" cy="5.5" r="1.75"/><path d="M4 5.25v5.5M12 7.25c0 2.5-3 2.5-6.5 4"/></svg><span class="sr">git</span></span>{/if}
+    {#if from(x)}<span class="where">{from(x)}</span>{/if}
+  </button>
+{/snippet}
 
 <div class="sc-page">
   <form onsubmit={start}>
@@ -131,24 +182,35 @@
 
     <fieldset class="folders" disabled={!info?.online}>
       <legend>Folder on {host}</legend>
-      {#if recent.length}
-      <div class="chips" role="radiogroup" aria-label="Folder">
-        {#each recent as path (path)}
-          <button type="button" class="chip" role="radio" aria-checked={!other && folder === path} onclick={() => pick(path)} title={path}>
-            <span class="chip-name">{base(path)}</span><span class="chip-path">{path}</span>
+      <Field hint={typedOwn ? `Claude starts in ${cwd} as typed.` : folders.length ? "Type to filter, or type any folder path." : `Type the full path of a folder on ${host}.`}>
+        <input bind:this={pathField} class="path" value={folder} oninput={(e) => (folder = e.currentTarget.value)} placeholder="/Users/you/project" aria-label="Folder path" spellcheck="false" autocapitalize="off" autocomplete="off"/>
+      </Field>
+      {#if folders.length}
+        <div class="list" role="radiogroup" aria-label="Folder">
+          {#if recentShown.length}
+            <p class="group">Recently used</p>
+            {#each recentShown as x (x.path)}{@render row(x)}{/each}
+          {/if}
+          {#if projectsShown.length}
+            <p class="group">{where}</p>
+            {#each projectsShown as x (x.path)}{@render row(x)}{/each}
+          {/if}
+          {#if !shown.length}
+            <p class="none">No folder here matches “{cwd}”. Type its full path to use it anyway.</p>
+          {/if}
+          <button type="button" class="row other" role="radio" aria-checked={false} onclick={pickOther}>
+            <span class="name">Other folder…</span>
           </button>
-        {/each}
-        <button type="button" class="chip" role="radio" aria-checked={other} onclick={pickOther}>
-          <span class="chip-name">Other folder…</span>
-        </button>
-      </div>
-      {/if}
-      {#if other}
-        <Field hint={recent.length ? "" : `Folders you use here show up as choices next time.`}>
-          <input class="path" value={folder} oninput={(e) => (folder = e.currentTarget.value)} placeholder="/Users/you/project" aria-label="Folder path" spellcheck="false" autocapitalize="off" autocomplete="off"/>
-        </Field>
+        </div>
       {/if}
     </fieldset>
+
+    {#if hasModes}
+      <fieldset class="modes" disabled={!info?.online}>
+        <legend>Permissions</legend>
+        <Modes value={mode} onpick={(m) => (mode = m)} bypass={caps?.bypass ?? null} {host} label="Permissions"/>
+      </fieldset>
+    {/if}
 
     <div class="foot">
       <label class="model">Model
@@ -158,7 +220,7 @@
       </label>
       <span class="spacer"></span>
       <span class="hint" aria-hidden="true">{mac ? "⌘ Enter" : "Ctrl Enter"}</span>
-      <Button kind="primary" type="submit" disabled={!info?.online || starting}>{starting ? "Starting…" : "Start thread"}</Button>
+      <Button kind={mode === "bypassPermissions" ? "danger" : "primary"} type="submit" disabled={!info?.online || starting}>{starting ? "Starting…" : mode === "bypassPermissions" ? "Start without permissions" : "Start thread"}</Button>
     </div>
     {#if said}<p class="error" role="alert">{said}</p>{/if}
   </form>
@@ -166,7 +228,7 @@
 
 <style>
   .sc-page { max-width: 760px; padding: var(--s6) var(--s5); }
-  form { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s4); }
+  form { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s5); }
   .head { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--s3); }
   h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -0.01em; }
   .on { color: var(--muted); display: inline-flex; align-items: baseline; gap: var(--s2); }
@@ -180,19 +242,30 @@
   .prompt:focus { outline: none; border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
   .prompt:disabled { background: var(--hover); }
 
-  fieldset { margin: 0; padding: 0; border: 0; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s3); }
+  fieldset { margin: 0; padding: 0; border: 0; min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s2); }
   legend { padding: 0; margin-bottom: var(--s2); font-weight: 500; }
-  .chips { display: flex; flex-wrap: wrap; gap: var(--s2); }
-  .chip { overflow: hidden; display: inline-flex; flex-direction: column; align-items: flex-start; justify-content: center; min-height: 44px; max-width: 100%; padding: var(--s1) var(--s3); text-align: left; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-sm); cursor: pointer; }
-  .chip:hover { background: var(--hover); }
-  .chip[aria-checked=true] { background: var(--sel); border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
-  .chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
-  .chip:disabled { color: var(--disabled); cursor: default; }
-  .chip-name { font-weight: 500; }
-  .chip-name, .chip-path { max-width: 100%; }
-  .chip-path { width: 32ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--font-mono); color: var(--muted); }
   .path { width: 100%; min-height: 44px; padding: 0 var(--s3); font: 15px var(--font-mono); color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: var(--radius-sm); }
   .path:focus { outline: none; border-color: var(--focus); box-shadow: 0 0 0 1px var(--focus); }
+
+  /* The folders: one list, rows on hairlines, scrolled inside past ~8. */
+  .list { display: grid; max-height: 340px; overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--line); border-radius: var(--radius-sm); background: var(--card); }
+  .group { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; position: sticky; top: 0; z-index: 1; padding: var(--s2) var(--s3) var(--s1); font-size: var(--text-small); color: var(--muted); background: var(--card); }
+  .none { padding: var(--s3); color: var(--muted); font-size: var(--text-note); }
+  .row {
+    display: flex; align-items: baseline; gap: var(--s2); min-height: 40px; min-width: 0; padding: var(--s2) var(--s3);
+    text-align: left; font: inherit; color: var(--ink); background: none; border: 0; border-top: 1px solid var(--line); cursor: pointer;
+  }
+  .group + .row { border-top: 0; }
+  .row:hover { background: var(--hover); }
+  .row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+  .row[aria-checked=true] { background: var(--sel); box-shadow: inset 3px 0 0 var(--accent); }
+  .row:disabled { color: var(--disabled); cursor: default; }
+  .row .name { flex: none; max-width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+  .row .where { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--font-mono); color: var(--muted); }
+  .other .name { color: var(--accent); }
+  .git { flex: none; align-self: center; display: inline-flex; color: var(--muted); }
+  .git svg { fill: none; stroke: currentColor; stroke-width: 1.4; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 
   .foot { display: flex; align-items: center; flex-wrap: wrap; gap: var(--s3); }
   .model { display: inline-flex; align-items: center; gap: var(--s2); color: var(--muted); }
@@ -203,10 +276,13 @@
 
   @media (max-width: 719px) {
     .sc-page { padding: var(--s4); }
+    form { gap: var(--s4); }
     .prompt { min-height: 140px; }
-    .chips { flex-direction: column; }
-    .chip { width: 100%; }
-    .chip-path { width: 100%; }
+    .list { max-height: 300px; }
+    .row { min-height: var(--tap); flex-wrap: wrap; align-items: center; row-gap: 0; }
+    .row .where:empty { display: none; }
+    .row .name { max-width: 100%; }
+    .row .where { flex-basis: 100%; }
     .hint { display: none; }
     .foot :global(.sc-button) { width: 100%; }
   }

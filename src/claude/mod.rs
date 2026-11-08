@@ -8,6 +8,11 @@
 //! the route AGENTS-3 case 5 tested. `--setting-sources ""` keeps the operator's
 //! settings, and so their permission mode and rules, out of a run: the rules a run
 //! has are the spec's, as flags, and [`ClaudeOptions::permissions`].
+//!
+//! The permission mode is the thread's ([`crate::mode`]): `default` unless the spec
+//! carries another. `bypassPermissions` also passes
+//! `--allow-dangerously-skip-permissions`, which the CLI wants before it will run
+//! with no checks at all.
 
 mod driver;
 mod frames;
@@ -97,6 +102,7 @@ impl ClaudeHarness {
     }
 
     fn build(&self, spec: &RunSpec) -> Result<LaunchPlan, PlanError> {
+        let mode = crate::mode::mode_of(spec);
         let mut argv: Vec<String> = [
             self.options.program.as_str(),
             "-p",
@@ -109,7 +115,7 @@ impl ClaudeHarness {
             "--permission-prompt-tool",
             "stdio",
             "--permission-mode",
-            "default",
+            mode.as_str(),
             "--setting-sources",
             "",
             "--strict-mcp-config",
@@ -117,9 +123,15 @@ impl ClaudeHarness {
         .map(String::from)
         .into();
 
+        if mode.is_bypass() {
+            argv.push("--allow-dangerously-skip-permissions".into());
+        }
+        // The mode is a flag, never the agent's env.
+        let mut env = spec.env.clone();
+        env.remove(&EnvName::new(crate::mode::ENV_KEY));
         let mut plan = LaunchPlan {
             argv: vec![],
-            env: spec.env.clone(),
+            env,
             cwd: spec.cwd.clone(),
             files: vec![],
             needs: vec![Need::Program {

@@ -719,3 +719,115 @@ async fn history_pages_a_thread_and_threads_carry_its_title() {
     let item = settled.next().await.unwrap().unwrap();
     assert_eq!(item["content"]["type"], "event", "{item}");
 }
+
+/// Modes: any but `bypassPermissions` for whoever may start or use the thread;
+/// bypass is a host's owner's only, so on the service itself nobody's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_thread_takes_a_mode_and_nobody_bypasses_on_the_service() {
+    let s = service().await;
+    let ada = connect(s.port, &token(ADA, "ada")).await;
+    let root = connect(s.port, &token(ROOT, "root")).await;
+    let ben = connect(s.port, &token(BEN, "ben")).await;
+    for who in [&ada, &root] {
+        let refused = call(
+            who,
+            "agents.start",
+            json!({"placement": "local", "cwd": "/recorded/cwd", "prompt": "p",
+                   "mode": "bypassPermissions"}),
+        )
+        .await;
+        assert_eq!(refused["type"], "failed", "{refused}");
+        assert!(refused["message"]
+            .as_str()
+            .unwrap()
+            .contains("host's owner"));
+    }
+    assert!(s.runtime.threads().unwrap().is_empty(), "nothing started");
+    let bad = call(
+        &ada,
+        "agents.start",
+        json!({"placement": "local", "cwd": "/x", "prompt": "p", "mode": "yolo"}),
+    )
+    .await;
+    assert_eq!(bad["error_kind"], "invalid_params", "{bad}");
+
+    let started = call(
+        &ada,
+        "agents.start",
+        json!({"placement": "local", "cwd": "/recorded/cwd", "prompt": "the recorded prompt",
+               "mode": "plan"}),
+    )
+    .await;
+    assert_eq!(started["type"], "started", "{started}");
+    let thread = started["thread"].as_str().unwrap().to_string();
+    let listed = call(&ada, "agents.threads", json!({"thread": thread})).await;
+    assert_eq!(listed["threads"][0]["mode"], "plan", "{listed}");
+
+    let set = call(
+        &ada,
+        "agents.set_mode",
+        json!({"thread": thread, "mode": "acceptEdits"}),
+    )
+    .await;
+    assert_eq!(
+        set,
+        json!({"type": "mode_set", "thread": thread, "mode": "acceptEdits"})
+    );
+    let refused = call(
+        &ada,
+        "agents.set_mode",
+        json!({"thread": thread, "mode": "bypassPermissions"}),
+    )
+    .await;
+    assert_eq!(refused["type"], "failed", "{refused}");
+    let not_hers = call(
+        &ben,
+        "agents.set_mode",
+        json!({"thread": thread, "mode": "plan"}),
+    )
+    .await;
+    forbidden(&not_hers);
+    let listed = call(&ada, "agents.threads", json!({"thread": thread})).await;
+    assert_eq!(listed["threads"][0]["mode"], "acceptEdits", "{listed}");
+
+    // A suggestion index an allow can't apply is refused, and leaves the request.
+    let request = until_pending(&ada).await[0]["request"]["id"].clone();
+    let r = call(
+        &ada,
+        "agents.answer",
+        json!({"thread": thread, "request": request, "answer": allow(), "apply": [9]}),
+    )
+    .await;
+    assert_eq!(r["type"], "failed", "{r}");
+    assert_eq!(pending(&ada).await.len(), 1);
+}
+
+/// The service's own folders are an admin's: a user lists a host's, not this box's.
+#[tokio::test(flavor = "multi_thread")]
+async fn folders_on_the_service_itself_are_an_admins() {
+    let s = service().await;
+    let roots = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(roots.path().join("repo/.git")).unwrap();
+    s.runtime.set_roots(vec![roots.path().to_path_buf()]);
+    let ada = connect(s.port, &token(ADA, "ada")).await;
+    forbidden(&call(&ada, "agents.folders", json!({})).await);
+    let root = connect(s.port, &token(ROOT, "root")).await;
+    let got = call(&root, "agents.folders", json!({})).await;
+    assert_eq!(got["type"], "folders", "{got}");
+    let canon = roots.path().canonicalize().unwrap();
+    assert_eq!(got["roots"], json!([canon.to_string_lossy()]));
+    let repo = got["folders"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "repo")
+        .cloned()
+        .expect("the repo is listed");
+    assert_eq!(
+        repo,
+        json!({"path": canon.join("repo").to_string_lossy(), "name": "repo",
+               "recent": false, "git": true})
+    );
+    let outside = call(&root, "agents.folders", json!({"under": "/"})).await;
+    assert_eq!(outside["type"], "failed", "{outside}");
+}

@@ -72,6 +72,7 @@
 //! the deploy holds, never the store.
 
 use crate::auth::{Access, AgentsRequest, Caller};
+use crate::mode::PermissionMode;
 use crate::runtime::{GlobalSeq, ThreadId};
 use crate::service::{AgentsEvent, Placement, Prompt, WorkDir};
 use plexus_harness::{InputAnswer, InputRequestId, ModelName};
@@ -115,7 +116,7 @@ const WAITING_SINCE: &str = "host_waiting_since";
 /// Unpaired keys waiting at once, from anywhere.
 const MAX_WAITING: usize = 1024;
 /// What `agents.on.<host>.` reaches: a host's own `agents` surface.
-pub const HOST_METHODS: [&str; 12] = [
+pub const HOST_METHODS: [&str; 15] = [
     "start",
     "threads",
     "harnesses",
@@ -127,6 +128,9 @@ pub const HOST_METHODS: [&str; 12] = [
     "pending",
     "answer",
     "resume",
+    "set_mode",
+    "folders",
+    "capabilities",
     "claudecode.describe",
 ];
 /// The method both sides open a call with, and close it with.
@@ -1455,10 +1459,63 @@ impl HostsActivation {
         prompt: Prompt,
         /** the model, or the harness's default */
         model: Option<ModelName>,
+        /** default, acceptEdits, plan, or bypassPermissions; default `default` */
+        mode: Option<PermissionMode>,
     ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
         let placement = placement.unwrap_or_else(|| Placement("local".into()));
-        let params = json!({ "placement": placement, "cwd": cwd, "prompt": prompt, "model": model });
+        let mut params =
+            json!({ "placement": placement, "cwd": cwd, "prompt": prompt, "model": model });
+        // Only when given: a host from before modes refuses a key it doesn't know.
+        if let Some(mode) = mode {
+            params["mode"] = json!(mode);
+        }
         self.forward(&caller, &host, "start", params).await
+    }
+
+    /// Sets a thread's permission mode on one of your hosts: `agents.set_mode` there.
+    #[plexus_rpc::macros::method]
+    pub async fn set_mode(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the host */
+        host: HostName,
+        /** the thread */
+        thread: ThreadId,
+        /** default, acceptEdits, plan, or bypassPermissions */
+        mode: PermissionMode,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        let params = json!({ "thread": thread, "mode": mode });
+        self.forward(&caller, &host, "set_mode", params).await
+    }
+
+    /// What one of your hosts offers (its modes, whether it allows bypass, its
+    /// roots): `agents.capabilities` there. A host from before modes has none.
+    #[plexus_rpc::macros::method]
+    pub async fn capabilities(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the host */
+        host: HostName,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        self.forward(&caller, &host, "capabilities", json!({}))
+            .await
+    }
+
+    /// The folders a thread may start in on one of your hosts: `agents.folders` there.
+    #[plexus_rpc::macros::method]
+    pub async fn folders(
+        &self,
+        #[from_auth(self.access.verify)] caller: Caller,
+        /** the host */
+        host: HostName,
+        /** one level of a folder inside the host's roots, instead */
+        under: Option<WorkDir>,
+    ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
+        let mut params = json!({});
+        if let Some(under) = under {
+            params["under"] = json!(under);
+        }
+        self.forward(&caller, &host, "folders", params).await
     }
 
     /// Replays a thread on one of your hosts from `since`, then follows it live:
@@ -1554,8 +1611,13 @@ impl HostsActivation {
         request: InputRequestId,
         /** the answer */
         answer: InputAnswer,
+        /** with an allow: apply these of the request's `permission_suggestions`, by index */
+        apply: Option<Vec<u32>>,
     ) -> impl Stream<Item = AgentsEvent> + Send + 'static {
-        let params = json!({ "thread": thread, "request": request, "answer": answer });
+        let mut params = json!({ "thread": thread, "request": request, "answer": answer });
+        if let Some(apply) = apply {
+            params["apply"] = json!(apply);
+        }
         self.forward(&caller, &host, "answer", params).await
     }
 }

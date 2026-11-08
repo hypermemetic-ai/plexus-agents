@@ -2,9 +2,14 @@
      online or when last seen in words, what it is in plain words, its threads
      grouped by folder (most recent first), New thread as the one primary action,
      and unpair as a quiet separate danger action with an inline confirm that says
-     what it does. Main content only: sc-frame draws the top bar and the nav. -->
+     what it does. Main content only: sc-frame draws the top bar and the nav.
+
+     superconductor-ui/modes: under the threads, what the host itself allows
+     (`hosts.capabilities`): the folders threads start under (its --root) and
+     whether "Bypass all permissions" is on (--allow-bypass), with the command
+     that changes it. A host from before modes shows neither. -->
 <script module>
-  export const uses = ["hosts.list", "hosts.threads", "hosts.unpair"];
+  export const uses = ["hosts.list", "hosts.threads", "hosts.unpair", "hosts.capabilities"];
 </script>
 
 <script>
@@ -20,6 +25,7 @@
   let said = $state("");
   let confirming = $state(false);
   let unpairing = $state(false);
+  let caps = $state(null);
 
   const event = (r, type) => (r.events ?? []).find((e) => e.type === type);
   const failure = (r) => event(r, "failed")?.message ?? (r.ok ? "" : (r.message ?? ""));
@@ -46,13 +52,14 @@
     const r = await b.call("hosts.list", {});
     info = (event(r, "hosts")?.hosts ?? []).find((h) => h.name === host) ?? null;
     if (!info?.online) { threads = []; return; }
-    const t = await b.call("hosts.threads", { host });
+    const [t, c] = await Promise.all([b.call("hosts.threads", { host }), caps ? null : b.call("hosts.capabilities", { host })]);
+    if (c) caps = event(c, "capabilities") ?? null;
     threads = (event(t, "threads")?.threads ?? []).slice().sort((x, y) => (y.last_seq ?? 0) - (x.last_seq ?? 0));
     said = failure(t);
   }
   $effect(() => {
     host;
-    info = undefined; confirming = false; said = "";
+    info = undefined; confirming = false; said = ""; caps = null;
     load();
     const timer = setInterval(load, 5000);
     return () => clearInterval(timer);
@@ -75,6 +82,7 @@
     unpairing = false;
     if (event(r, "unpaired")) b.navigate("#/"); else said = failure(r) || "The server didn't confirm the unpairing.";
   }
+  const home = (p) => (p ?? "").replace(/^\/(Users|home)\/[^/]+/, "~");
   const threadHref = (t) => `#/h/${encodeURIComponent(host)}/t/${encodeURIComponent(t.id)}`;
 </script>
 
@@ -126,6 +134,25 @@
       {/each}
     {/if}
 
+    {#if info.online && caps}
+      <section class="caps" aria-labelledby="caps-h">
+        <h2 id="caps-h">What {host} allows</h2>
+        <dl>
+          <dt>Threads start in</dt>
+          <dd>
+            {#each caps.roots ?? [] as r (r)}<code class="root" title={r}>{home(r)}</code>{/each}
+            <span class="quiet">and the folders under {(caps.roots ?? []).length === 1 ? "it" : "them"}. To change this, restart the host with <code>--root DIR</code>.</span>
+          </dd>
+          <dt>Bypass all permissions</dt>
+          {#if caps.bypass}
+            <dd><span class="on-bypass">Allowed.</span> <span class="quiet">A thread may run every command without asking. Restart the host without <code>--allow-bypass</code> to turn this off.</span></dd>
+          {:else}
+            <dd>Off. <span class="quiet">Every thread asks before acting, unless you choose otherwise per thread. To allow it, restart the host with <code>--allow-bypass</code>.</span></dd>
+          {/if}
+        </dl>
+      </section>
+    {/if}
+
     <section class="danger" aria-labelledby="unpair-h">
       <h2 id="unpair-h">Unpair {host}</h2>
       {#if !confirming}
@@ -172,6 +199,13 @@
   .note { flex: 1; min-width: 0; }
   .turns { color: var(--muted); font-size: 13px; white-space: nowrap; }
 
+  .caps { margin-top: var(--s6); padding-top: var(--s5); border-top: 1px solid var(--line); }
+  dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: var(--s3) var(--s5); margin: var(--s4) 0 0; }
+  dt { font-weight: 500; }
+  dd { margin: 0; max-width: 62ch; line-height: var(--leading); overflow-wrap: anywhere; }
+  dd code.root { display: inline-block; margin-right: var(--s2); font: 13px var(--font-mono); color: var(--ink); }
+  .quiet code { font: 12.5px var(--font-mono); color: var(--ink); }
+  .on-bypass { color: var(--danger); font-weight: 500; }
   .danger { margin-top: var(--s6); padding-top: var(--s5); border-top: 1px solid var(--line); }
   .confirm { padding: var(--s4); border: 1px solid var(--st-failed-bg); background: var(--panel); border-radius: var(--radius-md); }
   .confirm p { margin-top: 0; max-width: 62ch; }
@@ -183,5 +217,7 @@
     .folder h2 { flex-direction: column; align-items: stretch; gap: 0; }
     .folder .path { white-space: normal; overflow-wrap: anywhere; }
     .actions { flex-direction: column; }
+    dl { grid-template-columns: minmax(0, 1fr); gap: var(--s1); }
+    dd + dt { margin-top: var(--s3); }
   }
 </style>
