@@ -110,28 +110,33 @@ fn projects_under(roots: &[PathBuf], dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Lists folders: each root, the projects right under it, and `recent` (newest
-/// first; any outside the roots, gone, or hidden are dropped). Under `under`, if
+/// first; any outside the roots, gone, or hidden are dropped). A recent folder
+/// keeps its path as the thread named it (so it matches the thread's `cwd`, a
+/// symlink in it included, e.g. `/home` → `/var/home`) and is not listed again
+/// under its resolved path. Under `under`, if
 /// given, instead of the roots: one level of a folder inside them, or an error.
 pub fn list(
     roots: &[PathBuf],
     recent: &[String],
     under: Option<&Path>,
 ) -> Result<Vec<Folder>, String> {
-    let recent: Vec<PathBuf> = recent
+    // (resolved, as named)
+    let recent: Vec<(PathBuf, PathBuf)> = recent
         .iter()
-        .filter_map(|r| inside(roots, Path::new(r)))
-        .fold(Vec::new(), |mut acc, p| {
-            if !acc.contains(&p) && acc.len() < MAX_RECENT {
-                acc.push(p);
+        .filter_map(|r| inside(roots, Path::new(r)).map(|p| (p, PathBuf::from(r))))
+        .fold(Vec::new(), |mut acc, (p, named)| {
+            if !acc.iter().any(|(q, _)| *q == p) && acc.len() < MAX_RECENT {
+                acc.push((p, named));
             }
             acc
         });
-    let is_recent = |p: &Path| recent.iter().any(|r| r == p);
+    let is_recent = |p: &Path| recent.iter().any(|(r, _)| r == p);
     let mut out: Vec<Folder> = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    let mut push = |p: &Path, out: &mut Vec<Folder>| {
+    // Listed once by its resolved path `p`, shown as `named`.
+    let mut push = |p: &Path, named: &Path, out: &mut Vec<Folder>| {
         if seen.insert(p.to_path_buf()) {
-            out.push(folder(p, is_recent(p)));
+            out.push(folder(named, is_recent(p)));
         }
     };
     match under {
@@ -140,17 +145,17 @@ pub fn list(
                 format!("{} is not a folder inside this host's roots", dir.display())
             })?;
             for p in projects_under(roots, &dir) {
-                push(&p, &mut out);
+                push(&p, &p, &mut out);
             }
         }
         None => {
-            for p in &recent {
-                push(p, &mut out);
+            for (p, named) in &recent {
+                push(p, named, &mut out);
             }
             for root in roots {
-                push(root, &mut out);
+                push(root, root, &mut out);
                 for p in projects_under(roots, root) {
-                    push(&p, &mut out);
+                    push(&p, &p, &mut out);
                 }
             }
         }
@@ -211,6 +216,20 @@ mod tests {
         assert!(got
             .iter()
             .all(|f| !Path::new(&f.path).starts_with(&outside)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recent_folder_keeps_the_path_its_thread_named_and_is_listed_once() {
+        let (_d, root) = tree();
+        let link_dir = tempfile::tempdir().unwrap();
+        let link = link_dir.path().join("home");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let named = link.join("repo").to_string_lossy().into_owned();
+        let got = list(std::slice::from_ref(&root), std::slice::from_ref(&named), None).unwrap();
+        assert_eq!(got[0].path, named);
+        assert!(got[0].recent && got[0].git);
+        assert_eq!(got.iter().filter(|f| f.name == "repo").count(), 1, "{got:?}");
     }
 
     #[test]
