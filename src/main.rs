@@ -47,7 +47,8 @@
 //! (on the sign-in cookie) lists the users this service knows, acts as any of them
 //! (`people.act_as`), makes a test user `oidc:test/<name>` with `user@*`
 //! (`people.create_user`, kept in the db's `people_grants`), and returns
-//! (`people.unbecome`). Elsewhere `people.*` doesn't exist. See
+//! (`people.unbecome`). Elsewhere `people.*` is mounted but off: `whoami` says
+//! `can_act: false` and the rest are refused (`acting_off`). See
 //! `plexus_agents::people`.
 //!
 //! `--public-url` is where people and hosts reach this service: `https://host` or
@@ -356,7 +357,7 @@ async fn main() -> anyhow::Result<()> {
         hosts.clone(),
         backend,
         Some(ui),
-        login.people.clone(),
+        Some(login.people.clone()),
         login.people_grants.clone(),
     );
     let serving = service::Serving {

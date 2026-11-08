@@ -18,7 +18,7 @@ use plexus_agents::front::{self, SignInConfig};
 use plexus_agents::hosts::Hosts;
 use plexus_agents::pairing::ServerKey;
 use plexus_agents::runtime::{Supervisor, SupervisorConfig};
-use plexus_agents::service::{hub_with_ui, Serving};
+use plexus_agents::service::{hub_with_people, Serving};
 use plexus_agents::ClaudeHarness;
 use plexus_harness::{Environment, Harness};
 use plexus_rpc::auth_core::adapters::sign_key_proof;
@@ -246,7 +246,7 @@ async fn the_nav_and_palette_through_their_states() {
     let signer = admin.trim_start_matches("key:").to_string();
     let ui = UiActivation::new(store.clone(), Signers::parse(&[signer]).unwrap());
     let grants = vec![format!("{admin}=admin@*").parse().unwrap()];
-    let hub = hub_with_ui(
+    let hub = hub_with_people(
         runtime,
         harnesses,
         grants,
@@ -254,6 +254,8 @@ async fn the_nav_and_palette_through_their_states() {
         Some(hosts.clone()),
         login.backend(),
         Some(ui),
+        Some(login.people.clone()),
+        login.people_grants.clone(),
     );
     let serving = Serving {
         hosts: Some(hosts.clone()),

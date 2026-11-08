@@ -107,8 +107,8 @@ async fn an_admin_acts_as_a_test_user_and_returns_in_a_browser() {
     let hosts = Hosts::open(&db, format!("ws://127.0.0.1:{port}/ws"), ServerKey::from_seed([42; 32])).unwrap();
     let store = Arc::new(UiStore::open_channel(&dir.path().join("ui.db"), DEFAULT_CHANNEL).unwrap());
     let ui = UiActivation::new(store.clone(), Signers::parse(&[deploy.trim_start_matches("key:").to_string()]).unwrap());
-    let hub = hub_with_people(runtime, harnesses, grants, vec![], Some(hosts.clone()), login.backend(), Some(ui), login.people.clone(), login.people_grants.clone());
-    assert!(login.people.is_some(), "test, on loopback: the people page is on");
+    let hub = hub_with_people(runtime, harnesses, grants, vec![], Some(hosts.clone()), login.backend(), Some(ui), Some(login.people.clone()), login.people_grants.clone());
+    assert!(login.people.off().is_none(), "test, on loopback: the people page is on");
     tokio::spawn(front::serve_public(hub, login, Serving { hosts: Some(hosts), ui: Some(store), ..Serving::new([127, 0, 0, 1].into(), port) }));
     while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() {
         tokio::time::sleep(Duration::from_millis(10)).await;

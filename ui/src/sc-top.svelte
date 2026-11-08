@@ -10,8 +10,8 @@
      someone for an admin, a band in ink sits over the bar on every screen —
      "Acting as <name>", and Return to <admin> (people.unbecome). Amber is "needs
      you" alone, so the band is the system's own ink turned over: the one inverted
-     surface in the app. `people.whoami` does not exist off test; then nothing of
-     this shows. -->
+     surface in the app. Off test `people.whoami` answers
+     `can_act: false` and nobody acts; then nothing of this shows. -->
 <script module>
   export const uses = ["auth.whoami", "people.whoami", "people.unbecome"];
 </script>

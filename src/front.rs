@@ -145,9 +145,12 @@ pub struct Login {
     pub workos: bool,
     /// Who may have a session (SUPERCONDUCTOR-25): everyone when empty.
     pub allow: Allow,
-    /// Test only: plexus-login's `people.*` — an admin acts as any user, or makes
-    /// one — to register on the hub. None anywhere else: the methods don't exist.
-    pub people: Option<plexus_login::acting::PeopleActivation>,
+    /// plexus-login's `people.*` — an admin acts as any user, or makes one — to
+    /// register on every hub: on only for `--env test` off [`crate::people::PROD_HOSTS`]
+    /// with a grant store; anywhere else mounted but off (`whoami` says `can_act:
+    /// false`, the rest are `refused` with `acting_off`), so a bundle naming
+    /// `people.*` pushes to any environment.
+    pub people: plexus_login::acting::PeopleActivation,
     /// The store a created user's grants are kept in, for the gate.
     pub people_grants: Option<Arc<GrantStore>>,
 }
@@ -251,18 +254,19 @@ pub fn sign_in(config: &SignInConfig, port: u16) -> anyhow::Result<Login> {
         .prod_hosts
         .clone()
         .unwrap_or_else(|| crate::people::PROD_HOSTS.iter().map(|h| h.to_string()).collect());
-    let people = match wired.acting(config.env, &prod_hosts) {
-        Ok(p) if config.people_grants.is_some() => Some(p),
-        Ok(_) => {
+    // Without a grant store a created user's roles could not be kept: acting off.
+    let env = match (config.env, &config.people_grants) {
+        (Environment::Test, None) => {
             eprintln!("plexus-agents: --env test, but no grant store: the people page is off");
-            None
+            Environment::Local
         }
-        Err(plexus_login::acting::NotEnabled::NotTest(_)) => None,
-        Err(why) => {
-            eprintln!("plexus-agents: the people page is off: {why}");
-            None
-        }
+        (env, _) => env,
     };
+    let people = wired.acting(env, &prod_hosts);
+    match people.off() {
+        None | Some(plexus_login::acting::NotEnabled::NotTest(_)) => {}
+        Some(why) => eprintln!("plexus-agents: the people page is off: {why}"),
+    }
     let mut origins = wired.origins.clone();
     if let Some(o) = origin {
         if !origins.contains(&o) {

@@ -21,7 +21,9 @@
 //! their owners' (pairing, not grants): a test user sees no one else's host.
 //!
 //! The env (`--env`/`AGENTS_ENV`: `test`, `prod`, `local`; default `local`) decides
-//! whether `people.*` exists at all: only `test`, and never on [`PROD_HOSTS`].
+//! whether `people.*` is on: only `test`, and never on [`PROD_HOSTS`]. Elsewhere it
+//! is mounted but off — `whoami` answers `can_act: false`, the rest are refused
+//! with `acting_off` — so the one UI bundle pushes to every environment.
 
 use async_trait::async_trait;
 use plexus_login::simple::SimpleAccess;

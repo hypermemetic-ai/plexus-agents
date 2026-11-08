@@ -1,7 +1,8 @@
 //! The people page through the wire (plexus-login's `people.*`, agents' grants):
 //! on `--env test` an admin on the sign-in cookie makes a test user, acts as it —
 //! the gate then answers as that user, with the role it was given — and returns;
-//! on `prod`, or on a production host, the methods don't exist.
+//! on `prod`, `local` or a production host the methods are there but off:
+//! `whoami` says `can_act: false`, the rest are refused (`acting_off`).
 
 use jsonrpsee::core::client::SubscriptionClientT;
 use jsonrpsee::core::params::ObjectParams;
@@ -77,7 +78,7 @@ async fn up(env: Environment, public_url: Option<String>) -> Up {
     let ctx = AuthContext::new(ADMIN.into(), "sid".into(), vec![], json!({ "principal": ADMIN, "name": "Ada Admin" }));
     let (id, _) = login.wired.sessions.create(ctx).unwrap();
     let cookie = format!("{}={id}", login.wired.sessions.cookie_name());
-    let hub = hub_with_people(runtime, harnesses, grants, vec![], None, login.backend(), None, login.people.clone(), login.people_grants.clone());
+    let hub = hub_with_people(runtime, harnesses, grants, vec![], None, login.backend(), None, Some(login.people.clone()), login.people_grants.clone());
     tokio::spawn(front::serve_public(hub, login, Serving::new([127, 0, 0, 1].into(), port)));
     while tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_err() {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -184,24 +185,40 @@ async fn an_admins_bearer_cannot_act() {
     assert_eq!(r["reason"], "not_a_browser_session", "{r}");
 }
 
-fn absent(v: &Value) -> bool {
-    v["type"] == "error"
+/// Acting off: `whoami` answers, with `can_act: false`; the rest are refused.
+async fn off(c: &WsClient, wher: &str) {
+    let me = call(c, "people.whoami", json!({})).await;
+    assert_eq!(
+        (me["type"].as_str(), me["principal"].as_str(), me["admin"].as_bool(), me["can_act"].as_bool()),
+        (Some("whoami"), Some(ADMIN), Some(true), Some(false)),
+        "{wher}: {me}"
+    );
+    for (m, p) in [
+        ("people.known_users", json!({})),
+        ("people.act_as", json!({"principal": "oidc:test/carol"})),
+        ("people.create_user", json!({"name": "carol", "roles": ["user@*"]})),
+        ("people.unbecome", json!({})),
+    ] {
+        let r = call(c, m, p).await;
+        assert_eq!(
+            (r["type"].as_str(), r["reason"].as_str(), r["message"].as_str()),
+            (Some("refused"), Some("acting_off"), Some("Acting as other users is only on in test deployments.")),
+            "{m} on {wher}: {r}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn on_prod_and_on_a_production_host_the_methods_do_not_exist() {
+async fn on_prod_local_and_a_production_host_the_methods_are_there_but_refuse() {
     let prod = up(Environment::Prod, None).await;
     let c = socket(prod.port, ("cookie", prod.cookie.clone())).await;
-    for m in ["people.whoami", "people.known_users", "people.unbecome"] {
-        let r = call(&c, m, json!({})).await;
-        assert!(absent(&r), "{m} on prod: {r}");
-    }
+    off(&c, "prod").await;
     assert_eq!(call(&c, "auth.whoami", json!({})).await["principal"], ADMIN, "sign-in itself is untouched");
     let local = up(Environment::Local, None).await;
     let c = socket(local.port, ("cookie", local.cookie.clone())).await;
-    assert!(absent(&call(&c, "people.whoami", json!({})).await), "local");
+    off(&c, "local").await;
     // Test, but its public URL is production's host.
     let host = up(Environment::Test, Some("https://agents.menger.sh".into())).await;
     let c = socket(host.port, ("cookie", host.cookie.clone())).await;
-    assert!(absent(&call(&c, "people.whoami", json!({})).await), "a production host");
+    off(&c, "a production host").await;
 }
