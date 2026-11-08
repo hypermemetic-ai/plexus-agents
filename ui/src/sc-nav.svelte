@@ -12,11 +12,10 @@
        redraws on a quiet poll. Status is derived from that one answer every time, never
        cached: a thread's undecided requests (`pending`) count only while it runs or is
        parked, so a finished turn drops "Needs you" on the next refresh.
-     - A thread's title (its first user message) and its last activity (the `at_ms` of
-       its newest event) are not in `hosts.threads` (a gap, in the report): each is read
-       once from `hosts.watch` — the title from the thread's start, the time from
-       `since: last_seq - 1`, one event — two at a time, and kept in localStorage (a
-       title never changes; a time is read again only when `last_seq` moved).
+     - A thread's title (its first prompt) and its last activity are its row's
+       `title` and `last_activity` in `hosts.threads`, kept by the host as the thread
+       advances: nothing is replayed to read them. A host older than those fields
+       names a thread by its folder, with no time.
      - Done-unread: a thread idle whose `last_seq` passed the one you last saw it at
        (kept in localStorage; a thread first seen counts as read).
 
@@ -24,7 +23,7 @@
      reads. Until sc-frame gives the palette its own section, a nav drawn by a page
      carries one itself (when no palette said `sc.palette.here`). -->
 <script module>
-  export const uses = ["hosts.list", "hosts.threads", "hosts.watch"];
+  export const uses = ["hosts.list", "hosts.threads"];
 
   const FOLD = 5;          // rows shown per group before "Show N older"
   const QUIET_MS = 8000;   // the poll when nothing moves
@@ -76,8 +75,6 @@
   let loaded = $state(false);
   let refused = $state("");
   let hash = $state(location.hash || "#/");
-  let titles = $state(load("sc.nav.titles"));   // thread id → its first message
-  let times = $state(load("sc.nav.times"));     // thread id → [last_seq, at_ms]
   let seen = $state(load("sc.nav.seen"));       // thread id → last_seq when last read
   let open = $state({});             // group key → unfolded
   let cursor = $state(-1);           // the keyboard's row in `flat`
@@ -130,80 +127,22 @@
     return () => { clearTimeout(timer); removeEventListener("hashchange", moved); document.removeEventListener("visibilitychange", back); off(); };
   });
 
-  // ── a thread's title and last activity, read once each from hosts.watch ───
-  // Opens the collection, takes what `pick` finds, and lets it go.
-  function probe(host, thread, since, pick, ms = 8000) {
-    return new Promise((resolve) => {
-      let done = false, off = null;
-      const end = (v) => {
-        if (done) return;
-        done = true;
-        clearTimeout(t);
-        if (off) setTimeout(off, 0);
-        resolve(v);
-      };
-      const t = setTimeout(() => end(null), ms);
-      off = b.live({
-        snapshot: "hosts.threads",
-        params: { host, thread },
-        changes: "hosts.watch",
-        changes_params: since == null ? { host, thread } : { host, thread, since },
-        key: "seq",
-        on: { event: "upsert:event" },
-      }).subscribe((value) => {
-        if (value.status === "error" || value.status === "refused") return end(null);
-        const v = pick([...value.rows].sort((x, y) => x.seq - y.seq));
-        if (v != null) end(v);
-      });
-      if (done) setTimeout(off, 0);
-    });
-  }
-  const queue = new Map();   // "title:id" / "time:id" → task
-  const failed = new Map();  // key → when it last came back empty
-  let running = 0;
-  function want(key, prio, task) {
-    if (queue.has(key) || (failed.get(key) ?? 0) > Date.now() - 60000) return;
-    queue.set(key, { prio, task });
-  }
-  function pump() {
-    while (running < 2 && queue.size) {
-      const [key, next] = [...queue.entries()].sort((x, y) => x[1].prio - y[1].prio)[0];
-      queue.delete(key);
-      running += 1;
-      next.task().then((ok) => { if (!ok) failed.set(key, Date.now()); }).finally(() => { running -= 1; pump(); });
-    }
-  }
   function settle() {
     const ids = new Set();
-    let order = 0;
     for (const h of hosts) {
       for (const t of byHost[h.name] ?? []) {
         ids.add(t.id);
         // Seen at first sight: only what moves while you look elsewhere is unread.
         if (seen[t.id] == null) seen[t.id] = t.last_seq ?? 0;
-        if (!h.online) continue;
-        const prio = (pendingOf(t).length ? 0 : 100) + order++;
-        if (titles[t.id] == null) {
-          want("title:" + t.id, prio, () => probe(h.name, t.id, null, (rows) => {
-            const m = rows.find((r) => r.event?.kind === "user.message" && (r.event.text ?? "").trim());
-            return m ? tidy(m.event.text) : null;
-          }).then((title) => { if (title) { titles[t.id] = title; save("sc.nav.titles", titles); } return !!title; }));
-        }
-        const seq = t.last_seq ?? 0;
-        if (seq > 0 && times[t.id]?.[0] !== seq) {
-          want("time:" + t.id + ":" + seq, prio + 0.5, () => probe(h.name, t.id, seq - 1, (rows) => rows.at(-1)?.event?.at_ms ?? null, 5000)
-            .then((at) => { if (at) { times[t.id] = [seq, at]; save("sc.nav.times", times); } return !!at; }));
-        }
       }
     }
     // Forget what no host lists any more.
-    for (const store of [[titles, "sc.nav.titles"], [times, "sc.nav.times"], [seen, "sc.nav.seen"]]) {
-      if (Object.keys(store[0]).some((id) => !ids.has(id)) && loaded && hosts.every((h) => h.online)) {
-        for (const id of Object.keys(store[0])) if (!ids.has(id)) delete store[0][id];
-      }
-      save(store[1], store[0]);
+    if (Object.keys(seen).some((id) => !ids.has(id)) && loaded && hosts.every((h) => h.online)) {
+      for (const id of Object.keys(seen)) if (!ids.has(id)) delete seen[id];
     }
-    pump();
+    save("sc.nav.seen", seen);
+    // What the probes of an older nav kept, now in the rows.
+    try { localStorage.removeItem("sc.nav.titles"); localStorage.removeItem("sc.nav.times"); } catch {}
   }
 
   // ── status: one per thread, from this refresh's answer alone ──────────────
@@ -234,9 +173,9 @@
       id: t.id,
       cwd: t.cwd ?? "",
       folder,
-      title: titles[t.id] || (folder ? `Thread in ${folder}` : "Untitled thread"),
-      named: !!titles[t.id],
-      at: times[t.id]?.[1] ?? 0,
+      title: t.title ? tidy(t.title) : folder ? `Thread in ${folder}` : "Untitled thread",
+      named: !!t.title,
+      at: t.last_activity ?? 0,
       seq: t.last_seq ?? 0,
       status: statusOf(h, t),
       href: href(h.name, t.id),

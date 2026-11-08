@@ -8,13 +8,21 @@
      (sc-composer) at the bottom. What the runtime says to Claude (a resume after
      your answer, a restart) is a small system line, never a message of yours.
 
-     The transcript is a `live` collection keyed by `seq`: `hosts.watch` replays
-     the thread and follows it, each `event` an upsert, folded here in order.
-     Its snapshot `hosts.threads { host, thread }` answers no row (plexus-ui's
-     `live` has no shape for a stream alone); the folder comes from the same
-     method, called once. -->
+     The transcript opens from `hosts.history`: the newest page of finished items
+     (a prompt, a whole message, a call with its result, a request with its
+     answer, a turn's end with its time), never the deltas they streamed as.
+     Then a `live` collection keyed by `seq` follows from its `last_seq`:
+     `hosts.watch { since, settled }`, each `event` an upsert, folded in order
+     (its snapshot `hosts.threads { host, thread }` answers no row: plexus-ui's
+     `live` has no shape for a stream alone). A reconnect reopens the watch from
+     that `since`, settled (finished messages' deltas left out), and what was
+     already folded is skipped by `seq`. Scrolling to the top reads the page
+     before (`before: next_before`) and folds everything again, older first,
+     the view held where it was. A host older than `hosts.history` is replayed
+     whole by `hosts.watch`, as before. The folder and the title come from
+     `hosts.threads`, called once. -->
 <script module>
-  export const uses = ["hosts.threads", "hosts.watch", "hosts.pending"];
+  export const uses = ["hosts.threads", "hosts.history", "hosts.watch", "hosts.pending"];
 
   /** What the runtime told Claude, in the operator's words. */
   function runtimeWords(text) {
@@ -34,7 +42,7 @@
 
 <script>
   import { untrack } from "svelte";
-  import { bus, live } from "plexus-ui/host";
+  import { bus } from "plexus-ui/host";
   import Pill from "./sc-pill.svelte";
   import Text from "./sc-text.svelte";
   import ToolRun from "./sc-toolrun.svelte";
@@ -47,23 +55,21 @@
 
   let { host, thread } = $props();
   const b = bus();
-  const log = live({
-    snapshot: "hosts.threads",
-    params: () => ({ host, thread }),
-    changes: "hosts.watch",
-    changes_params: () => ({ host, thread }),
-    key: "seq",
-    on: { event: "upsert:event" },
-  });
+  // What the page says of its reading: the watch's status once it's open.
+  const log = $state({ status: "pending", message: undefined });
 
-  // The thread's folder, once.
+  // The thread's folder and title, once.
   let folder = $state("");
+  let named = $state("");
   $effect(() => {
     const h = host, t = thread;
     untrack(async () => {
+      folder = ""; named = "";
       const r = await b.call("hosts.threads", { host: h, thread: t });
       const v = (r.events ?? []).find((e) => e.type === "threads")?.threads?.find((x) => x.id === t);
+      if (h !== host || t !== thread) return;
       if (v?.cwd) folder = v.cwd;
+      if (v?.title) named = v.title;
     });
   });
 
@@ -74,19 +80,21 @@
   let failed = $state(false);
   let asks = $state({});           // request id → its pending record, while it waits
   let unresolved = $state(new Set());
-  let seen = 0;
+  let seen = 0;                    // the newest seq folded: the watch's rows at or below it are had
   let reply = null;
+  let cut = false;                 // a page starts here: its first call starts a run of its own
   let tools = new Map();           // tool_use id → its call (state)
   let turns = new Map();           // turn id → { start, waited, waitFrom, calls }
   let asked = new Map();           // request id → its "ask" item (state)
   let helpers = new Set();         // the top-level helpers started
 
   function reset() {
-    items = []; running = false; thinking = false; failed = false; asks = {}; unresolved = new Set();
-    seen = 0; reply = null; tools = new Map(); turns = new Map(); asked = new Map(); helpers = new Set();
+    items = []; running = false; thinking = false; failed = false; unresolved = new Set();
+    seen = 0; reply = null; cut = false; tools = new Map(); turns = new Map(); asked = new Map(); helpers = new Set();
   }
-  function push(item) { items.push(item); return items[items.length - 1]; }
-  function note(text, tone = "quiet") { reply = null; return push({ type: "note", key: "n" + seen, text, tone }); }
+  function push(item) { cut = false; items.push(item); return items[items.length - 1]; }
+  let at = 0;                      // the seq of the row being folded: its items' keys
+  function note(text, tone = "quiet") { reply = null; return push({ type: "note", key: "n" + at, text, tone }); }
   function turnOf(ev) {
     const id = ev.turn ?? ev.in_turn ?? "-";
     if (!turns.has(id)) turns.set(id, { start: ev.at_ms ?? 0, waited: 0, waitFrom: null, calls: [] });
@@ -94,8 +102,7 @@
   }
 
   function fold(row) {
-    if (row.seq <= seen) return;
-    seen = row.seq;
+    at = row.seq;
     const ev = row.event ?? {};
     // A helper's own steps stay in the helper; only its start and end are drawn.
     if (ev.agent && !/^subagent\./.test(ev.kind)) return;
@@ -104,27 +111,27 @@
       case "user.message": {
         const text = ev.text ?? "";
         if (/^\[runtime\]/.test(text)) note(runtimeWords(text));
-        else push({ type: "user", key: "u" + seen, text });
+        else push({ type: "user", key: "u" + at, text });
         reply = null;
         break;
       }
       case "thinking.delta": thinking = true; break;
       case "text.delta":
         thinking = false;
-        if (!reply) reply = push({ type: "agent", key: "t" + seen, text: "" });
+        if (!reply) reply = push({ type: "agent", key: "t" + at, text: "" });
         reply.text += ev.text ?? "";
         break;
       case "message":
         thinking = false;
         if (reply) reply.text = ev.text ?? reply.text;
-        else if (ev.text) push({ type: "agent", key: "t" + seen, text: ev.text });
+        else if (ev.text) push({ type: "agent", key: "t" + at, text: ev.text });
         reply = null;
         break;
       case "tool.call": {
         thinking = false;
         reply = null;
         const last = items[items.length - 1];
-        const run = last?.type === "run" ? last : push({ type: "run", key: "r" + seen, calls: [] });
+        const run = last?.type === "run" && !cut ? last : push({ type: "run", key: "r" + at, calls: [] });
         // A call the park stopped is made again on resume: the first goes.
         for (const c of tools.values()) {
           if (c.parked && !c.hidden && c.name === ev.name && JSON.stringify(c.input) === JSON.stringify(ev.input)) c.hidden = true;
@@ -181,8 +188,8 @@
         // Calls the turn ended under never finish: they stop being live.
         for (const c of t.calls) if (!c.done) { c.done = true; c.is_error = st.status !== "completed"; }
         push({
-          type: "foot", key: "f" + seen, status: st.status ?? "completed", failure: st.failure, detail: st.detail,
-          stopped_by: ev.stopped_by, ms: Math.max(0, (ev.at_ms ?? t.start) - t.start - t.waited), files: edits.size, add, del,
+          type: "foot", key: "f" + at, status: st.status ?? "completed", failure: st.failure, detail: st.detail,
+          stopped_by: ev.stopped_by, ms: ev.duration_ms ?? Math.max(0, (ev.at_ms ?? t.start) - t.start - t.waited), files: edits.size, add, del,
         });
         failed = st.status === "failed";
         break;
@@ -208,17 +215,112 @@
     }
   }
 
-  $effect(() => untrack(() => log.subscribe((value, change) => {
-    const whole = !change || change.replace;
-    if (whole) reset();
-    const rows = whole ? value.rows : (change.upsert ?? []);
-    for (const row of [...rows].sort((x, y) => x.seq - y.seq)) fold(row);
-    ask();
-  })));
+  // ── reading: the history's pages, then the watch from its last_seq ──────
+  const PAGE = 50;
+  let pages = [];                  // the history's pages read so far, oldest first; each oldest first
+  let tail = [];                   // the watch's rows since, in order
+  let base = 0;                    // the newest page's last_seq
+  let older = $state(null);        // the next page back's `before`; null at the start (or no history)
+  let reading = $state(false);     // a page back is being read
+  let prepended = false;
+
+  /** A history item as the events it stands for, folded as the watch's are. */
+  function foldItem(it) {
+    const was = { at_ms: it.at_ms, in_turn: it.in_turn, agent: it.agent };
+    const row = (seq, event) => fold({ seq, event: { ...was, ...event } });
+    switch (it.item) {
+      case "user": row(it.seq, { kind: "user.message", text: it.text, by: it.by }); break;
+      case "message": row(it.seq, it.partial ? { kind: "text.delta", text: it.text } : { kind: "message", text: it.text }); break;
+      case "tool":
+        row(it.seq, { kind: "tool.call", id: it.id, name: it.name, input: it.input });
+        if (it.result) row(it.result.seq, { kind: "tool.result", id: it.id, is_error: it.result.is_error, output: it.result.output, at_ms: it.result.at_ms });
+        break;
+      case "input":
+        row(it.seq, { kind: "input.requested", id: it.id });
+        if (it.resolution) row(it.resolution.seq, { kind: "input.resolved", id: it.id, outcome: it.resolution.outcome, by: it.resolution.by, at_ms: it.resolution.at_ms });
+        break;
+      case "turn_started": row(it.seq, { kind: "turn.started", turn: it.turn, origin: it.origin }); break;
+      case "turn_ended": row(it.seq, { kind: "turn.terminal", ...it.terminal, duration_ms: it.duration_ms }); break;
+      case "notice": row(it.seq, it.event ?? {}); break;
+    }
+  }
+  /** Everything read, folded again in order: the pages, then the watch's rows. */
+  function refold() {
+    reset();
+    for (const page of pages) { cut = true; reply = null; for (const it of page) foldItem(it); }
+    cut = false;
+    for (const row of tail) fold(row);
+    seen = Math.max(base, tail.at(-1)?.seq ?? 0);
+  }
+  function heard(row) {
+    if (row.seq <= seen) return;
+    tail.push(row);
+    seen = row.seq;
+    fold(row);
+  }
+  const first = (r, type) => (r.ok ? (r.events ?? []).find((e) => e.type === type) : null);
+
+  $effect(() => {
+    const h = host, t = thread;
+    let gone = false, off = null;
+    untrack(async () => {
+      reset(); asks = {}; pages = []; tail = []; base = 0; older = null; reading = false;
+      log.status = "pending"; log.message = undefined;
+      const page = first(await b.call("hosts.history", { host: h, thread: t, limit: PAGE }), "history");
+      if (gone) return;
+      if (page) {
+        pages = [page.items ?? []];
+        base = page.last_seq ?? 0;
+        older = page.next_before ?? null;
+        refold();
+        ask();
+      }
+      // No history (a host older than it): the watch replays the thread whole, as before.
+      off = b.live({
+        snapshot: "hosts.threads",
+        params: { host: h, thread: t },
+        changes: "hosts.watch",
+        changes_params: page ? { host: h, thread: t, since: base, settled: true } : { host: h, thread: t },
+        key: "seq",
+        on: { event: "upsert:event" },
+      }).subscribe((value, change) => {
+        log.status = value.status; log.message = value.message;
+        const rows = !change || change.replace ? value.rows : (change.upsert ?? []);
+        for (const row of [...rows].sort((x, y) => x.seq - y.seq)) heard(row);
+        ask();
+      });
+      if (gone) off();
+      requestAnimationFrame(fill);
+    });
+    return () => { gone = true; off?.(); };
+  });
+
+  /** The page before the oldest read, folded in above what's shown; the view stays put. */
+  async function back() {
+    if (older == null || reading) return;
+    const h = host, t = thread, before = older;
+    reading = true;
+    const page = first(await b.call("hosts.history", { host: h, thread: t, before, limit: PAGE }), "history");
+    reading = false;
+    if (h !== host || t !== thread || before !== older || !page) return;   // asked again on the next scroll
+    remember();
+    pages.unshift(page.items ?? []);
+    older = page.next_before ?? null;
+    prepended = true;
+    refold();
+    requestAnimationFrame(fill);
+  }
+  // Too little to scroll, or the reader up at the top: read further back.
+  const NEAR = 600;
+  function fill() {
+    if (!scrollEl || older == null) return;
+    const short = scrollEl.scrollHeight - scrollEl.clientHeight < NEAR;
+    if (short || (!pinned && scrollEl.scrollTop < NEAR)) back();
+  }
 
   const status = $derived(unresolved.size ? "needs" : running ? "working" : failed ? "failed" : "idle");
   const title = $derived.by(() => {
-    const first = items.find((i) => i.type === "user")?.text ?? "";
+    const first = named || (items.find((i) => i.type === "user")?.text ?? "");
     const line = first.split("\n").map((l) => l.trim()).find(Boolean) ?? "";
     return line.length > 90 ? line.slice(0, 88).trimEnd() + "…" : line;
   });
@@ -288,6 +390,7 @@
     else pinned = false;
     away = d > scrollEl.clientHeight;
     remember();
+    if (!pinned && scrollEl.scrollTop < NEAR) back();
   }
   $effect(() => {
     if (!scrollEl || !logEl) return;
@@ -304,13 +407,15 @@
     grew.observe(scrollEl);
     return () => grew.disconnect();
   });
-  // A new thread lands at its end; items that arrive while the reader is up are counted.
+  // A new thread lands at its end; items that arrive while the reader is up are counted
+  // (not those an older page put above them).
   let counted = 0;
   $effect(() => { host; thread; untrack(() => { pinned = true; unread = 0; counted = 0; }); });
   $effect(() => {
     const n = items.length;
     untrack(() => {
-      if (n > counted && !pinned) unread += n - counted;
+      if (n > counted && !pinned && !prepended) unread += n - counted;
+      prepended = false;
       counted = n;
     });
   });
@@ -377,6 +482,7 @@
 
   <div class="scroller" bind:this={scrollEl} onscroll={scrolled} onwheel={hand} onpointerdown={hand} onkeydown={hand}
     ontouchstart={() => { touching = true; hand(); }} ontouchend={() => { touching = false; hand(); }} ontouchcancel={() => { touching = false; }}>
+    {#if older != null}<p class="older" aria-live="polite">{reading ? "Loading earlier messages…" : ""}</p>{/if}
     <div class="log" aria-live="polite" bind:this={logEl}>
       {#if log.status === "error" || log.status === "refused" || log.status === "closed"}
         <Empty title="This thread can't be shown right now." body={`${log.message ?? "The host didn't answer."} Check that ${host} is online, then reload.`}/>
@@ -463,6 +569,9 @@
   .note code { font-family: var(--font-mono); font-size: 12px; color: var(--ink); overflow-wrap: anywhere; }
   .note[data-tone=answer] { border-left-color: var(--st-needs-fg); }
   .quiet { color: var(--muted); }
+  /* Above the oldest page read: the next one is on its way. Its height is kept, so
+     the transcript doesn't move when it shows or empties. */
+  .older { box-sizing: border-box; height: 32px; margin: 0 auto; padding: var(--s2) var(--s5) 0; max-width: calc(72ch + 2 * var(--s5)); color: var(--muted); font-size: 12.5px; }
   .busy { display: flex; align-items: center; gap: var(--s2); margin: var(--s3) 0; color: var(--st-working-fg); font-size: 13px; }
   .dot { width: 7px; height: 7px; border-radius: var(--radius-pill); background: var(--st-working-fg); animation: beat 1.2s ease-out infinite alternate; }
 
