@@ -40,12 +40,6 @@
     return "Picked up again.";
   }
 
-  const OUTCOME = { allowed: "You allowed", denied: "You denied", answered: "You answered", refused: "Refused" };
-  /** What an answered request was for: its command, its file, or its tool. */
-  function askedFor(rec) {
-    const k = rec?.request?.kind ?? {};
-    return k.input?.command ?? k.input?.file_path ?? k.tool ?? k.name ?? "";
-  }
 </script>
 
 <script>
@@ -194,7 +188,7 @@
         const t = turnOf(ev);
         if (t.waitFrom != null && ev.at_ms) { t.waited += ev.at_ms - t.waitFrom; t.waitFrom = null; }
         const a = asked.get(ev.id);
-        if (a) { a.outcome = typeof ev.outcome === "string" ? ev.outcome : "cancelled"; a.record = asks[ev.id] ?? a.record; }
+        if (a) { a.outcome = ev.outcome ?? "cancelled"; a.record = asks[ev.id] ?? a.record; }
         delete asks[ev.id];
         break;
       }
@@ -562,7 +556,8 @@
           {:else if !it.outcome}
             <p class="note" data-tone="needs">Claude is waiting for your answer. Loading the request…</p>
           {:else if it.record}
-            <p class="note" data-tone="answer">{OUTCOME[it.outcome] ?? "Withdrawn"}{#if askedFor(it.record)}&nbsp;<code>{askedFor(it.record)}</code>{/if}</p>
+            <!-- the card's own one-line record (sc-approval), kept by the resolved outcome -->
+            <div class="ask"><Approval {host} {thread} record={{ ...it.record, outcome: it.outcome }}/></div>
           {:else}
             <span hidden></span>
           {/if}
@@ -638,7 +633,6 @@
   .note[data-tone=warn] { color: var(--st-failed-fg); border-left-color: var(--st-failed-fg); }
   .note[data-tone=needs] { color: var(--st-needs-fg); border-left-color: var(--st-needs-fg); }
   .note code { font-family: var(--font-mono); font-size: 12px; color: var(--ink); overflow-wrap: anywhere; }
-  .note[data-tone=answer] { border-left-color: var(--st-needs-fg); }
   .quiet { color: var(--muted); }
   /* Above the oldest page read: the next one is on its way. Its height is kept, so
      the transcript doesn't move when it shows or empties. */

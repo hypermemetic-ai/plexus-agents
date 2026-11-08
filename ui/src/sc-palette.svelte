@@ -92,11 +92,13 @@
   $effect(() => { if (opener !== last) { last = opener; show(); } });
   $effect(() => {
     if (!open) return;
+    // `only`: while open the palette has these keys alone — Escape closing it
+    // must not also reach the page under it (the composer's Escape stops Claude).
     return b.keys({
-      escape: { to: close, in_inputs: true, label: "Close the search" },
-      arrowdown: { to: () => step(1), in_inputs: true, label: "Next result" },
-      arrowup: { to: () => step(-1), in_inputs: true, label: "Previous result" },
-      enter: { to: choose, in_inputs: true, label: "Open the selected result" },
+      escape: { to: close, in_inputs: true, only: true, label: "Close the search" },
+      arrowdown: { to: () => step(1), in_inputs: true, only: true, label: "Next result" },
+      arrowup: { to: () => step(-1), in_inputs: true, only: true, label: "Previous result" },
+      enter: { to: choose, in_inputs: true, only: true, label: "Open the selected result" },
     });
   });
   const focus = (node) => { node.focus(); };
