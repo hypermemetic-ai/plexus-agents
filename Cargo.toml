@@ -4,6 +4,21 @@ version = "0.1.0"
 edition = "2021"
 description = "The agents service for Plexus: the Claude harness, the runtime and the agents activation"
 license = "MIT"
+repository = "https://github.com/hypermemetic-ai/plexus-agents"
+
+[[bin]]
+name = "plexus-agents"
+path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+disabled-strategies = ["quick-install", "compile"]
+
+[package.metadata.binstall.signing]
+algorithm = "minisign"
+pubkey = "RWQ8R/5keYik+skEADyK4mOcWpj8axIRMfSktPZEjHkvaNU1Q4n707lt"
 
 [dependencies]
 # Unpublished, so by local path for now. Everything else is a published crate.

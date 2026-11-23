@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""Package the executable from an exact, revision-labelled Agents deployment image."""
+import argparse
+import gzip
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import tarfile
+import tempfile
+import tomllib
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("image", help="local deployment image reference")
+parser.add_argument("revision", help="expected full source commit of the deployment")
+parser.add_argument("output", type=Path, help="new directory for the release assets")
+parser.add_argument("--minisign-key", required=True, type=Path)
+parser.add_argument("--gpg-passphrase-fd", type=int, help="optional inherited file descriptor")
+args = parser.parse_args()
+here = Path(__file__).resolve().parent
+manifest = here.parents[1] / "Cargo.toml"
+package = tomllib.loads(manifest.read_text())["package"]
+image, = json.loads(subprocess.check_output(["docker", "image", "inspect", args.image]))
+if image["Config"]["Labels"].get("org.opencontainers.image.revision") != args.revision:
+    parser.error("deployment image and requested source revision differ")
+if (image["Os"], image["Architecture"]) != ("linux", "amd64"):
+    parser.error("this package supports the Linux x86-64 deployment image")
+target = "x86_64-unknown-linux-gnu"
+binary = package["name"]
+archive = f"{binary}-{package['version']}-{target}.tar.gz"
+release_key = here / "plexus-agents-release.asc"
+pub = here / "plexus-agents-minisign.pub"
+if args.output.exists():
+    parser.error("the output directory already exists")
+if pub.read_text().splitlines()[1] != package["metadata"]["binstall"]["signing"]["pubkey"]:
+    parser.error("the public key in the manifest differs from the release key")
+fingerprint = next(row.split(":")[9] for row in subprocess.check_output(
+    ["gpg", "--with-colons", "--show-keys", release_key], text=True
+).splitlines() if row.startswith("fpr:"))
+secret = args.minisign_key.resolve()
+args.output.parent.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(dir=args.output.parent) as tmp:
+    stage = Path(tmp).resolve()
+    assets = stage / "assets"
+    assets.mkdir()
+    host = stage / binary
+    container = subprocess.check_output(["docker", "create", image["Id"]], text=True).strip()
+    try:
+        subprocess.run(["docker", "cp", f"{container}:/usr/local/bin/{binary}", host], check=True)
+    finally:
+        subprocess.run(["docker", "rm", "-v", container], stdout=subprocess.DEVNULL, check=True)
+    with (assets / archive).open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+        with tarfile.open(fileobj=gz, mode="w") as tar, host.open("rb") as data:
+            member = tarfile.TarInfo(binary)
+            member.size = host.stat().st_size
+            member.mode = 0o755
+            tar.addfile(member, data)
+    def run(*cmd, **kwargs):
+        subprocess.run(cmd, cwd=assets, check=True, **kwargs)
+    run("minisign", "-S", "-s", secret, "-m", archive, "-x", archive + ".sig", "-t", archive)
+    run("minisign", "-V", "-p", pub, "-m", archive, "-x", archive + ".sig")
+    for source in (manifest, pub, release_key):
+        (assets / source.name).write_bytes(source.read_bytes())
+    with host.open("rb") as stream:
+        binary_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+    build = {"source_revision": args.revision, "image_id": image["Id"], "target": target,
+             "binary_sha256": binary_hash}
+    (assets / "BUILD.json").write_text(json.dumps(build, indent=2) + "\n")
+    with (assets / "SHA256SUMS").open("w") as sums:
+        for file in sorted(assets.iterdir()):
+            if file.name != "SHA256SUMS":
+                with file.open("rb") as stream:
+                    sums.write(f"{hashlib.file_digest(stream, 'sha256').hexdigest()}  {file.name}\n")
+    fd = args.gpg_passphrase_fd
+    opts = [] if fd is None else ["--pinentry-mode", "loopback", "--passphrase-fd", str(fd)]
+    run("gpg", "--batch", *opts, "--local-user", fingerprint, "--armor", "--detach-sign", "SHA256SUMS",
+        pass_fds=() if fd is None else (fd,))
+    run("gpg", "--batch", "--dearmor", "--output", stage / "verify.gpg", release_key)
+    run("gpgv", "--keyring", stage / "verify.gpg", "SHA256SUMS.asc", "SHA256SUMS")
+    os.rename(assets, args.output)
